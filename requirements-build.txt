@@ -1,0 +1,31 @@
+# 낚시 매크로 빌드용 의존성 (python.org 정식 Python 가상환경에 설치)
+# torch/torchvision은 CPU 휠로 별도 설치 권장:
+#   pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cpu
+# 그 다음 이 파일 설치:
+#   pip install -r requirements-build.txt
+#
+# ※ opencv는 headless '하나만' 사용(GUI 함수 미사용, 용량↓, 충돌 방지).
+#   빌드 venv에 opencv-python(GUI판)이 같이 깔리면 제거하되, 반드시 headless를
+#   강제 재설치할 것. opencv-python과 opencv-python-headless는 같은 'cv2' 폴더를
+#   공유해서, GUI판만 uninstall하면 cv2 파일까지 지워져 cv2가 통째로 죽는다
+#   (easyocr/windows_capture 연쇄 import 실패). 순서:
+#     pip uninstall -y opencv-python
+#     pip install --force-reinstall --no-deps opencv-python-headless==5.0.0.93
+
+easyocr==1.7.2
+numpy==2.4.1
+opencv-python-headless==5.0.0.93
+pillow==12.1.0
+PyAutoGUI==0.9.54
+pyclipper==1.4.0
+python-bidi==0.6.11
+pywin32==311
+PyYAML==6.0.3
+requests==2.32.5
+scikit-image==0.26.0
+scipy==1.17.0
+shapely==2.1.2
+windows-capture==2.0.0
+
+# 빌드 도구
+pyinstaller==6.18.0

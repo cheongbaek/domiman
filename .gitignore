@@ -1,0 +1,31 @@
+# 가상환경 (수백MB, 각 PC에서 재생성)
+venv314/
+
+# 빌드/배포 산출물 (PyInstaller, Inno Setup)
+build/
+dist/
+Output/
+
+# OCR 모델 (빌드 시 로컬에 필요하지만 소스 아님, 수십MB)
+ocr_model/
+ocr_verify_result/
+
+# 개인 설정 (ntfy 채널명·PC 목록 등 비공개 정보 — 첫 실행 시 기본값으로 재생성됨)
+domiman_config.json
+
+# 로그
+fishing_log_*.txt
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# 진단용 스크린샷/캡처 산출물
+*.png
+
+# 빌드 산출 바이너리
+*.apk
+
+# Claude Code 로컬 상태 (도구 개인 설정, 프로젝트 소스 아님)
+.claude/

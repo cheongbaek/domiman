@@ -1,0 +1,9 @@
+{
+    "python-envs.defaultEnvManager": "ms-python.python:system",
+    "python.defaultInterpreterPath": "${workspaceFolder}/venv314/Scripts/python.exe",
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}/venv314/Lib/site-packages/win32",
+        "${workspaceFolder}/venv314/Lib/site-packages/win32/lib",
+        "${workspaceFolder}/venv314/Lib/site-packages/win32comext"
+    ]
+}
