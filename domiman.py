@@ -308,7 +308,7 @@ def _ntfy_stream_loop():
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260725c"
+APP_VERSION = "260725d"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -361,7 +361,7 @@ COORD_FISHING_BTN = (1086, 988)   # 낚시 취소/시작 토글
 COORD_TANK_BTN = (1007, 1006)     # 살림망 확인
 COORD_MYROOM_BTN = (1138, 245)    # 마이룸 보내기
 COORD_CONFIRM_BTN = (958, 575)    # 확인(팝업)
-REGION_FISHING_BTN = (1047, 988, 74, 31)   # 위 버튼 글자('취소'/'시작' 부분매칭, 실측)
+REGION_FISHING_BTN = (1040, 983, 88, 40)   # 위 버튼 글자('취소'/'시작' 부분매칭, 실측+여유)
 
 REGION_Q_LEFT = (742, 406, 78, 69)
 REGION_Q_RIGHT = (830, 407, 78, 69)
@@ -941,6 +941,7 @@ def is_fishing_active():
         return True
     if "시작" in txt:
         return False
+    print(f"[낚시 상태 판독 실패] REGION_FISHING_BTN OCR 원문='{txt}'")
     return None
 
 
@@ -1088,13 +1089,19 @@ def run_fishing_routine():
             traceback.print_exc()
 
     try:
-        print("1. 낚시 취소")
-        for _ in range(4):
-            press_key(VK_RETURN, 0.5)
-            press_key(VK_ESCAPE, 0.5)
+        # 낚시 취소(진행 중)면 기존 그대로, 낚시 시작(대기 중)이 확인되면
+        # 취소할 게 없으므로 ESC/Enter+취소 클릭을 생략하고 바로 수량 확인으로.
+        # 판독 불가(None)면 안전하게 기존 동작(진행 중 가정) 유지.
+        if is_fishing_active() is not False:
+            print("1. 낚시 취소")
+            for _ in range(4):
+                press_key(VK_RETURN, 0.5)
+                press_key(VK_ESCAPE, 0.5)
 
-        click_real(COORD_FISHING_BTN, delay=2)
-        print(f" -> [종료 시각] {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            click_real(COORD_FISHING_BTN, delay=2)
+            print(f" -> [종료 시각] {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            print("1. '낚시 시작' 상태 확인 — 취소 절차 생략")
 
         print("2. 살림망 확인")
         click_real(COORD_TANK_BTN, delay=1.5)
@@ -1786,43 +1793,51 @@ class DomimanApp:
         threading.Thread(target=_bg, daemon=True).start()
 
     def on_tank_check(self):
-        """'실시간 수량확인' 버튼. 로컬이면 로그로 출력 + 낚시 상태 확인 후
-        대기 중이면 자동 재개, 원격이면 N 명령 발송.
-        낚시 진행 여부와 무관하게 상시 작동(원격은 응답 대기 중만 봉인)."""
+        """'실시간 수량확인' 버튼. 로컬이면 창을 불러 수량과 낚시 상태를 함께
+        새로 확인(대기 중 = '낚시 시작'이면 자동 재개), 원격이면 N 명령 발송.
+        낚시 진행 여부와 무관하게 상시 작동(원격은 응답 대기 중만 봉인).
+
+        _query_tank의 수량 캐시 지름길을 쓰지 않고 항상 새로 캡처한다(함정):
+        낚시 상태 확인은 매번 실제 화면을 봐야 해서 캐시로 건너뛸 수 없는데,
+        캐시 적중 시 _query_tank는 캡처를 아예 켜지 않고, 캐시 miss 시엔
+        _query_tank 자신의 콜백 이후 finally에서 game_capture.stop()이 실행돼
+        여기서 새로 띄우는 배경 스레드와 캡처 시작/정지가 경합했다(레이스로
+        인해 실제로 '낚시 시작' 상태에서도 재개 버튼을 못 누르는 원인이었음).
+        한 스레드 안에서 수량 읽기 -> 상태 확인까지 끝내 경합을 없앤다."""
         if self.remote_target:
             if self.pending is None:
                 self._send_command("N", "N")
             return
+        if not self.ocr_ready or CURRENT_RESOLUTION is None:
+            print("[실시간 수량 확인] OCR/해상도가 아직 준비되지 않았습니다.")
+            return
         name = PC_NAME
 
-        def report(qty):
-            if qty is None:
-                print(f"[실시간 수량 확인] {name}: 수량 파싱 실패")
-            else:
-                print(f"[실시간 수량 확인] {name}: 살림망 {qty[0]}/{qty[1]}")
-            self._check_and_resume_fishing()
-        self._query_tank(report)
-
-    def _check_and_resume_fishing(self):
-        """게임 창의 낚시 취소/시작 버튼을 확인해 대기 중('낚시 시작')이면
-        자동으로 재개한다. 실시간 수량확인 버튼에서 호출(배경 스레드)."""
-        if not self.ocr_ready or CURRENT_RESOLUTION is None:
-            return
-
         def _bg():
+            global _last_tank
             try:
                 bring_game_to_front(GAME_KEYWORD)
                 _ensure_watch_capture()
-                time.sleep(1.0)
+                time.sleep(3.0)         # 창이 떠 숫자가 렌더될 시간
+                qty = read_tank_quantity()
+                if qty is not None:
+                    _last_tank = qty
+                if qty is None:
+                    print(f"[실시간 수량 확인] {name}: 수량 파싱 실패")
+                else:
+                    print(f"[실시간 수량 확인] {name}: 살림망 {qty[0]}/{qty[1]}")
+
                 if is_fishing_active() is False:
                     print("[낚시 상태 확인] '낚시 시작' 상태 — 자동으로 재개합니다.")
                     _resume_fishing()
             except Exception:
                 traceback.print_exc()
+                print(f"[실시간 수량 확인] {name}: 수량 파싱 실패")
             finally:
                 if (not self._running() and game_capture is not None
                         and game_capture.is_running):
                     game_capture.stop()
+
         threading.Thread(target=_bg, daemon=True).start()
 
     def _on_flag_toggle(self):
@@ -1929,12 +1944,14 @@ class DomimanApp:
 
     # ---------- 피제어(응답) 측 ----------
     def _status_string(self):
-        """,Z 뒤에 붙는 현재 상태 문자열: 타이머,해상도,a|m,로그[,낚싯대,미끼]"""
+        """,Z 뒤에 붙는 현재 상태 문자열: 타이머,해상도,a|m,로그,실행중[,낚싯대,미끼]
+        '실행중'을 항상 있는 필드(4번째 뒤)로 둔 이유: 감시모드에서만 붙는
+        낚싯대/미끼처럼 있다 없다 하면 자리가 밀려 파싱이 꼬인다."""
         tval = self.var_timer.get().strip() or "0"
         res = {"1080p": "1080", "1440p": "1440"}.get(CURRENT_RESOLUTION, "0")
         am = "a" if self.res_auto else "m"
         tf = lambda b: "t" if b else "f"   # noqa: E731
-        s = f"{tval},{res},{am},{tf(self.var_logsave.get())}"
+        s = f"{tval},{res},{am},{tf(self.var_logsave.get())},{tf(self._running())}"
         if self._is_watch_value(tval):
             s += f",{tf(self.var_rod.get())},{tf(self.var_bait.get())}"
         return s
@@ -2119,8 +2136,11 @@ class DomimanApp:
         # 그 외 규격 밖 응답은 pending 해제만 하고 무시
 
     def _apply_remote_status(self, rest):
-        """상태 응답(타이머,해상도,a|m,로그[,낚싯대,미끼])을 UI에 반영."""
-        if len(rest) < 4:
+        """상태 응답(타이머,해상도,a|m,로그,실행중[,낚싯대,미끼])을 UI에 반영.
+        실행중 필드로 시작/중지 버튼을 즉시 실제 상태에 맞춰 갱신한다(과거엔
+        이 필드가 없어 접속 직후 무조건 '시작'으로 뜨다가 버튼을 눌러야만
+        교정됐음)."""
+        if len(rest) < 5:
             return
         self._applying_remote = True
         try:
@@ -2134,11 +2154,13 @@ class DomimanApp:
                 label = "감지 실패"
             self.lb_res.configure(text=label)
             self.var_logsave.set(rest[3] == "t")
-            if len(rest) >= 6:
-                self.var_rod.set(rest[4] == "t")
-                self.var_bait.set(rest[5] == "t")
+            if len(rest) >= 7:
+                self.var_rod.set(rest[5] == "t")
+                self.var_bait.set(rest[6] == "t")
         finally:
             self._applying_remote = False
+        self.remote_running_shown = (rest[4] == "t")
+        self._set_start_button_remote()
 
     def _handle_remote_report(self, rest):
         """제어 대상의 상황 보고(,Z,F,*)를 로그 문구로 변환·표시."""
