@@ -22,6 +22,7 @@ import random
 import json
 import queue
 import socket
+import subprocess
 import threading
 import traceback
 import warnings
@@ -293,6 +294,56 @@ def _ntfy_stream_loop():
                     pass
         if _ntfy_enabled:
             time.sleep(1.0)   # 재연결 전 짧은 대기(연타 방지)
+
+
+# ============================================================
+# [2-1. 버전 확인 + 수동 업데이트 (GitHub raw 파일, exe는 아직 미지원)]
+# ------------------------------------------------------------
+# 버전 문자열 = "YYMMDD" + 알파벳 1글자(a,b,c...), 예) "260725a" < "260725b"
+# < "260726a". 자릿수가 고정이라 문자열 비교 그대로가 날짜순+알파벳순과 같다.
+# 리포(cheongbaek/domiman)의 version.txt가 APP_VERSION보다 "크면" 업데이트
+# 대상. 업데이트는 항상 사용자가 버튼을 눌러야만 확인/적용된다(자동 없음).
+# exe(frozen) 상태는 실행 파일을 자기 자신이 덮어쓸 수 없어 아직 미지원
+# (런처/코어 분리 구조로 향후 지원 예정) — .py 스크립트 실행 상태에서만 동작.
+# ============================================================
+APP_VERSION = "260725a"
+UPDATE_REPO = "cheongbaek/domiman"
+UPDATE_BRANCH = "main"
+UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
+
+
+def fetch_latest_version():
+    """리포의 version.txt를 읽어온다. 형식이 다르거나 통신 실패면 None."""
+    try:
+        resp = requests.get(f"{UPDATE_RAW_BASE}/version.txt", timeout=10)
+        resp.raise_for_status()
+        v = resp.text.strip()
+        return v if re.fullmatch(r"\d{6}[a-z]", v) else None
+    except Exception:
+        return None
+
+
+def download_latest_source():
+    """리포의 domiman.py 원본 전체를 텍스트로 받아온다. 실패면 None."""
+    try:
+        resp = requests.get(f"{UPDATE_RAW_BASE}/domiman.py", timeout=15)
+        resp.raise_for_status()
+        return resp.text if resp.text.strip() else None
+    except Exception:
+        return None
+
+
+def apply_update_and_restart(new_source):
+    """새 소스로 이 파일을 원자적으로 교체하고 같은 인터프리터로 재시작한다.
+    쓰다가 중단돼도 os.replace 직전까지는 원본이 그대로 남아 안전하다.
+    성공하면 반환하지 않음(재시작 프로세스 기동 후 os._exit)."""
+    target = os.path.abspath(__file__)
+    tmp = target + ".new"
+    with open(tmp, "w", encoding="utf-8") as fp:
+        fp.write(new_source)
+    os.replace(tmp, target)
+    subprocess.Popen([sys.executable, target])
+    os._exit(0)   # 새 프로세스를 이미 띄웠으므로 네이티브 스레드 정리 대기 없이 즉시 종료
 
 
 # ============================================================
@@ -1252,11 +1303,14 @@ class DomimanApp:
         # 우측 버튼 열(col 2) 왼쪽 여백(상태 문구는 고정 2줄 줄바꿈으로 처리)
         pad_r = {"padx": (12, 6), "pady": 3}
 
-        # -- 최상단: 제어PC 변경 버튼 (창 폭 전체, 얇고 긴 버튼) --
+        # -- 최상단: 제어PC 변경 버튼(창 폭 대부분) + 업데이트 확인 버튼(우측 끝) --
         self.bt_pc = tk.Button(f, text=PC_NAME, font=FONT, bg=BTN_GRAY,
                                command=self.on_pc_button)
-        self.bt_pc.grid(row=0, column=0, columnspan=4, sticky="ew",
+        self.bt_pc.grid(row=0, column=0, columnspan=3, sticky="ew",
                         padx=6, pady=(3, 8))
+        self.bt_update = tk.Button(f, text="⟳", font=FONT, bg=BTN_GRAY,
+                                   command=self.on_check_update)
+        self.bt_update.grid(row=0, column=3, sticky="ew", padx=6, pady=(3, 8))
 
         # -- 해상도 행 --
         self.lb_res_t = tk.Label(f, text="해상도", font=FONT)
@@ -1423,7 +1477,7 @@ class DomimanApp:
                          disabledbackground=t["bg"], disabledforeground="#888888")
         self.txt_log.configure(bg=t["log_bg"], fg=t["fg"], insertbackground=t["fg"])
         # 버튼은 회색 유지, 시작/중지 색 불변
-        for bt in (self.bt_pc, self.bt_res_manual, self.bt_res_auto,
+        for bt in (self.bt_pc, self.bt_update, self.bt_res_manual, self.bt_res_auto,
                    self.bt_tank_check, self.bt_sched_exit, self.bt_collect_now,
                    self.bt_dark, self.bt_exit, self.bt_log_fold, self.bt_log_clear,
                    self.bt_log_export):
@@ -2208,6 +2262,7 @@ class DomimanApp:
             w.configure(state="normal" if enabled else "disabled")
 
         st(self.bt_pc, not running)
+        st(self.bt_update, not running)
         # 이름/채널/ntfy — 원격에선 항상 봉인, 로컬에선 실행 중 봉인
         settings_ok = (not running) and (not remote)
         for w in (self.en_name, self.en_chan, self.cb_ntfy):
@@ -2493,6 +2548,68 @@ class DomimanApp:
         if getattr(self, "current_status_key", "") not in ("disconnect", "nowindow", "ocrfail"):
             self.set_status("idle")
         print("[시스템] 낚시 자동화가 중지되었습니다.")
+
+    # ---------- 업데이트 ----------
+    def on_check_update(self):
+        """'⟳' 버튼 — 수동 업데이트 확인. 로컬 낚시 실행 중엔 잠겨 있어
+        호출되지 않음(_apply_ui_locks). 원격 제어 중·exe 배포판은 미지원."""
+        if self.remote_target:
+            print("[업데이트] 원격 제어 중에는 이 PC의 업데이트를 확인할 수 없습니다.")
+            return
+        if getattr(sys, "frozen", False):
+            print("[업데이트] exe 배포판은 아직 자동 업데이트를 지원하지 않습니다"
+                  " (추후 지원 예정). 새 버전은 수동으로 재설치해 주세요.")
+            return
+
+        self.bt_update.configure(state="disabled")
+        print(f"[업데이트] 버전 확인 중... (현재 {APP_VERSION})")
+
+        def _bg():
+            latest = fetch_latest_version()
+            self.root.after(0, lambda: self._on_version_checked(latest))
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _on_version_checked(self, latest):
+        if not self._running():
+            self.bt_update.configure(state="normal")
+        if latest is None:
+            print("[업데이트] 버전 확인 실패(네트워크 오류).")
+        elif latest == APP_VERSION:
+            print(f"[업데이트] 이미 최신 버전입니다. ({APP_VERSION})")
+        elif latest > APP_VERSION:
+            if messagebox.askyesno(
+                    "업데이트",
+                    f"새 버전이 있습니다: {APP_VERSION} → {latest}\n"
+                    "지금 다운로드하고 재시작하시겠습니까?"):
+                self._download_and_apply_update(latest)
+        else:
+            print(f"[업데이트] 현재 버전({APP_VERSION})이 리포 버전({latest})보다"
+                  " 최신이거나 같습니다.")
+
+    def _download_and_apply_update(self, latest):
+        self.bt_update.configure(state="disabled")
+        print(f"[업데이트] {latest} 다운로드 중...")
+
+        def _bg():
+            src = download_latest_source()
+            self.root.after(0, lambda: self._on_update_downloaded(src))
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _on_update_downloaded(self, src):
+        if not src:
+            print("[업데이트] 다운로드 실패. 잠시 후 다시 시도해 주세요.")
+            if not self._running():
+                self.bt_update.configure(state="normal")
+            return
+        print("[업데이트] 적용 후 재시작합니다...")
+        try:
+            save_config(PC_NAME, NTFY_TOPIC, self.pc_list)
+            self._save_log_on_exit()
+        except Exception:
+            pass
+        apply_update_and_restart(src)   # 반환하지 않음(재시작 프로세스 기동 후 os._exit)
 
     # ---------- 종료 ----------
     def on_exit_button(self):
