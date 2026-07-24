@@ -29,7 +29,6 @@ import warnings
 
 import tkinter as tk
 from tkinter import font as tkfont
-from tkinter import messagebox
 
 import cv2
 import numpy as np
@@ -309,7 +308,7 @@ def _ntfy_stream_loop():
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260725b"
+APP_VERSION = "260725c"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -362,6 +361,7 @@ COORD_FISHING_BTN = (1086, 988)   # 낚시 취소/시작 토글
 COORD_TANK_BTN = (1007, 1006)     # 살림망 확인
 COORD_MYROOM_BTN = (1138, 245)    # 마이룸 보내기
 COORD_CONFIRM_BTN = (958, 575)    # 확인(팝업)
+REGION_FISHING_BTN = (1047, 988, 74, 31)   # 위 버튼 글자('취소'/'시작' 부분매칭, 실측)
 
 REGION_Q_LEFT = (742, 406, 78, 69)
 REGION_Q_RIGHT = (830, 407, 78, 69)
@@ -373,7 +373,7 @@ REGION_MIN_TIME = (940, 916, 72, 34)    # 최소 획득 시간 'n초'
 
 # --- 미끼 자동 교체 ---
 REGION_NO_BAIT = (890, 499, 142, 36)      # '미끼가 부족합니다' 팝업
-COORD_OWN_BAIT_BTN = (1004, 578)          # 팝업의 '보유 미끼' 버튼
+COORD_BAIT_LIST_BTN = (903, 913)          # 보유 미끼 리스트 열기(직접 진입, 실측)
 COORD_BAIT_NEXT_BTN = (1291, 565)         # 다음 페이지 화살표
 REGION_BAIT_NAMES = (640, 483, 640, 202)  # 카드 이름 바 8칸(2행x4열)
 BAIT_USE_BTNS = [
@@ -386,11 +386,8 @@ BAIT_TARGET_PATTERN = r"[갯개]지[렁렇령]"   # '갯지렁이' OCR 오인식
 BAIT_MAX_PAGE_MOVES = 4
 
 # --- 낚싯대 자동 교체 ---
-REGION_ROD_EXPIRE = (843, 444, 148, 40)     # '! 아이템 기간 만료' 타이틀
-REGION_ROD_ITEM_NAME = (898, 575, 100, 34)  # 팝업 속 아이템 이름
-ROD_EXPIRE_NAME_PATTERN = r"낚"
-COORD_ROD_LIST_BTN = (815, 916)             # 보유 낚싯대 리스트 열기
-ROD_TARGET_PATTERN = r"스타|장미검"
+COORD_ROD_LIST_BTN = (814, 917)             # 보유 낚싯대 리스트 열기(직접 진입, 실측)
+ROD_TARGET_PATTERN = r"매직|스타|장미|푸"   # 조각 중 하나라도 걸리면 채택(오인식에 강함)
 
 # --- 접속 끊김 감지 ---
 REGION_DISCONNECT = (769, 386, 258, 40)     # '서버와 접속이 끊어졌습니다.'
@@ -931,16 +928,20 @@ def _detect_no_bait_popup():
     return ("미끼가" in txt) or ("부족" in txt)
 
 
-def _detect_rod_expire_popup():
-    """'! 아이템 기간 만료' 팝업 감지 — '만료' + 이름의 '낚' 2중 확인."""
-    if "만료" not in _ocr_region(REGION_ROD_EXPIRE):
-        return False
-    return re.search(ROD_EXPIRE_NAME_PATTERN, _ocr_region(REGION_ROD_ITEM_NAME)) is not None
-
-
 def _detect_disconnect():
     """서버 접속 끊김 대화상자 감지 ('서버와' 부분매칭)."""
     return "서버와" in _ocr_region(REGION_DISCONNECT)
+
+
+def is_fishing_active():
+    """낚시 진행 여부. COORD_FISHING_BTN 글자가 '취소'면 진행 중(True),
+    '시작'이면 대기 중(False). 둘 다 판독 안 되면 None(호출측이 무시)."""
+    txt = _ocr_region(REGION_FISHING_BTN)
+    if "취소" in txt:
+        return True
+    if "시작" in txt:
+        return False
+    return None
 
 
 def _find_cards_by_pattern(pattern):
@@ -978,11 +979,21 @@ def _use_card_and_restart(row, col):
     click_real(COORD_FISHING_BTN, delay=1.0)
 
 
+def _resume_fishing():
+    """ESC 3번(혹시 떠있을 팝업 정리) -> '낚시 시작' 클릭. is_fishing_active()가
+    False(대기 중)로 확인된 경우에만 호출할 것."""
+    press_esc(delay=0.5)
+    press_esc(delay=0.5)
+    press_esc(delay=0.5)
+    click_real(COORD_FISHING_BTN, delay=1.0)
+
+
 # ============================================================
 # [9. 자동화 루틴 (낚시.py 이식 — GUI 상태 연동)]
 # ============================================================
 def run_bait_swap_routine():
-    """미끼 자동 교체: 보유 미끼 -> 페이지 탐색(최대 4번 넘김) -> 사용 -> 재개.
+    """미끼 자동 교체: ESC 3회(혹시 떠있을 팝업 정리) -> 보유 미끼 리스트 직접
+    진입 -> 페이지 탐색(최대 4번 넘김) -> 사용 -> 재개.
     대상 미감지로 좌상단 폴백을 쓰면 실패(x,b)로 보고한다."""
     print("\n=== [미끼 자동 교체] '미끼가 부족합니다' 감지 ===")
     set_status("bait")
@@ -992,7 +1003,10 @@ def run_bait_swap_routine():
         print("[경고] 게임 창을 찾지 못했습니다. 교체를 건너뜁니다.")
         return
 
-    click_real(COORD_OWN_BAIT_BTN, delay=1.5)
+    press_esc(delay=0.5)
+    press_esc(delay=0.5)
+    press_esc(delay=0.5)
+    click_real(COORD_BAIT_LIST_BTN, delay=1.5)
 
     found = None
     for page in range(BAIT_MAX_PAGE_MOVES + 1):
@@ -1018,9 +1032,10 @@ def run_bait_swap_routine():
 
 
 def run_rod_swap_routine():
-    """낚싯대 자동 교체: ESC(팝업 닫기) -> 리스트 열기 -> '스타'/'장미검' 탐색.
+    """낚싯대 자동 교체: ESC 3회(혹시 떠있을 팝업 정리) -> 리스트 직접 진입 ->
+    '매직'/'스타'/'장미'/'푸' 중 하나라도 걸리면 채택.
     대상 미감지 시 좌상단 폴백을 쓰고 실패(x,r)로 보고한다."""
-    print("\n=== [낚싯대 자동 교체] '아이템 기간 만료' 감지 ===")
+    print("\n=== [낚싯대 자동 교체] 최소 획득 시간 1초 감지 ===")
     set_status("rod")
 
     if not bring_game_to_front(GAME_KEYWORD):
@@ -1028,7 +1043,9 @@ def run_rod_swap_routine():
         print("[경고] 게임 창을 찾지 못했습니다. 교체를 건너뜁니다.")
         return
 
-    press_esc(delay=1.0)
+    press_esc(delay=0.5)
+    press_esc(delay=0.5)
+    press_esc(delay=0.5)
     click_real(COORD_ROD_LIST_BTN, delay=1.5)
 
     cards = _find_cards_by_pattern(ROD_TARGET_PATTERN)
@@ -1163,6 +1180,8 @@ class FishingWorker(threading.Thread):
 
         last_interval = 20.0
         fail_streak = 0
+        same_qty = None
+        same_count = 0
 
         while not self.stop_event.is_set():
             _ensure_watch_capture()
@@ -1184,6 +1203,11 @@ class FishingWorker(threading.Thread):
                 print(f"[{now}] 살림망 {cur}/{mx} (회수 기준 {mx - 5}), "
                       f"최소획득 {mstr}, 다음 확인 {interval:.0f}초 후")
 
+                if qty == same_qty:
+                    same_count += 1
+                else:
+                    same_qty, same_count = qty, 1
+
                 if cur >= mx - 5:
                     print(" -> [회수 조건 충족] 회수 루틴을 실행합니다.")
                     if game_capture is not None and game_capture.is_running:
@@ -1197,10 +1221,20 @@ class FishingWorker(threading.Thread):
                     run_bait_swap_routine()
                     self.stop_event.wait(2.0)
                     continue
-                if self.rod_swap and _detect_rod_expire_popup():
+                if self.rod_swap and minsec == 1:
                     run_rod_swap_routine()
                     self.stop_event.wait(2.0)
                     continue
+
+                # 살림망 수량이 3회 이상 그대로 — 낚시가 멈춰있을 수 있으니 확인
+                if same_count >= 3:
+                    active = is_fishing_active()
+                    if active is False:
+                        print(f" -> [낚시 정지 감지] 살림망 수량이 {same_count}회 연속 "
+                              f"동일 + '낚시 시작' 확인 — 재개합니다.")
+                        _resume_fishing()
+                        self.stop_event.wait(2.0)
+                        continue
             else:
                 fail_streak += 1
                 set_status("parsefail")
@@ -1752,7 +1786,8 @@ class DomimanApp:
         threading.Thread(target=_bg, daemon=True).start()
 
     def on_tank_check(self):
-        """'실시간 수량확인' 버튼. 로컬이면 로그로 출력, 원격이면 N 명령 발송.
+        """'실시간 수량확인' 버튼. 로컬이면 로그로 출력 + 낚시 상태 확인 후
+        대기 중이면 자동 재개, 원격이면 N 명령 발송.
         낚시 진행 여부와 무관하게 상시 작동(원격은 응답 대기 중만 봉인)."""
         if self.remote_target:
             if self.pending is None:
@@ -1765,7 +1800,30 @@ class DomimanApp:
                 print(f"[실시간 수량 확인] {name}: 수량 파싱 실패")
             else:
                 print(f"[실시간 수량 확인] {name}: 살림망 {qty[0]}/{qty[1]}")
+            self._check_and_resume_fishing()
         self._query_tank(report)
+
+    def _check_and_resume_fishing(self):
+        """게임 창의 낚시 취소/시작 버튼을 확인해 대기 중('낚시 시작')이면
+        자동으로 재개한다. 실시간 수량확인 버튼에서 호출(배경 스레드)."""
+        if not self.ocr_ready or CURRENT_RESOLUTION is None:
+            return
+
+        def _bg():
+            try:
+                bring_game_to_front(GAME_KEYWORD)
+                _ensure_watch_capture()
+                time.sleep(1.0)
+                if is_fishing_active() is False:
+                    print("[낚시 상태 확인] '낚시 시작' 상태 — 자동으로 재개합니다.")
+                    _resume_fishing()
+            except Exception:
+                traceback.print_exc()
+            finally:
+                if (not self._running() and game_capture is not None
+                        and game_capture.is_running):
+                    game_capture.stop()
+        threading.Thread(target=_bg, daemon=True).start()
 
     def _on_flag_toggle(self):
         """로그 저장/낚싯대/미끼 체크박스 클릭 — 원격 모드면 C 명령 발송."""
@@ -2583,15 +2641,40 @@ class DomimanApp:
             print("[업데이트] 버전 확인 실패(네트워크 오류).")
         elif latest == APP_VERSION:
             print(f"[업데이트] 이미 최신 버전입니다. ({APP_VERSION})")
+            self.lb_status.configure(text="업데이트가 없습니다.")
+            self.root.after(3000, self._refresh_status_display)
         elif latest > APP_VERSION:
-            if messagebox.askyesno(
-                    "업데이트",
-                    f"새 버전이 있습니다: {APP_VERSION} → {latest}\n"
-                    "지금 다운로드하고 재시작하시겠습니까?"):
-                self._download_and_apply_update(latest)
+            self._show_update_dialog(latest)
         else:
             print(f"[업데이트] 현재 버전({APP_VERSION})이 리포 버전({latest})보다"
                   " 최신이거나 같습니다.")
+
+    def _show_update_dialog(self, latest):
+        """업데이트 발견 시 뜨는 안내 팝업. [업데이트]=다운로드+재시작, [취소]=무시."""
+        top = tk.Toplevel(self.root)
+        top.title("업데이트")
+        top.resizable(False, False)
+        top.grab_set()
+        t = THEME["dark" if self.dark else "light"]
+        top.configure(bg=t["bg"])
+
+        tk.Label(top, text="업데이트가 있습니다.", font=FONT,
+                 bg=t["bg"], fg=t["fg"]).pack(padx=24, pady=(14, 6))
+        tk.Label(top, text=f"현재 : {APP_VERSION}", font=FONT,
+                 bg=t["bg"], fg=t["fg"]).pack(padx=24, pady=0, anchor="w")
+        tk.Label(top, text=f"신규 : {latest}", font=FONT,
+                 bg=t["bg"], fg=t["fg"]).pack(padx=24, pady=(0, 10), anchor="w")
+
+        def on_update():
+            top.destroy()
+            self._download_and_apply_update(latest)
+
+        row = tk.Frame(top, bg=t["bg"])
+        row.pack(padx=16, pady=(0, 14))
+        tk.Button(row, text="업데이트", font=FONT, bg=BTN_GRAY, width=8,
+                  command=on_update).pack(side="left", padx=(0, 6))
+        tk.Button(row, text="취소", font=FONT, bg=BTN_GRAY, width=8,
+                  command=top.destroy).pack(side="left")
 
     def _download_and_apply_update(self, latest):
         self.bt_update.configure(state="disabled")
