@@ -9,7 +9,7 @@
 GUI 특이사항: 자동화는 워커 스레드(stop_event), 로그는 stdout 리다이렉트
 (LogWriter 큐→Text 위젯), 상태 문구는 엑셀 J8:K18 매핑, 접속 끊김 시
 종료하지 않고 대기(재감지→재시작 가능), 낚시 중에는 설정 컨트롤 잠금.
-exe 패키징: `pyinstaller --noconsole --add-data "ocr_model;ocr_model" domiman.py`.
+exe 패키징은 domiman.spec으로 빌드(아래 [런처/코어 분리] 참고).
 
 **종료는 `os._exit(0)` 필수(함정):** `on_exit`은 설정/로그 저장만 마치고
 `os._exit(0)`로 즉시 끝낸다. `root.destroy()` 후 정상 인터프리터 종료로 두면
@@ -17,6 +17,41 @@ torch/easyocr/OpenMP 네이티브 스레드 정리를 기다리느라 (로그 �
 무관하게) 메인 스레드가 수 초 블록돼 창에 '응답 없음'이 뜨고 늦게 꺼졌다.
 os._exit는 그 정리를 건너뛴다. 저장은 os._exit 전에 동기로 끝내둘 것
 (원격 Q 응답도 `wait=True`로 먼저 보낸 뒤 on_exit 호출).
+
+**런처/코어 분리 + 수동 업데이트 (구현됨):** GitHub 리포
+`cheongbaek/domiman`(main 브랜치, Public)에 `domiman.py`/`version.txt`를
+올려두고, GUI의 `⟳` 버튼(제어PC 이름 버튼 우측 끝)으로 수동 업데이트를
+확인·적용한다. 버전 규약은 `APP_VERSION`(domiman.py [2-1] 섹션) =
+"YYMMDD"+알파벳(a,b,c...) 문자열이며 고정 자릿수라 사전식 비교 그대로
+날짜+알파벳 순서와 같다. `version.txt`가 더 크면 `domiman.py` 원본 전체를
+받아 `os.replace`로 원자적 교체 후 재시작.
+- exe 빌드 시 **컴파일 대상은 `launcher.py`(실행 파일 본체=domiman.exe)이고
+  `domiman.py`는 `datas`로만 동봉**해 매 실행마다 `runpy.run_path`로 그대로
+  읽어서 돌린다(`domiman.spec` 참고). 이렇게 분리한 이유(함정): 실행 중인
+  exe 자체는 Windows에서 덮어쓸 수 없어(파일 잠금) exe만으로는 자체 업데이트가
+  불가능 — 로직 전체를 진짜 실행 파일이 아닌 옆의 평범한 `.py` 데이터 파일에
+  두면 그 파일은 언제든 자유롭게 덮어쓸 수 있다. 업데이트는 결국 이 loose
+  `domiman.py`만 교체하는 것으로 끝난다.
+- `domiman.py`는 `runpy`로 동적 로드되어 **PyInstaller 정적 분석 대상이
+  아니므로**, 그 파일이 쓰는 의존성(pyautogui/requests/numpy/tkinter 등)은
+  `domiman.spec`의 `hiddenimports`에 명시해야 묻어들여진다. 새 최상위
+  `import`를 domiman.py에 추가하면 스펙의 hiddenimports도 같이 챙길 것
+  (안 그러면 스크립트 모드에선 되는데 exe에서만 `ModuleNotFoundError`).
+- 프리징 여부와 무관하게 `os.path.abspath(__file__)`은 실제 `domiman.py`
+  경로로 정확히 해석됨(runpy가 `__file__`을 그 경로로 설정) — exe에서도
+  `getattr(sys, 'frozen', False)`가 그대로 True로 유지되므로(부트로더가
+  `sys` 전역에 심는 속성) 기존 frozen 분기 로직들은 그대로 동작한다.
+- exe에서 재시작할 땐 `subprocess.Popen([sys.executable])`(인자 없이
+  launcher 자신을 다시 띄움 — 재기동된 launcher가 방금 교체된 새
+  domiman.py를 다시 읽음), 스크립트 모드는 기존처럼
+  `subprocess.Popen([sys.executable, target])`.
+- `launcher.py`는 거의 안 바뀌는 최소 코드(경로 해석 + runpy 디스패치 +
+  domiman.py 없을 때 안내 메시지박스)만 담당. DPI awareness는 domiman.py
+  자체가 이미 module-level에서 설정하므로 launcher.py에서 중복 설정하지
+  않음.
+- 새 버전 배포 절차: ① domiman.py 수정 ② `version.txt`를 다음 알파벳으로
+  올림 ③ 두 파일만 커밋·푸시. 각 PC는 `⟳` 클릭 한 번으로 반영(재설치·재빌드
+  불필요 — launcher.py/의존성 DLL 자체가 바뀌는 경우에만 재설치 필요).
 
 ---
 

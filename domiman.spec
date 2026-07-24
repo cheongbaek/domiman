@@ -1,11 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
-# domiman.py PyInstaller 빌드 스펙 (onedir = 분할 파일 구조, AV 오탐 완화용)
+# domiman 빌드 스펙 (onedir = 분할 파일 구조, AV 오탐 완화용)
 # 빌드:  pyinstaller domiman.spec --noconfirm --clean
 # 결과:  dist/domiman/  (이 폴더 전체를 installer.iss로 설치프로그램화)
 #
 # ※ 반드시 python.org 정식 Python(가상환경)에서 빌드할 것. Microsoft Store
 #    Python으로는 PyInstaller가 정상 동작하지 않는다.
 # ※ GUI 전용(콘솔 없음). 로그는 domiman.py 내부 로그 창으로 확인.
+# ※ 컴파일 대상은 launcher.py(실행 파일 본체)다. domiman.py는 datas로만
+#   동봉해 매 실행마다 runpy로 그대로 읽게 한다(업데이트 시 domiman.py만
+#   통째로 교체하면 되는 구조 — launcher.py 상단 주석 참고). domiman.py는
+#   정적 분석 대상이 아니라서 그 파일이 쓰는 의존성은 아래 hiddenimports에
+#   명시해야 묻어들여진다(pyautogui/requests/numpy/tkinter 등).
 
 from PyInstaller.utils.hooks import collect_all
 
@@ -33,11 +38,19 @@ for pkg in [
 # pywin32
 hiddenimports += ['win32gui', 'win32con', 'win32api', 'win32process']
 
+# domiman.py가 runpy로 동적 로드되어 정적 분석에 안 잡히는 의존성들을 명시.
+hiddenimports += ['pyautogui', 'requests', 'numpy',
+                   'tkinter', 'tkinter.font', 'tkinter.messagebox']
+
 # OCR 모델 동봉 (다운로드 불가 시스템 대응). 런타임엔 sys._MEIPASS/ocr_model 로 접근.
 datas += [('ocr_model', 'ocr_model')]
 
+# 실제 매크로 로직 본체. launcher.py가 매 실행마다 runpy로 그대로 읽어서
+# 돌린다(런타임엔 sys._MEIPASS/domiman.py). 업데이트는 이 파일만 교체하면 됨.
+datas += [('domiman.py', '.')]
+
 a = Analysis(
-    ['domiman.py'],
+    ['launcher.py'],
     pathex=[],
     binaries=binaries,
     datas=datas,

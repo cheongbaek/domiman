@@ -297,16 +297,19 @@ def _ntfy_stream_loop():
 
 
 # ============================================================
-# [2-1. 버전 확인 + 수동 업데이트 (GitHub raw 파일, exe는 아직 미지원)]
+# [2-1. 버전 확인 + 수동 업데이트 (GitHub raw 파일)]
 # ------------------------------------------------------------
 # 버전 문자열 = "YYMMDD" + 알파벳 1글자(a,b,c...), 예) "260725a" < "260725b"
 # < "260726a". 자릿수가 고정이라 문자열 비교 그대로가 날짜순+알파벳순과 같다.
 # 리포(cheongbaek/domiman)의 version.txt가 APP_VERSION보다 "크면" 업데이트
 # 대상. 업데이트는 항상 사용자가 버튼을 눌러야만 확인/적용된다(자동 없음).
-# exe(frozen) 상태는 실행 파일을 자기 자신이 덮어쓸 수 없어 아직 미지원
-# (런처/코어 분리 구조로 향후 지원 예정) — .py 스크립트 실행 상태에서만 동작.
+# exe 배포판은 launcher.py(빌드되는 domiman.exe 본체)가 이 파일(domiman.py)을
+# 매 실행마다 runpy로 그대로 읽어서 돌리는 구조라, 업데이트는 domiman.py만
+# 통째로 교체하면 된다(실행 중인 exe 자체는 덮어쓸 수 없는 Windows 제약을
+# 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
+# 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260725a"
+APP_VERSION = "260725b"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -334,15 +337,21 @@ def download_latest_source():
 
 
 def apply_update_and_restart(new_source):
-    """새 소스로 이 파일을 원자적으로 교체하고 같은 인터프리터로 재시작한다.
+    """새 소스로 이 파일을 원자적으로 교체하고 재시작한다.
     쓰다가 중단돼도 os.replace 직전까지는 원본이 그대로 남아 안전하다.
-    성공하면 반환하지 않음(재시작 프로세스 기동 후 os._exit)."""
+    성공하면 반환하지 않음(재시작 프로세스 기동 후 os._exit).
+    frozen(exe)이면 launcher(domiman.exe) 자신을 인자 없이 재기동해 새
+    domiman.py를 다시 읽게 하고, 스크립트 모드면 같은 인터프리터로
+    domiman.py를 직접 재실행한다."""
     target = os.path.abspath(__file__)
     tmp = target + ".new"
     with open(tmp, "w", encoding="utf-8") as fp:
         fp.write(new_source)
     os.replace(tmp, target)
-    subprocess.Popen([sys.executable, target])
+    if getattr(sys, "frozen", False):
+        subprocess.Popen([sys.executable])
+    else:
+        subprocess.Popen([sys.executable, target])
     os._exit(0)   # 새 프로세스를 이미 띄웠으므로 네이티브 스레드 정리 대기 없이 즉시 종료
 
 
@@ -2552,13 +2561,10 @@ class DomimanApp:
     # ---------- 업데이트 ----------
     def on_check_update(self):
         """'⟳' 버튼 — 수동 업데이트 확인. 로컬 낚시 실행 중엔 잠겨 있어
-        호출되지 않음(_apply_ui_locks). 원격 제어 중·exe 배포판은 미지원."""
+        호출되지 않음(_apply_ui_locks). 원격 제어 중에는 미지원(그 PC에서
+        직접 확인해야 함)."""
         if self.remote_target:
             print("[업데이트] 원격 제어 중에는 이 PC의 업데이트를 확인할 수 없습니다.")
-            return
-        if getattr(sys, "frozen", False):
-            print("[업데이트] exe 배포판은 아직 자동 업데이트를 지원하지 않습니다"
-                  " (추후 지원 예정). 새 버전은 수동으로 재설치해 주세요.")
             return
 
         self.bt_update.configure(state="disabled")
