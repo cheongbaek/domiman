@@ -387,6 +387,38 @@ def attempt_login(client, timeout=PENDING_TIMEOUT_SEC):
     return status
 
 
+def attempt_login_json(client, timeout=PENDING_TIMEOUT_SEC):
+    """attempt_login()의 Kotlin/Chaquopy 친화 버전 — PyObject dict 대신 JSON
+    문자열로 반환한다(Map<PyObject,PyObject> 변환을 Kotlin 쪽에서 다루지 않아도
+    되게). 성공 시 상태 dict의 JSON, 실패 시 문자열 "null"."""
+    return json.dumps(attempt_login(client, timeout))
+
+
+def dispatch_json(client, title, body):
+    """dispatch()의 Kotlin/Chaquopy 친화 버전. 반환 JSON 스키마:
+      {"kind": "reply"|"report"|null,
+       "status": {...}|null,           # kind=="reply"이고 상태 응답일 때
+       "tank": [cur,mx]|null,           # kind=="reply"이고 N(수량) 응답일 때
+       "tank_fail": bool,               # 위와 같되 파싱 실패(",Z,N,fail")
+       "report_text": str|null,         # kind=="report"일 때 로그에 띄울 문장
+       "report_status_key": str|null}   # 위와 같이 온 상태문구 키(STATUS_TEXT)
+    kind에 따라 관련 없는 필드는 그냥 없거나 null이다."""
+    kind, rest = client.dispatch(title, body)
+    out = {"kind": kind}
+    if kind == "reply":
+        if rest and rest[0] == "N":
+            tank = DomimanClient.parse_tank_reply(rest)
+            out["tank"] = list(tank) if tank else None
+            out["tank_fail"] = tank is None
+        else:
+            out["status"] = DomimanClient.parse_status(rest)
+    elif kind == "report":
+        text, status_key = DomimanClient.report_text(rest, client.target_id)
+        out["report_text"] = text
+        out["report_status_key"] = status_key
+    return json.dumps(out)
+
+
 # ============================================================
 # [2. 로그인 정보 저장 (Sheet1 전체 — 최근 로그인 목록 + 자동로그인 무장상태)]
 # ============================================================
@@ -455,6 +487,21 @@ class LoginStore:
         return LoginStore(
             recent=[SavedLogin.from_dict(x) for x in d.get("recent", [])],
             auto_login_enabled=bool(d.get("auto_login_enabled", False)))
+
+    def to_json(self):
+        """SharedPreferences처럼 문자열 하나만 다루는 저장소에 그대로 넣을 수
+        있는 형태(Kotlin에서 dict/list 변환을 직접 다루지 않아도 되게)."""
+        return json.dumps(self.to_dict())
+
+    @staticmethod
+    def from_json(s):
+        """비어있거나 손상된 값이면 빈 LoginStore(첫 실행과 동일하게 안전 처리)."""
+        if not s:
+            return LoginStore()
+        try:
+            return LoginStore.from_dict(json.loads(s))
+        except (json.JSONDecodeError, TypeError, KeyError):
+            return LoginStore()
 
 
 # ============================================================

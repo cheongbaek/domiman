@@ -424,6 +424,51 @@ Sheet2=메인 제어, A-E열=대략 레이아웃/G열=상세설명):**
 - 로그 창은 PC(접기 가능)와 달리 항상 펼쳐진 상태로 마지막 8줄만
   유지(`MobileLogBuffer`).
 
+**실제 안드로이드 프로젝트(구현 시작됨) — 위치가 이 저장소 밖입니다(중요):**
+`C:\Users\windo\dev\domiman-android` (Kotlin/Compose, Chaquopy 17.0.0으로
+`domiman_m.py`를 그대로 내장). **이 `macro` 폴더 안이 아니다** — AGP/Chaquopy가
+네이티브 빌드 도구 특성상 **비ASCII 경로에서 빌드를 거부**해서(`macro` 폴더가
+"한국교통대학교" 등 한글을 포함) 별도 ASCII 전용 경로로 옮겨 시작했다. 새
+기능을 추가할 때 이 사실을 잊고 `macro\domiman-android`를 찾지 말 것.
+- **구조**: `Login`/`RecentLogins`/`Main` 3화면(Navigation3), 각 화면=
+  Compose 화면+ViewModel, 전부 `DomimanRepository`(Chaquopy 브리지) 공유.
+  `domiman_m.py`는 `app/src/main/python/domiman_m.py`에 복사돼 있음 — **원본
+  (이 저장소의 `domiman_m.py`)을 고치면 반드시 그 경로로도 재복사**할 것
+  (자동 동기화 없음, 지금은 수동 `Copy-Item`).
+- **Chaquopy 브리지는 JSON 문자열로만 주고받는다(설계 결정):** PyObject의
+  `Map<PyObject,PyObject>` 변환이 불확실해, `domiman_m.py`에 Kotlin 전용
+  헬퍼(`attempt_login_json`, `dispatch_json`, `LoginStore.to_json/from_json`)
+  를 추가해 전부 JSON으로 왕복시킨다. Kotlin 쪽은 `kotlinx.serialization`으로
+  파싱(`DomimanModels.kt`). 새 Python 반환값을 Kotlin에 넘길 일이 생기면
+  PyObject API를 직접 파헤치지 말고 이 패턴(JSON 헬퍼 추가)을 따를 것.
+- **역할 분리**: `domiman_m.LoginFlow`(화면전환 규칙)는 Kotlin의
+  Navigation3/ViewModel과 책임이 겹쳐 **안 씀** — `DomimanRepository`는 그보다
+  낮은 `LoginStore`/`DomimanClient`/`attempt_login_json`만 직접 호출한다.
+  Python은 프로토콜+데이터 규칙, Kotlin은 화면/내비게이션 상태.
+- **빌드 시 겪은 함정 3가지(재발 방지)**:
+  1. 위에 적은 **비ASCII 경로 거부** — AGP가 빌드 자체를 막음(우회 설정
+     `android.overridePathCheck=true`도 있지만, Chaquopy가 네이티브 링킹을
+     하므로 진짜 실패 위험이 있어 경로 이전으로 해결).
+  2. **Configuration Cache와 비호환** — Chaquopy가 구성 단계에서 외부
+     프로세스(빌드용 python 탐지)를 실행해 Gradle configuration cache와
+     충돌. `gradle.properties`의 `org.gradle.configuration-cache=false`로
+     꺼둠(`android create` 템플릿 기본값은 `true`).
+  3. **buildPython 자동탐지 실패** — Chaquopy는 호스트에서 빌드 스크립트를
+     돌릴 Python(APK에 내장되는 타겟 Python과 별개)이 필요한데, 이 PC의 `py`
+     런처 `-V:3.13` 슬롯이 (도미맨 PC 프로젝트에도 이미 기록된 함정과 같은)
+     **Microsoft Store 스텁**이라 자동탐지가 실패했다. python.org 정식
+     3.13(`winget install Python.Python.3.13`)을 설치해
+     `chaquopy.defaultConfig.buildPython("C:/.../Python313/python.exe")`로
+     경로를 명시해 해결.
+- 빌드: `cd C:\Users\windo\dev\domiman-android; $env:JAVA_HOME =
+  "C:\Program Files\Android\Android Studio\jbr"; .\gradlew.bat assembleDebug`
+  (JAVA_HOME은 전역으로 안 걸어뒀으므로 매번 지정 필요 — [런처/코어 분리]
+  절의 PATH 새로고침과 같은 이유).
+- **아직 안 한 것**: 실기기/에뮬레이터 실행 테스트, 백그라운드 Foreground
+  Service(지금은 화면이 떠 있는 동안만 ntfy 스트리밍 유지), 시스템 뒤로가기
+  버튼 실제 인터셉트(`OnBackPressedCallback` — 지금은 화면 내 버튼으로만
+  로그아웃 2단계 확인 구현), GitHub 저장소 연동.
+
 ## 코딩 스타일
 - 콘솔 출력/주석 한국어. 섹션은 `# === [n. 제목] ===` 형식.
 - 기존 로깅(Tee), 예외 훅, atexit 정리, 연속 실패 5회 차단, ntfy 양방향
