@@ -460,14 +460,26 @@ Sheet2=메인 제어, A-E열=대략 레이아웃/G열=상세설명):**
      3.13(`winget install Python.Python.3.13`)을 설치해
      `chaquopy.defaultConfig.buildPython("C:/.../Python313/python.exe")`로
      경로를 명시해 해결.
+  4. **DomimanRepository의 send\* 함수는 반드시 suspend + Dispatchers.IO**
+     (실기기 테스트에서 발견 — 처음엔 `sendStart`/`sendSetResolution` 등이
+     평범한 `fun`이라 Compose `onClick`에서 바로 호출됐는데, 이게
+     `cmd_*→send_command()→requests.post()`로 이어지는 **블로킹 네트워크
+     호출을 메인 스레드에서 그대로 실행**해 ntfy 발신이 버벅이거나 실패했다.
+     `login()`/`attemptLogin()`은 처음부터 `withContext(Dispatchers.IO)`로
+     감쌌었지만 Sheet2의 명령 버튼들은 빠뜨렸던 것 — Chaquopy로 Python
+     네트워크 함수를 새로 노출할 때마다 이 패턴을 반드시 지킬 것.
 - 빌드: `cd C:\Users\windo\dev\domiman-android; $env:JAVA_HOME =
   "C:\Program Files\Android\Android Studio\jbr"; .\gradlew.bat assembleDebug`
   (JAVA_HOME은 전역으로 안 걸어뒀으므로 매번 지정 필요 — [런처/코어 분리]
   절의 PATH 새로고침과 같은 이유).
-- **아직 안 한 것**: 실기기/에뮬레이터 실행 테스트, 백그라운드 Foreground
-  Service(지금은 화면이 떠 있는 동안만 ntfy 스트리밍 유지), 시스템 뒤로가기
-  버튼 실제 인터셉트(`OnBackPressedCallback` — 지금은 화면 내 버튼으로만
-  로그아웃 2단계 확인 구현), GitHub 저장소 연동.
+- 에뮬레이터: SDK에 `emulator`+`system-images/android-36/google_apis/x86_64`
+  설치 완료, `android emulator create`로 `medium_phone` AVD 생성됨(기본
+  device profile 자동 선택 — 이후엔 `android emulator start medium_phone`).
+  단, 실기기 테스트가 더 빨라 에뮬레이터 부팅은 중간에 보류한 적 있음.
+- **아직 안 한 것**: 백그라운드 Foreground Service(지금은 화면이 떠 있는
+  동안만 ntfy 스트리밍 유지), 시스템 뒤로가기 버튼 실제 인터셉트
+  (`OnBackPressedCallback` — 지금은 화면 내 버튼으로만 로그아웃 2단계 확인
+  구현), GitHub 저장소 연동.
 
 ## 코딩 스타일
 - 콘솔 출력/주석 한국어. 섹션은 `# === [n. 제목] ===` 형식.
