@@ -13,6 +13,9 @@ ocr_verify_result/
 # 개인 설정 (ntfy 채널명·PC 목록 등 비공개 정보 — 첫 실행 시 기본값으로 재생성됨)
 domiman_config.json
 
+# UI 목업(예시 데이터에 실제 ntfy 채널명이 들어있어 비공개 유지)
+앱UI설명.xlsx
+
 # 로그
 fishing_log_*.txt
 *.log
