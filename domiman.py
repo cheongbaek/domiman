@@ -61,6 +61,8 @@ else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
     LOG_DIR = SCRIPT_DIR
 
+ICON_PATH = os.path.join(SCRIPT_DIR, "app.ico")   # GUI 창(제목표시줄/작업표시줄) 아이콘
+
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
@@ -308,7 +310,7 @@ def _ntfy_stream_loop():
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260725d"
+APP_VERSION = "260725e"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -1206,9 +1208,6 @@ class FishingWorker(threading.Thread):
                 fail_streak = 0
                 set_status("fishing")
                 cur, mx = qty
-                mstr = f"{minsec}초" if minsec is not None else "?"
-                print(f"[{now}] 살림망 {cur}/{mx} (회수 기준 {mx - 5}), "
-                      f"최소획득 {mstr}, 다음 확인 {interval:.0f}초 후")
 
                 if qty == same_qty:
                     same_count += 1
@@ -1317,6 +1316,10 @@ class DomimanApp:
         self._res_top = None             # 해상도 팝업 위젯들
 
         root.title("domiman.py")
+        try:
+            root.iconbitmap(ICON_PATH)   # 기본 tkinter 깃털 아이콘 대신 앱 아이콘
+        except Exception:
+            pass
         root.resizable(False, False)
         root.protocol("WM_DELETE_WINDOW", self.on_exit)
 

@@ -49,6 +49,11 @@ datas += [('ocr_model', 'ocr_model')]
 # 돌린다(런타임엔 sys._MEIPASS/domiman.py). 업데이트는 이 파일만 교체하면 됨.
 datas += [('domiman.py', '.')]
 
+# GUI 창 아이콘용(root.iconbitmap, 런타임엔 sys._MEIPASS/app.ico로 접근).
+# exe 파일 자체 아이콘은 아래 EXE(icon='app.ico')로 별도 임베드됨 — 이건
+# tkinter가 창/작업표시줄에 기본 깃털 아이콘 대신 쓰기 위한 실물 파일.
+datas += [('app.ico', '.')]
+
 a = Analysis(
     ['launcher.py'],
     pathex=[],
