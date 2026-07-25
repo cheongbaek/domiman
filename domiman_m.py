@@ -397,19 +397,32 @@ def attempt_login_json(client, timeout=PENDING_TIMEOUT_SEC):
 def dispatch_json(client, title, body):
     """dispatch()의 Kotlin/Chaquopy 친화 버전. 반환 JSON 스키마:
       {"kind": "reply"|"report"|null,
-       "status": {...}|null,           # kind=="reply"이고 상태 응답일 때
+       "status": {...}|null,           # kind=="reply"이고 상태 응답(S/V/T/C)일 때
        "tank": [cur,mx]|null,           # kind=="reply"이고 N(수량) 응답일 때
        "tank_fail": bool,               # 위와 같되 파싱 실패(",Z,N,fail")
+       "echo": "G"|"P"|"W"|"Q"|"Y"|null, # kind=="reply"이고 상태 없는 명령 에코일 때
+       "sched_minutes": str|null,       # echo=="Y"에 분 인자가 붙은 경우(예약확정)
        "report_text": str|null,         # kind=="report"일 때 로그에 띄울 문장
        "report_status_key": str|null}   # 위와 같이 온 상태문구 키(STATUS_TEXT)
-    kind에 따라 관련 없는 필드는 그냥 없거나 null이다."""
+    kind에 따라 관련 없는 필드는 그냥 없거나 null이다.
+
+    ※ G/P/W/Q/Y 응답은 domiman.py가 상태 필드 없이 명령 글자만 되돌려주는
+    '에코'다(예: 시작 성공→',Z,G'). 상태 응답(S/V/T/C)은 첫 필드가 타이머
+    숫자라 이 글자들과 겹치지 않으므로 rest[0]로 안전하게 구분된다. 과거엔
+    이 분기가 없어 G/P 응답이 parse_status→None으로 버려져, 모바일에서
+    '시작/중지'를 눌러도 running/pending이 갱신되지 않던 버그가 있었다."""
     kind, rest = client.dispatch(title, body)
     out = {"kind": kind}
     if kind == "reply":
-        if rest and rest[0] == "N":
+        first = rest[0] if rest else ""
+        if first == "N":
             tank = DomimanClient.parse_tank_reply(rest)
             out["tank"] = list(tank) if tank else None
             out["tank_fail"] = tank is None
+        elif first in ("G", "P", "W", "Q", "Y"):
+            out["echo"] = first
+            if first == "Y" and len(rest) >= 2:
+                out["sched_minutes"] = rest[1]
         else:
             out["status"] = DomimanClient.parse_status(rest)
     elif kind == "report":
