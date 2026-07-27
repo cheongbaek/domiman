@@ -482,10 +482,48 @@ Sheet2=메인 제어, A-E열=대략 레이아웃/G열=상세설명):**
   설치 완료, `android emulator create`로 `medium_phone` AVD 생성됨(기본
   device profile 자동 선택 — 이후엔 `android emulator start medium_phone`).
   단, 실기기 테스트가 더 빨라 에뮬레이터 부팅은 중간에 보류한 적 있음.
-- **아직 안 한 것**: 백그라운드 Foreground Service(지금은 화면이 떠 있는
-  동안만 ntfy 스트리밍 유지), 시스템 뒤로가기 버튼 실제 인터셉트
-  (`OnBackPressedCallback` — 지금은 화면 내 버튼으로만 로그아웃 2단계 확인
-  구현), GitHub 저장소 연동.
+
+**세션을 앱 싱글턴 + 포그라운드 서비스로 이관(구현됨 — 백그라운드 복귀
+문제 해결 + 알림):** 실기기에서 "앱을 완전히 안 끄고 빠져나왔다 다시 들어가면
+ntfy 발신·수신이 죽어 껐다 켜야 정상" 문제를 잡기 위해 세션 구조를 바꿨다.
+- **`DomimanRepository`가 앱 싱글턴**이 됨(`DomimanApplication.repository`,
+  Activity당 생성 X). 이유(함정): 예전엔 저장소가 `MainActivity`의
+  `by lazy` 필드라 화면 회전/백그라운드 복귀로 Activity가 재생성되면
+  `activeClient`(로그인 세션)가 사라져 이후 모든 명령이 no-op이었다.
+- **스트림은 `appScope`(앱 수명 `CoroutineScope`)에서 돎** — ViewModel/Activity와
+  독립. 세션 수명 = 로그인~로그아웃(더 이상 MainScreen VM의 onCleared에서
+  세션을 끄지 않는다).
+- **포그라운드 서비스 `DomimanService`(type=dataSync)**: 로그인 시
+  `beginSession()`이 서비스를 띄워 OS가 백그라운드에서 프로세스를 못 죽이게
+  한다 → 스트림이 계속 살아 이벤트 알림이 오고, 다시 앱에 들어와도 세션이
+  그대로. 서비스는 스트림을 직접 들지 않고(스트림은 appScope) 상시 알림으로
+  프로세스만 살려둔다. `START_STICKY`라 예외적으로 죽어도 재시작되며 이때
+  `reviveIfNeeded()`가 저장된 마지막 로그인으로 재접속(세션 소실 시).
+- **복귀 리프레시**: MainScreen이 `LifecycleEventEffect(ON_RESUME)`에서
+  `ensureSessionAlive()` 호출 — 세션 있으면 스트림 새로 붙이고 S 질의로 상태
+  재동기화, 세션 없고 직전 로그인 상태였으면(`session_active` 영속 플래그)
+  마지막 로그인으로 재접속, 그래도 실패면 로그인 화면으로.
+- **스트림 즉시 중단**: `domiman_m.DomimanClient.stream_disconnect()`(열린
+  응답 강제 close, PC의 `ntfy_stream_disconnect`와 동일)로 블로킹 `iter_lines`를
+  깨워 로그아웃/재접속 시 옛 스레드가 안 남게 함.
+
+**알림(구현됨):** 하단 '로그아웃' 옆 '알림 설정' 버튼 → `NotificationSettings`
+화면(마스터 '알림 켜기' + 10개 이벤트 체크박스, 마스터 꺼지면 하위 봉인,
+기본값 전부 on). `NotificationPrefs`(SharedPreferences, 앱데이터 삭제 시 소멸)에
+영속. 실제 알림은 `DomimanRepository.onStreamMessage`가 보고(`,Z,F,*`) 수신 시
+`NotificationPrefs.isEnabled(notifyKey)`면 `DomimanNotifications.postEvent`로
+발송 — **화면이 아니라 저장소(앱 스코프)에서 띄우므로 백그라운드에서도 온다.**
+어느 체크박스인지는 `dispatch_json`이 넣어주는 `report_notify_key`
+(domiman_m.`notify_key_for_report`, NOTIFY_KEYS 역변환)로 판정. 채널 2개
+(ongoing=서비스 상시/낮음, events=이벤트/기본).
+- **첫 실행 권한 요청(MainActivity)**: POST_NOTIFICATIONS(13+) 요청 후 콜백에서
+  배터리 최적화 예외(`ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`) 요청 —
+  절전모드가 백그라운드 서비스/네트워크를 죽이지 않도록. `savedInstanceState
+  == null`일 때만(회전 재요청 방지).
+
+- **아직 안 한 것**: 시스템 뒤로가기 버튼 실제 인터셉트(`OnBackPressedCallback`
+  — 지금은 화면 내 버튼으로만 로그아웃 2단계 확인 구현), 알림 탭 시 앱 열기
+  (contentIntent 없음), GitHub 저장소 연동(안드로이드 프로젝트는 아직 git 미연동).
 
 ## 코딩 스타일
 - 콘솔 출력/주석 한국어. 섹션은 `# === [n. 제목] ===` 형식.

@@ -94,32 +94,52 @@ STATUS_TEXT = {
 }
 
 # 원격 보고(,Z,F,*) -> 로그 문구/상태 변환표. {name}=제어 중인 PC 이름.
+# rs/bs(낚싯대/미끼 교체 시작)는 domiman.py 260728a에서 추가된 코드.
 REPORT_TEXT = {
     ("s",):      "{name}의 낚시 루틴이 시작되었습니다.",
     ("g",):      "{name}의 살림망 회수가 완료되었습니다.",
     ("f",):      "{name}의 살림망 회수가 실패하였습니다.",
+    ("rs",):     "{name}이(가) 낚싯대 교체를 시작합니다.",
     ("y", "r"):  "{name}의 낚싯대 교체가 성공하였습니다.",
-    ("y", "b"):  "{name}의 미끼 교체가 성공하였습니다.",
-    ("x", "d"):  "{name}의 게임 연결이 끊겼습니다.",
     ("x", "r"):  "{name}의 낚싯대 교체가 실패하였습니다.",
+    ("bs",):     "{name}이(가) 미끼 교체를 시작합니다.",
+    ("y", "b"):  "{name}의 미끼 교체가 성공하였습니다.",
     ("x", "b"):  "{name}의 미끼 교체가 실패하였습니다.",
+    ("x", "d"):  "{name}의 게임 연결이 끊겼습니다.",
 }
 REPORT_STATUS = {
     ("s",): "collect", ("g",): "fishing", ("f",): "fishing",
-    ("y", "r"): "fishing", ("y", "b"): "fishing",
-    ("x", "d"): "disconnect", ("x", "r"): "fishing", ("x", "b"): "fishing",
+    ("rs",): "rod", ("y", "r"): "fishing", ("x", "r"): "fishing",
+    ("bs",): "bait", ("y", "b"): "fishing", ("x", "b"): "fishing",
+    ("x", "d"): "disconnect",
 }
 
-# 알림 설정 체크박스 <-> 보고 코드 매핑 (domiman.py엔 없는 안드로이드 전용 기능).
+# 알림 설정 체크박스 <-> 보고 코드 매핑 (안드로이드 전용). 키 순서 = 앱 알림
+# 설정 화면의 체크박스 순서(마스터 '알림 켜기'는 코드가 없어 여기 없음).
+# report_code_for(key)로 ',Z,F,<code>'의 코드 문자열을 얻는다.
 NOTIFY_KEYS = {
-    "routine_start": ("s",),
-    "routine_fail":  ("f",),
-    "rod_success":   ("y", "r"),
-    "rod_fail":      ("x", "r"),
-    "bait_success":  ("y", "b"),
-    "bait_fail":     ("x", "b"),
-    "crash":         ("x", "d"),
+    "routine_start": ("s",),       # 살림망 회수 시작
+    "routine_success": ("g",),     # 살림망 회수 성공
+    "routine_fail":  ("f",),       # 살림망 회수 실패
+    "rod_start":     ("rs",),      # 낚싯대 교체 시작
+    "rod_success":   ("y", "r"),   # 낚싯대 교체 성공
+    "rod_fail":      ("x", "r"),   # 낚싯대 교체 실패
+    "bait_start":    ("bs",),      # 미끼 교체 시작
+    "bait_success":  ("y", "b"),   # 미끼 교체 성공
+    "bait_fail":     ("x", "b"),   # 미끼 교체 실패
+    "crash":         ("x", "d"),   # 게임 튕김
 }
+
+
+def notify_key_for_report(rest):
+    """보고 필드(rest, 예 ['y','r'] 또는 ['rs'])를 알림 설정 키로 역변환.
+    매칭 없으면 None. Kotlin이 어느 알림 체크박스에 해당하는지 판단할 때 씀."""
+    key = tuple(rest[:2]) if len(rest) >= 2 and (rest[0], rest[1]) in REPORT_STATUS \
+        else tuple(rest[:1])
+    for name, code in NOTIFY_KEYS.items():
+        if code == key:
+            return name
+    return None
 
 
 # ============================================================
@@ -144,6 +164,7 @@ class DomimanClient:
         self.url = f"{server}/{channel}"
         self._last_poll_time = 0
         self.pending = None   # {"kind": str, "sent": epoch}
+        self._stream_resp = None   # 현재 열린 스트리밍 응답(stream_disconnect용)
 
     # ---------- 발신 ----------
     def _send(self, body, timeout=10):
@@ -230,10 +251,15 @@ class DomimanClient:
         원문 그대로 넘긴다 — poll()과 동일.)
 
         ※ read_timeout: 정상 연결은 ntfy keepalive(기본 45s)가 계속 도착해
-          유지된다. Kotlin에서는 프롬프트한 취소를 위해 별도 스레드에서
-          연결(OkHttp Call)을 cancel()하는 방식을 쓴다(domiman.py와 동일)."""
+          유지된다. iter_lines는 블로킹이라 should_stop()은 다음 줄(메시지/
+          keepalive)이 와야 확인된다 → 프롬프트한 중단은 다른 스레드에서
+          stream_disconnect()로 연결을 강제 close해야 한다(domiman.py의
+          ntfy_stream_disconnect와 동일 패턴). Kotlin(Chaquopy)에서 백그라운드
+          진입/로그아웃 시 이걸 호출하면 블로킹 읽기가 즉시 풀려 스레드가
+          살아남지 않는다."""
         resp = requests.get(f"{self.url}/json", stream=True,
                             timeout=(connect_timeout, read_timeout))
+        self._stream_resp = resp
         try:
             if resp.status_code != 200:
                 return
@@ -250,8 +276,20 @@ class DomimanClient:
                     continue                         # open/keepalive 무시
                 on_message(data.get("title", ""), data.get("message", "").strip())
         finally:
+            self._stream_resp = None
             try:
                 resp.close()
+            except Exception:
+                pass
+
+    def stream_disconnect(self):
+        """열린 스트리밍 연결을 다른 스레드에서 강제 종료 — 블로킹 iter_lines를
+        즉시 깨운다(domiman.py ntfy_stream_disconnect와 동일). 연결이 없으면
+        무동작. 재연결은 호출부(should_stop 루프)가 알아서 하거나 안 한다."""
+        r = self._stream_resp
+        if r is not None:
+            try:
+                r.close()
             except Exception:
                 pass
 
@@ -403,7 +441,8 @@ def dispatch_json(client, title, body):
        "echo": "G"|"P"|"W"|"Q"|"Y"|null, # kind=="reply"이고 상태 없는 명령 에코일 때
        "sched_minutes": str|null,       # echo=="Y"에 분 인자가 붙은 경우(예약확정)
        "report_text": str|null,         # kind=="report"일 때 로그에 띄울 문장
-       "report_status_key": str|null}   # 위와 같이 온 상태문구 키(STATUS_TEXT)
+       "report_status_key": str|null,   # 위와 같이 온 상태문구 키(STATUS_TEXT)
+       "report_notify_key": str|null}   # 위와 같이 온 알림 설정 키(NOTIFY_KEYS)
     kind에 따라 관련 없는 필드는 그냥 없거나 null이다.
 
     ※ G/P/W/Q/Y 응답은 domiman.py가 상태 필드 없이 명령 글자만 되돌려주는
@@ -429,6 +468,7 @@ def dispatch_json(client, title, body):
         text, status_key = DomimanClient.report_text(rest, client.target_id)
         out["report_text"] = text
         out["report_status_key"] = status_key
+        out["report_notify_key"] = notify_key_for_report(rest)  # 알림 체크박스 판정용
     return json.dumps(out)
 
 
