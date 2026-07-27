@@ -210,7 +210,8 @@ def ntfy_send(body, wait=False):
 def send_report(code):
     """상황 보고 ',Z,F,(코드)' 발신 — 낚시 루틴(워커 스레드)에서 동기 호출.
     코드: s(루틴 시작) g(회수 성공) f(회수 실패)
-          y,r/y,b(낚싯대/미끼 교체 성공) x,d/x,r/x,b(튕김/낚싯대/미끼 실패)"""
+          rs/bs(낚싯대/미끼 교체 시작) y,r/y,b(낚싯대/미끼 교체 성공)
+          x,d/x,r/x,b(튕김/낚싯대/미끼 실패)"""
     ntfy_send(f",Z,F,{code}", wait=True)
 
 
@@ -310,7 +311,7 @@ def _ntfy_stream_loop():
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260725e"
+APP_VERSION = "260728a"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -425,16 +426,19 @@ REPORT_TEXT = {
     ("s",):      "{name}의 낚시 루틴이 시작되었습니다.",
     ("g",):      "{name}의 살림망 회수가 완료되었습니다.",
     ("f",):      "{name}의 살림망 회수가 실패하였습니다.",
+    ("rs",):     "{name}이(가) 낚싯대 교체를 시작합니다.",
     ("y", "r"):  "{name}의 낚싯대 교체가 성공하였습니다.",
-    ("y", "b"):  "{name}의 미끼 교체가 성공하였습니다.",
-    ("x", "d"):  "{name}의 게임 연결이 끊겼습니다.",
     ("x", "r"):  "{name}의 낚싯대 교체가 실패하였습니다.",
+    ("bs",):     "{name}이(가) 미끼 교체를 시작합니다.",
+    ("y", "b"):  "{name}의 미끼 교체가 성공하였습니다.",
     ("x", "b"):  "{name}의 미끼 교체가 실패하였습니다.",
+    ("x", "d"):  "{name}의 게임 연결이 끊겼습니다.",
 }
 REPORT_STATUS = {
     ("s",): "collect", ("g",): "fishing", ("f",): "fishing",
-    ("y", "r"): "fishing", ("y", "b"): "fishing",
-    ("x", "d"): "disconnect", ("x", "r"): "fishing", ("x", "b"): "fishing",
+    ("rs",): "rod", ("y", "r"): "fishing", ("x", "r"): "fishing",
+    ("bs",): "bait", ("y", "b"): "fishing", ("x", "b"): "fishing",
+    ("x", "d"): "disconnect",
 }
 
 _status_cb = None   # GUI가 등록하는 콜백(스레드 안전 처리 포함)
@@ -1000,6 +1004,7 @@ def run_bait_swap_routine():
     대상 미감지로 좌상단 폴백을 쓰면 실패(x,b)로 보고한다."""
     print("\n=== [미끼 자동 교체] '미끼가 부족합니다' 감지 ===")
     set_status("bait")
+    send_report("bs")          # 미끼 교체 시작 보고
 
     if not bring_game_to_front(GAME_KEYWORD):
         set_status("nowindow")
@@ -1040,6 +1045,7 @@ def run_rod_swap_routine():
     대상 미감지 시 좌상단 폴백을 쓰고 실패(x,r)로 보고한다."""
     print("\n=== [낚싯대 자동 교체] 최소 획득 시간 1초 감지 ===")
     set_status("rod")
+    send_report("rs")          # 낚싯대 교체 시작 보고
 
     if not bring_game_to_front(GAME_KEYWORD):
         set_status("nowindow")
@@ -1761,14 +1767,21 @@ class DomimanApp:
             ntfy_stream_disconnect()   # 열린 스트림을 즉시 끊어 반응 지연 없앰
 
     # ---------- 실시간 수량 확인 ----------
-    def _query_tank(self, on_result):
-        """마지막 파싱값을 구해 on_result((cur,mx) | None)을 호출한다.
-        - 캐시에 유효한 수(_last_tank)가 있으면 즉시 on_result(동기).
-        - 없으면(직전 실패/미파싱) 배경 스레드에서 게임 창을 앞으로 불러
-          3초 뒤 1회 파싱해 그 결과를 넘긴다(그래도 실패면 None — 재시도 없음).
-        3초 sleep을 메인 스레드에서 돌리면 창이 멈추므로 배경 스레드 필수."""
-        if _last_tank is not None:
-            on_result(_last_tank)
+    def _tank_check_and_resume(self, on_result):
+        """실시간 수량확인의 공용 로직(로컬 버튼 + 원격 N 질의가 공유).
+        회수 루틴 시작 때처럼 **게임 창을 앞으로 불러** 살림망 수량을 새로
+        읽고(3초 렌더 대기), **동시에 낚시 취소/시작 버튼을 확인해 '낚시 시작'
+        (대기 중)이면 눌러서 낚시를 재개**한다('낚시 취소'=진행 중이면 그대로
+        둔다). 결과 (cur,mx)|None을 on_result로 전달.
+
+        단, **감시 워커가 돌고 있으면**(self._running()) 워커가 매 사이클
+        창을 앞으로 불러 살림망을 읽고 낚시 상태도 스스로 관리하므로, 여기서
+        또 창을 뺏어 ESC/클릭을 하면 워커 루틴과 충돌한다 → 이 경우엔 워커가
+        갱신해 둔 캐시(_last_tank)만 즉시 돌려주고 창을 건드리지 않는다.
+        (자동 재개 기능은 매크로가 멈춰 있을 때 쓰라고 있는 것이므로 워커
+        가동 중엔 불필요.)"""
+        if self._running():
+            on_result(_last_tank)       # 워커가 매 사이클 갱신하는 신선한 값
             return
         if not self.ocr_ready or CURRENT_RESOLUTION is None:
             on_result(None)             # OCR/해상도 미준비 → 파싱 불가
@@ -1783,7 +1796,11 @@ class DomimanApp:
                 qty = read_tank_quantity()
                 if qty is not None:
                     _last_tank = qty
-                on_result(qty)
+                on_result(qty)          # 결과 먼저 알림(원격 N 응답을 빠르게)
+                # 낚시 상태 확인 후 '낚시 시작'(대기 중)이면 눌러서 재개
+                if is_fishing_active() is False:
+                    print("[낚시 상태 확인] '낚시 시작' 상태 — 자동으로 재개합니다.")
+                    _resume_fishing()
             except Exception:
                 traceback.print_exc()
                 on_result(None)
@@ -1798,50 +1815,19 @@ class DomimanApp:
     def on_tank_check(self):
         """'실시간 수량확인' 버튼. 로컬이면 창을 불러 수량과 낚시 상태를 함께
         새로 확인(대기 중 = '낚시 시작'이면 자동 재개), 원격이면 N 명령 발송.
-        낚시 진행 여부와 무관하게 상시 작동(원격은 응답 대기 중만 봉인).
-
-        _query_tank의 수량 캐시 지름길을 쓰지 않고 항상 새로 캡처한다(함정):
-        낚시 상태 확인은 매번 실제 화면을 봐야 해서 캐시로 건너뛸 수 없는데,
-        캐시 적중 시 _query_tank는 캡처를 아예 켜지 않고, 캐시 miss 시엔
-        _query_tank 자신의 콜백 이후 finally에서 game_capture.stop()이 실행돼
-        여기서 새로 띄우는 배경 스레드와 캡처 시작/정지가 경합했다(레이스로
-        인해 실제로 '낚시 시작' 상태에서도 재개 버튼을 못 누르는 원인이었음).
-        한 스레드 안에서 수량 읽기 -> 상태 확인까지 끝내 경합을 없앤다."""
+        낚시 진행 여부와 무관하게 상시 작동(원격은 응답 대기 중만 봉인)."""
         if self.remote_target:
             if self.pending is None:
                 self._send_command("N", "N")
             return
-        if not self.ocr_ready or CURRENT_RESOLUTION is None:
-            print("[실시간 수량 확인] OCR/해상도가 아직 준비되지 않았습니다.")
-            return
         name = PC_NAME
 
-        def _bg():
-            global _last_tank
-            try:
-                bring_game_to_front(GAME_KEYWORD)
-                _ensure_watch_capture()
-                time.sleep(3.0)         # 창이 떠 숫자가 렌더될 시간
-                qty = read_tank_quantity()
-                if qty is not None:
-                    _last_tank = qty
-                if qty is None:
-                    print(f"[실시간 수량 확인] {name}: 수량 파싱 실패")
-                else:
-                    print(f"[실시간 수량 확인] {name}: 살림망 {qty[0]}/{qty[1]}")
-
-                if is_fishing_active() is False:
-                    print("[낚시 상태 확인] '낚시 시작' 상태 — 자동으로 재개합니다.")
-                    _resume_fishing()
-            except Exception:
-                traceback.print_exc()
+        def report(qty):
+            if qty is None:
                 print(f"[실시간 수량 확인] {name}: 수량 파싱 실패")
-            finally:
-                if (not self._running() and game_capture is not None
-                        and game_capture.is_running):
-                    game_capture.stop()
-
-        threading.Thread(target=_bg, daemon=True).start()
+            else:
+                print(f"[실시간 수량 확인] {name}: 살림망 {qty[0]}/{qty[1]}")
+        self._tank_check_and_resume(report)
 
     def _on_flag_toggle(self):
         """로그 저장/낚싯대/미끼 체크박스 클릭 — 원격 모드면 C 명령 발송."""
@@ -2042,9 +2028,10 @@ class DomimanApp:
             reply(self._status_string())
 
         elif cmd == "N":
-            # 마지막 파싱값을 응답. 캐시 없으면 창 띄우고 3초 뒤 1회 파싱(_query_tank).
-            # 재파싱은 배경 스레드라 여기서 즉시 리턴 후 완료 시점에 reply가 나간다.
-            self._query_tank(lambda qty: reply(
+            # 로컬 버튼과 동일 로직(_tank_check_and_resume): 워커 미가동이면 창을
+            # 앞으로 불러 살림망을 새로 읽고 '낚시 시작'이면 눌러 재개, 워커
+            # 가동 중이면 캐시값 즉시 반환. 배경 스레드라 완료 시점에 reply가 나간다.
+            self._tank_check_and_resume(lambda qty: reply(
                 "N," + (f"{qty[0]},{qty[1]}" if qty is not None else "fail")))
 
     # ---------- 제어(요청) 측 ----------
