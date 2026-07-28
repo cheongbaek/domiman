@@ -311,7 +311,7 @@ def _ntfy_stream_loop():
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260728a"
+APP_VERSION = "260728b"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -1774,15 +1774,13 @@ class DomimanApp:
         (대기 중)이면 눌러서 낚시를 재개**한다('낚시 취소'=진행 중이면 그대로
         둔다). 결과 (cur,mx)|None을 on_result로 전달.
 
-        단, **감시 워커가 돌고 있으면**(self._running()) 워커가 매 사이클
-        창을 앞으로 불러 살림망을 읽고 낚시 상태도 스스로 관리하므로, 여기서
-        또 창을 뺏어 ESC/클릭을 하면 워커 루틴과 충돌한다 → 이 경우엔 워커가
-        갱신해 둔 캐시(_last_tank)만 즉시 돌려주고 창을 건드리지 않는다.
-        (자동 재개 기능은 매크로가 멈춰 있을 때 쓰라고 있는 것이므로 워커
-        가동 중엔 불필요.)"""
-        if self._running():
-            on_result(_last_tank)       # 워커가 매 사이클 갱신하는 신선한 값
-            return
+        **항상 창 호출 방식으로 동작한다(워커 가동 여부와 무관):** 과거엔
+        감시 워커가 돌고 있으면 캐시(_last_tank)만 즉시 돌려주고 창을 안
+        건드렸으나, 워커 스레드는 살아 있는데 게임 낚시가 조용히 멈춘 경우
+        수량이 정체돼도 창을 안 불러 확인/재개가 안 되는 문제가 있었다. 이제는
+        신호가 오면 무조건 창을 앞으로 불러 새로 읽고 낚시 상태를 확인해
+        '낚시 시작'이면 재개한다. (정상 진행 중이면 is_fishing_active()가 True라
+        재개 클릭은 나가지 않으므로, 워커의 정상 낚시를 방해하지 않는다.)"""
         if not self.ocr_ready or CURRENT_RESOLUTION is None:
             on_result(None)             # OCR/해상도 미준비 → 파싱 불가
             return
