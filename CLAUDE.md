@@ -433,12 +433,78 @@ Sheet2=메인 제어, A-E열=대략 레이아웃/G열=상세설명):**
 - 로그 창은 PC(접기 가능)와 달리 항상 펼쳐진 상태로 마지막 8줄만
   유지(`MobileLogBuffer`).
 
-**실제 안드로이드 프로젝트(구현 시작됨) — 위치가 이 저장소 밖입니다(중요):**
+**실제 안드로이드 프로젝트(구현됨) — 위치가 이 저장소 밖입니다(중요):**
 `C:\Users\windo\dev\domiman-android` (Kotlin/Compose, Chaquopy 17.0.0으로
 `domiman_m.py`를 그대로 내장). **이 `macro` 폴더 안이 아니다** — AGP/Chaquopy가
 네이티브 빌드 도구 특성상 **비ASCII 경로에서 빌드를 거부**해서(`macro` 폴더가
 "한국교통대학교" 등 한글을 포함) 별도 ASCII 전용 경로로 옮겨 시작했다. 새
 기능을 추가할 때 이 사실을 잊고 `macro\domiman-android`를 찾지 말 것.
+
+### ⚠️ 현재 안드로이드 앱 상태 = 유지 대상(권위 문서, 재설계 금지)
+**새 세션에서 절대 UI/구조를 새로 설계하지 말 것.** 아래가 지금 실제로
+빌드·동작 중인 최종 상태다. 사용자가 이 UI를 그대로 유지하길 원한다. 변경
+요청이 있을 때만 해당 부분을 고치고, 그 외엔 이 스펙을 보존한다.
+
+**로컬 git(백업, 원격 없음):** `C:\Users\windo\dev\domiman-android`에 git
+초기화돼 있고 커밋으로 백업 중(원격 push 안 함 — GitHub 미연동). 매 기능
+단위로 커밋해 둘 것. `.gitignore`가 `build/`·`.gradle/`·`local.properties`를
+제외(소스+`gradle-wrapper.jar`만 추적). 최신 커밋 `e082da7`
+(위젯 아이콘/토스트/런치신뢰성/앱아이콘)이 현재 상태.
+
+**파일 트리(app/src/main):**
+- `java/com/example/domiman/`
+  - `DomimanApplication.kt` — Python.start + `repository` 앱 싱글턴 생성
+  - `MainActivity.kt` — repository는 `(application as DomimanApplication).repository`,
+    첫 실행 권한요청(알림→배터리예외), 다크모드 override 상태 보유
+  - `Navigation.kt` — Navigation3. **시작 화면 = 이전 로그인돼 있었으면 Main,
+    아니면 Login**(`if repository.isSessionConfigured() Main else Login`)
+  - `NavigationKeys.kt` — `Login`/`RecentLogins`/`Main`/`NotificationSettings`
+  - `DomimanService.kt` — 포그라운드 서비스(specialUse|dataSync)
+  - `DomimanWidgetProvider.kt` — 4x1 홈 위젯
+  - `data/DomimanRepository.kt` — 앱 싱글턴 핵심(세션·스트림·명령·알림·위젯 연동)
+  - `data/DomimanModels.kt` — `@Serializable` DTO(DomimanStatus/DispatchResult/
+    SavedLoginJson/LoginStoreJson), dispatch_json/attempt_login_json JSON 파싱
+  - `data/NotificationPrefs.kt` — 알림 설정 영속(`NotifyItem` enum 10개 + master)
+  - `data/DomimanNotifications.kt` — 알림 채널/발송, contentIntent로 앱 열기
+  - `ui/login/`·`ui/recent/`·`ui/main/`·`ui/notif/` — 각 화면 Compose + ViewModel
+  - `theme/` — 템플릿 기본 테마
+- `python/domiman_m.py` — **이 저장소 `domiman_m.py`의 사본. 원본 고치면 반드시
+  `Copy-Item`으로 재복사**(자동 동기화 없음).
+- `res/drawable/` — `widget_bg.xml`(둥근 밝은 패널), `widget_btn_bg.xml`(누름
+  하이라이트 셀렉터), `widget_ic_refresh/collect/play/pause.png`(제공된 초록 세트)
+- `res/drawable-nodpi/ic_launcher_scene.png` — 앱 아이콘(록맨 낚시 장면, adaptive 배경)
+- `res/layout/widget_domiman.xml`, `res/xml/domiman_widget_info.xml`(4x1)
+- `res/mipmap-*` — 앱 아이콘(adaptive XML + 밀도별 png)
+
+**화면별 정확한 UI(유지):**
+- **로그인(`ui/login`, 앱UI설명 Sheet1 A1:E18):** 제목 "당신도 강태공이
+  되어보세요!", 입력 3개(ID / 피제어 PC 이름 / ntfy 채널명), `[v] 자동 로그인`
+  체크박스, 버튼 행 `[로그인][…]`. '…'=최근 로그인 화면. 실패 시 폼 비우고
+  "입력값을 초기화하고 다시 입력하세요." edit 모드일 땐 체크박스 숨기고 버튼이
+  `[수정][취소]`.
+- **최근 로그인(`ui/recent`, Sheet1 A21:E39):** 상단 `< 최근 로그인`, 리스트
+  행마다 `ID` + `피제어PC · 채널`. **짧게 탭=즉시 로그인**, **길게 눌러 드롭다운
+  [수정]/[삭제]**. 로그인 화면에서 '자동 로그인' 체크 후 '…'로 들어와 탭하면
+  그 항목도 자동로그인 무장(`repository.pendingAutoLoginArm`).
+- **메인(`ui/main`, Sheet2, PC GUI와 유사):** 세로 스크롤. 순서 =
+  해상도 라벨 + `[직접 설정][자동 감지]` / 타이머 입력(분, 디바운스 1.5초 발신) +
+  "0을 입력하면 살림망 감시 모드로 작동합니다." / `[v]낚싯대 자동교체`
+  `[v]미끼 자동교체` + "…감시 모드에서만…" / 큰 `시작|중지` 버튼(running이면
+  '중지') / 상태 메시지 / `[예약 종료][즉시 회수]` / `[실시간 수량확인][다크모드]`
+  / `로그` 헤더 + `x`(지우기) + 로그 8줄 패널 / 하단 `[로그아웃][알림 설정]`.
+  예약 종료는 분 입력 다이얼로그→`Y,n`. 해상도 직접설정은 1080/1440 다이얼로그.
+  버튼은 응답 대기(isPending) 중 잠기고 15초 무응답이면 자동 해제+"응답이
+  없습니다." 로그.
+- **알림 설정(`ui/notif`):** 상단 `< 알림 설정`, 마스터 `[v] 알림 켜기`(꺼지면
+  아래 10개 봉인·미발송), 이하 10개 체크박스(순서 고정): 살림망 회수
+  시작/성공/실패, 낚싯대 교체 시작/성공/실패, 미끼 교체 시작/성공/실패, 게임 튕김.
+  기본값 전부 on, SharedPreferences 영속(앱데이터 삭제 시 소멸).
+
+**빌드·배포 워크플로(현재 방식, 유지):**
+1. `cd C:\Users\windo\dev\domiman-android; $env:JAVA_HOME="C:\Program Files\Android\Android Studio\jbr"; .\gradlew.bat assembleDebug`
+2. 빌드 결과 `app\build\outputs\apk\debug\app-debug.apk`를 **손으로 복사해
+   `C:\Users\windo\OneDrive - 한국교통대학교\domiman.apk`를 덮어쓴다**(사용자
+   지정 배포 위치). gradle 자동복사 태스크는 두지 않음(사용자 요청).
 - **구조**: `Login`/`RecentLogins`/`Main` 3화면(Navigation3), 각 화면=
   Compose 화면+ViewModel, 전부 `DomimanRepository`(Chaquopy 브리지) 공유.
   `domiman_m.py`는 `app/src/main/python/domiman_m.py`에 복사돼 있음 — **원본
@@ -496,12 +562,22 @@ ntfy 발신·수신이 죽어 껐다 켜야 정상" 문제를 잡기 위해 세�
 - **스트림은 `appScope`(앱 수명 `CoroutineScope`)에서 돎** — ViewModel/Activity와
   독립. 세션 수명 = 로그인~로그아웃(더 이상 MainScreen VM의 onCleared에서
   세션을 끄지 않는다).
-- **포그라운드 서비스 `DomimanService`(type=dataSync)**: 로그인 시
+- **포그라운드 서비스 `DomimanService`(type=`specialUse|dataSync`)**: 로그인 시
   `beginSession()`이 서비스를 띄워 OS가 백그라운드에서 프로세스를 못 죽이게
   한다 → 스트림이 계속 살아 이벤트 알림이 오고, 다시 앱에 들어와도 세션이
   그대로. 서비스는 스트림을 직접 들지 않고(스트림은 appScope) 상시 알림으로
   프로세스만 살려둔다. `START_STICKY`라 예외적으로 죽어도 재시작되며 이때
   `reviveIfNeeded()`가 저장된 마지막 로그인으로 재접속(세션 소실 시).
+  **함정 — dataSync는 Android 14+에서 하루 6시간 제한**이라 장기 방치 시
+  종료→프로세스 사망했다. 그래서 34+는 시간제한 없는 `specialUse`를 쓰고(권한
+  `FOREGROUND_SERVICE_SPECIAL_USE` + `<property PROPERTY_SPECIAL_USE_FGS_SUBTYPE>`),
+  33 이하는 `dataSync` 폴백(매니페스트에 `specialUse|dataSync` 병기, 코드에서
+  SDK로 분기). 그래도 삼성 One UI 공격적 절전은 변수라, 최후엔 설정→배터리→
+  '제한 없음'에 앱 추가 권장(코드로 강제 불가).
+- **위젯 탭 시 프로세스 보호(함정):** 위젯 버튼 broadcast(`onReceive`)는 반환되면
+  프로세스가 곧 죽어, 15초 걸리는 재로그인이 끝나기 전에 종료돼 갱신이 안 됐다
+  → `onReceive`에서 **먼저 `DomimanService.start()`로 프로세스를 붙잡은 뒤**
+  명령을 appScope로 던진다.
 - **복귀 리프레시**: MainScreen이 `LifecycleEventEffect(ON_RESUME)`에서
   `ensureSessionAlive()` 호출 — 세션 있으면 스트림 새로 붙이고 S 질의로 상태
   재동기화, 세션 없고 직전 로그인 상태였으면(`session_active` 영속 플래그)
@@ -518,15 +594,37 @@ ntfy 발신·수신이 죽어 껐다 켜야 정상" 문제를 잡기 위해 세�
 발송 — **화면이 아니라 저장소(앱 스코프)에서 띄우므로 백그라운드에서도 온다.**
 어느 체크박스인지는 `dispatch_json`이 넣어주는 `report_notify_key`
 (domiman_m.`notify_key_for_report`, NOTIFY_KEYS 역변환)로 판정. 채널 2개
-(ongoing=서비스 상시/낮음, events=이벤트/기본).
+(ongoing=서비스 상시/낮음, events=이벤트/기본). **알림·상시알림 탭 시 앱을
+연다**(`contentIntent`=MainActivity, CLEAR_TOP).
 - **첫 실행 권한 요청(MainActivity)**: POST_NOTIFICATIONS(13+) 요청 후 콜백에서
   배터리 최적화 예외(`ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`) 요청 —
   절전모드가 백그라운드 서비스/네트워크를 죽이지 않도록. `savedInstanceState
   == null`일 때만(회전 재요청 방지).
 
+**홈 위젯 4x1(`DomimanWidgetProvider`, 구현됨):** `[새로고침]|수량|[다운로드]|[재생/중지]`.
+아이콘은 제공된 초록 원형 세트(`widget_ic_*`, `A_clean_2x2_grid_icon_set...png`를
+사분면 크롭). 동작: 새로고침=`cmd_tank_query`(N, 토스트 "실시간 수량 확인"),
+다운로드=`cmd_collect_now`(토스트 "즉시 살림망 회수"), 재생/중지=시작·중지 토글
+(running이면 정지 아이콘 `widget_ic_pause`+토스트 "매크로가 중지되었습니다",
+아니면 재생 `widget_ic_play`+"매크로가 시작되었습니다"). 각 버튼 누름 하이라이트
+(`widget_btn_bg`). **수량 표시는 새로고침(N 응답) 때만 갱신**(자동 폴링 없음),
+running 아이콘은 상태 변할 때 갱신 — 둘 다 `DomimanRepository`가 prefs
+(`widget_qty`/`widget_running`)에 쓰고 `DomimanWidgetProvider.refresh()` 호출.
+**로그인 세션 없으면 수량칸에 '로그인' 표시**, 그 상태에선 모든 칸 탭이 앱을
+연다(로그인 유도). **로그인 상태에선 수량칸 탭도 앱을 연다.** 위젯 명령은
+`repository.widget*()` → `ensureClientReady()`(세션 없으면 마지막 로그인으로
+재접속) 후 실행.
+
+**앱 아이콘 = 둥근 록맨(구현됨):** PC의 `app.ico`(록맨 낚시 픽셀아트)를 adaptive
+아이콘의 **배경 레이어로 꽉 채워** One UI가 자동으로 둥글게 마스킹
+(`mipmap-anydpi-v26/ic_launcher*.xml` → background=`@drawable/ic_launcher_scene`,
+foreground=투명). 구버전용 밀도별 `mipmap-*/ic_launcher(.round).png`도 둥근
+버전으로 생성(기존 webp·기본 로봇 아이콘 삭제).
+
 - **아직 안 한 것**: 시스템 뒤로가기 버튼 실제 인터셉트(`OnBackPressedCallback`
-  — 지금은 화면 내 버튼으로만 로그아웃 2단계 확인 구현), 알림 탭 시 앱 열기
-  (contentIntent 없음), GitHub 저장소 연동(안드로이드 프로젝트는 아직 git 미연동).
+  — 지금은 화면 내 '로그아웃' 버튼으로만 2단계 확인), 위젯 아이콘 다크모드
+  대비(초록 세트라 대체로 무난), 안드로이드 프로젝트 GitHub 원격 연동(현재
+  로컬 git 백업만).
 
 ## 코딩 스타일
 - 콘솔 출력/주석 한국어. 섹션은 `# === [n. 제목] ===` 형식.
