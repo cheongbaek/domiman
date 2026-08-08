@@ -311,7 +311,7 @@ def _ntfy_stream_loop():
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260728b"
+APP_VERSION = "260809a"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -373,6 +373,7 @@ REGION_VERIFY_TEXT = (832, 503, 255, 38)
 
 REGION_TANK_QTY = (825, 989, 130, 36)   # 살림망 수량 'cur/max'
 REGION_MIN_TIME = (940, 916, 72, 34)    # 최소 획득 시간 'n초'
+TANK_COLLECT_MARGIN = 5                 # 회수 조건: cur >= max - 5 (가득차기 5칸 전)
 
 # --- 미끼 자동 교체 ---
 REGION_NO_BAIT = (890, 499, 142, 36)      # '미끼가 부족합니다' 팝업
@@ -875,6 +876,13 @@ def _ensure_watch_capture():
     return True
 
 
+def _stop_watch_capture():
+    """감시용 WGC 캡처 정지. 회수 루틴(run_fishing_routine)은 1440p면 필요한
+    캡처를 스스로 켰다가 끄므로, 넘기기 전에 소유권을 놓아준다."""
+    if game_capture is not None and game_capture.is_running:
+        game_capture.stop()
+
+
 def _watch_grab_region(region):
     x, y, w, h = region
     if game_capture is not None and game_capture.is_running:
@@ -898,19 +906,33 @@ def _ocr_region(region):
 _last_tank = None
 
 
-def read_tank_quantity(retries=4, delay=0.3):
-    """살림망 수량 (current, max) 또는 None. 프레임 재시도 포함."""
+def read_tank_quantity(retries=4, delay=0.3, allow_overflow=False):
+    """살림망 수량 (current, max) 또는 None. 프레임 재시도 포함.
+
+    allow_overflow=True면 cur > mx(최대치가 더 작은 낚싯대로 막 바꾼 직후)도
+    그대로 채택한다. 평소엔 `cur <= mx` 가드가 OCR 오인식을 걸러주므로 기본은
+    False — 초과 상태가 나올 수 있는 낚싯대 교체 직후에만 열어준다
+    (그때도 자릿수 오인식은 걸러야 하니 mx의 3배까지만 허용)."""
     for i in range(retries):
         txt = _ocr_region(REGION_TANK_QTY)
         if txt:
             m = re.search(r'(\d+)\D+(\d+)', txt)
             if m:
                 cur, mx = int(m.group(1)), int(m.group(2))
-                if mx > 0 and 0 <= cur <= mx:
+                limit = mx * 3 if allow_overflow else mx
+                if mx > 0 and 0 <= cur <= limit:
                     return cur, mx
         if i < retries - 1:
             time.sleep(delay)
     return None
+
+
+def _tank_needs_collect(qty):
+    """(cur, mx)가 회수해야 할 상태인가. 회수 조건(가득차기 TANK_COLLECT_MARGIN칸
+    전) 이상이면 True — 최대치 초과(cur > mx)도 자연히 포함된다.
+    감시 루프와 낚싯대 교체 직후 확인이 같은 기준을 쓰도록 공유한다."""
+    cur, mx = qty
+    return cur >= mx - TANK_COLLECT_MARGIN
 
 
 def read_min_gain_time(retries=3, delay=0.2):
@@ -978,11 +1000,18 @@ def _find_cards_by_pattern(pattern):
     return []
 
 
-def _use_card_and_restart(row, col):
-    """'사용하기' 클릭 -> ESC 2번(리스트 창 + 밑에 깔린 팝업) -> '낚시 시작'."""
+def _use_card(row, col):
+    """'사용하기' 클릭 -> ESC 2번(리스트 창 + 밑에 깔린 팝업). '낚시 시작'은
+    누르지 않는다 — 누르기 전에 뭔가 더 확인할 게 있는 쪽(낚싯대 교체)이
+    이 단계까지만 쓴다."""
     click_real(BAIT_USE_BTNS[row][col], delay=1.0)
     press_esc(delay=0.5)
     press_esc(delay=1.0)
+
+
+def _use_card_and_restart(row, col):
+    """'사용하기' 클릭 -> ESC 2번(리스트 창 + 밑에 깔린 팝업) -> '낚시 시작'."""
+    _use_card(row, col)
     click_real(COORD_FISHING_BTN, delay=1.0)
 
 
@@ -1039,10 +1068,48 @@ def run_bait_swap_routine():
     set_status("fishing")
 
 
+def _restart_or_collect_after_rod_swap():
+    """낚싯대 교체 직후, '낚시 시작'을 누르기 전에 살림망 수량을 확인한다.
+
+    낚싯대마다 최대 살림망 개수가 달라서, 새로 든 낚싯대의 최대치가 기존보다
+    작으면 이미 쌓여 있는 물고기가 그 최대치를 넘어(예: 535/470) 낚시가 아예
+    시작되지 않는다. 회수 조건(예: 467/470)도 시작하자마자 다시 걸릴 상황이라
+    마찬가지다. 두 경우 모두 '낚시 시작'을 누르지 않고 곧바로 회수 루틴으로
+    넘긴다 — 회수 루틴은 맨 앞에서 is_fishing_active()로 버튼 글자를 읽어
+    '낚시 시작'(대기 중)이면 취소 절차를 알아서 생략하므로, 별도의 감시 조건
+    없이 바로 불러도 안전하다.
+
+    여유가 있으면(예: 165/470) 평소대로 '낚시 시작'을 눌러 재개한다. 판독
+    실패도 평소 동작으로 폴백 — 정말 초과 상태였다면 낚시가 안 걸려 수량이
+    정체되므로 감시 루프의 낚시 정지 감지가 결국 받아준다.
+
+    반환값: 회수 루틴을 실행했으면 True, 그냥 낚시를 재개했으면 False."""
+    time.sleep(1.0)          # 교체한 낚싯대 기준으로 수량 표시가 갱신될 시간
+    qty = read_tank_quantity(allow_overflow=True)
+    if qty is None:
+        print(" -> [살림망 확인 실패] 판독 불가 — 평소대로 낚시를 시작합니다.")
+        click_real(COORD_FISHING_BTN, delay=1.0)
+        return False
+
+    cur, mx = qty
+    if not _tank_needs_collect(qty):
+        print(f" -> [살림망 {cur}/{mx}] 여유 있음 — 낚시를 시작합니다.")
+        click_real(COORD_FISHING_BTN, delay=1.0)
+        return False
+
+    reason = "최대치 초과" if cur > mx else "회수 조건 충족"
+    print(f" -> [살림망 {cur}/{mx}] {reason} — '낚시 시작' 대신 회수 루틴으로 넘어갑니다.")
+    _stop_watch_capture()
+    run_fishing_routine()
+    return True
+
+
 def run_rod_swap_routine():
     """낚싯대 자동 교체: ESC 3회(혹시 떠있을 팝업 정리) -> 리스트 직접 진입 ->
     '매직'/'스타'/'장미'/'푸' 중 하나라도 걸리면 채택.
-    대상 미감지 시 좌상단 폴백을 쓰고 실패(x,r)로 보고한다."""
+    대상 미감지 시 좌상단 폴백을 쓰고 실패(x,r)로 보고한다.
+    교체 후에는 '낚시 시작'을 바로 누르지 않고 살림망 수량부터 확인한다
+    (_restart_or_collect_after_rod_swap 참고)."""
     print("\n=== [낚싯대 자동 교체] 최소 획득 시간 1초 감지 ===")
     set_status("rod")
     send_report("rs")          # 낚싯대 교체 시작 보고
@@ -1061,14 +1128,18 @@ def run_rod_swap_routine():
     if cards:
         row, col, ntext = random.choice(cards)
         print(f" -> [낚싯대 감지] {len(cards)}개 매칭, '{ntext}' 선택 ({row + 1}행 {col + 1}열)")
-        _use_card_and_restart(row, col)
+        _use_card(row, col)
         send_report("y,r")
-        print("=== [낚싯대 교체 완료] 낚시를 재개합니다 ===")
+        print("=== [낚싯대 교체 완료] 살림망을 확인합니다 ===")
     else:
         print(" -> [감지 실패] 좌상단 낚싯대를 대신 사용합니다.")
-        _use_card_and_restart(0, 0)
+        _use_card(0, 0)
         send_report("x,r")
-        print("=== [낚싯대 교체(폴백)] 낚시를 재개합니다 ===")
+        print("=== [낚싯대 교체(폴백)] 살림망을 확인합니다 ===")
+
+    # 바뀐 낚싯대의 최대 살림망이 더 작을 수 있으므로 시작 전에 수량 확인
+    if _restart_or_collect_after_rod_swap():
+        return          # 회수 루틴이 상태 문구·보고를 이미 처리했다
     set_status("fishing")
 
 
@@ -1213,17 +1284,15 @@ class FishingWorker(threading.Thread):
             if qty is not None:
                 fail_streak = 0
                 set_status("fishing")
-                cur, mx = qty
 
                 if qty == same_qty:
                     same_count += 1
                 else:
                     same_qty, same_count = qty, 1
 
-                if cur >= mx - 5:
+                if _tank_needs_collect(qty):
                     print(" -> [회수 조건 충족] 회수 루틴을 실행합니다.")
-                    if game_capture is not None and game_capture.is_running:
-                        game_capture.stop()
+                    _stop_watch_capture()
                     run_fishing_routine()
                     self.stop_event.wait(3.0)
                     continue
