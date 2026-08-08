@@ -311,7 +311,7 @@ def _ntfy_stream_loop():
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260809a"
+APP_VERSION = "260809b"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -1419,6 +1419,11 @@ class DomimanApp:
             print(f"[안내] 설정 파일의 사용자 지정 이름 '{PC_NAME}'을 사용 중입니다 "
                   f"(이 PC 호스트명: {_default_name}). 이름칸에서 바꿀 수 있습니다.")
 
+        # 체크박스 기본값을 전역 _ntfy_enabled에 반영(둘이 어긋나는 일 없도록
+        # 토글 핸들러를 그대로 재사용). 스트림 스레드는 0.5초 주기로 이 값을
+        # 다시 보므로 위에서 먼저 띄워도 곧바로 구독을 시작한다.
+        self.on_ntfy_toggle()
+
     # ---------- 위젯 구성 (엑셀 B2:H26 목업 기반) ----------
     def _build_widgets(self):
         r = self.root
@@ -1470,7 +1475,9 @@ class DomimanApp:
         self.lb_timer_hint.grid(row=3, column=0, columnspan=3, sticky="w", **pad)
 
         # -- 체크박스 2x2 + 시작/중지 큰 버튼 --
-        self.var_ntfy = tk.BooleanVar(value=False)
+        # 기본 켜짐. 실제 활성화(_ntfy_enabled)는 __init__ 끝의 on_ntfy_toggle()이
+        # 이 값에서 맞춰가므로, 기본값은 여기 한 곳만 고치면 된다.
+        self.var_ntfy = tk.BooleanVar(value=True)
         self.cb_ntfy = tk.Checkbutton(f, text="ntfy 메시지", font=FONT,
                                       variable=self.var_ntfy, command=self.on_ntfy_toggle)
         self.cb_ntfy.grid(row=4, column=0, sticky="w", **pad)
