@@ -311,7 +311,7 @@ def _ntfy_stream_loop():
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260809b"
+APP_VERSION = "260809c"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -904,23 +904,38 @@ def _ocr_region(region):
 # 마지막으로 파싱한 살림망 수량. (cur, mx)면 성공, None이면 직전 실패/미파싱.
 # 감시 루프가 매 사이클 갱신하고, '실시간 수량확인' 버튼(_query_tank)이 읽는다.
 _last_tank = None
+_last_tank_ocr = ""   # 마지막으로 읽은 수량 OCR 원문(판독 실패 원인 추적용)
 
 
-def read_tank_quantity(retries=4, delay=0.3, allow_overflow=False):
+def read_tank_quantity(retries=4, delay=0.3):
     """살림망 수량 (current, max) 또는 None. 프레임 재시도 포함.
 
-    allow_overflow=True면 cur > mx(최대치가 더 작은 낚싯대로 막 바꾼 직후)도
-    그대로 채택한다. 평소엔 `cur <= mx` 가드가 OCR 오인식을 걸러주므로 기본은
-    False — 초과 상태가 나올 수 있는 낚싯대 교체 직후에만 열어준다
-    (그때도 자릿수 오인식은 걸러야 하니 mx의 3배까지만 허용)."""
+    **cur > mx인 초과 상태도 그대로 돌려준다(중요 — 260809c에서 고침):**
+    최대 살림망이 더 작은 낚싯대로 바꾸면 이미 쌓인 물고기가 최대치를 넘은
+    상태(예: 520/470)가 된다. 예전의 `0 <= cur <= mx` 가드는 이걸 OCR
+    오인식으로 보고 버려서 None을 돌려줬는데, 그러면 감시 루프가 매 사이클
+    '수량 파싱 실패'만 찍고 회수 조건 판정까지 가지 못했다. 게다가 초과
+    상태에선 낚시 자체가 안 걸려 수량이 줄지도 않으므로 **스스로 빠져나올 수
+    없는 영구 정체**가 된다(낚싯대 교체 직후 한순간이 아니라 계속 남는 상태라,
+    교체 루틴 쪽에서만 열어주는 걸로는 부족했다).
+
+    **값 범위로 오인식을 거르려는 가드는 두지 않는다(교훈):** 위 `cur <= mx`가
+    바로 그런 가드였고, 예상 못 한 정상 값을 조용히 버려 이 버그를 만들었다.
+    임의 상한(mx의 n배 따위)은 잡는 범위도 원리적이지 않다 — 앞자리가 빠진
+    '52/470' 같은 더 흔한 오인식은 어차피 통과한다. 오인식은 아래 프레임
+    재시도와 감시 루프의 매 사이클 재파싱으로 자연히 씻겨 나가므로 그쪽에
+    맡긴다. `mx > 0`만 남기는데, 이건 오인식 휴리스틱이 아니라 구조적으로
+    무의미한 값을 막는 것(max가 0이면 `cur >= mx-5`가 항상 참이라 회수가
+    무한 반복된다)."""
+    global _last_tank_ocr
     for i in range(retries):
         txt = _ocr_region(REGION_TANK_QTY)
         if txt:
+            _last_tank_ocr = txt
             m = re.search(r'(\d+)\D+(\d+)', txt)
             if m:
                 cur, mx = int(m.group(1)), int(m.group(2))
-                limit = mx * 3 if allow_overflow else mx
-                if mx > 0 and 0 <= cur <= limit:
+                if mx > 0:
                     return cur, mx
         if i < retries - 1:
             time.sleep(delay)
@@ -1085,7 +1100,7 @@ def _restart_or_collect_after_rod_swap():
 
     반환값: 회수 루틴을 실행했으면 True, 그냥 낚시를 재개했으면 False."""
     time.sleep(1.0)          # 교체한 낚싯대 기준으로 수량 표시가 갱신될 시간
-    qty = read_tank_quantity(allow_overflow=True)
+    qty = read_tank_quantity()
     if qty is None:
         print(" -> [살림망 확인 실패] 판독 불가 — 평소대로 낚시를 시작합니다.")
         click_real(COORD_FISHING_BTN, delay=1.0)
@@ -1320,7 +1335,8 @@ class FishingWorker(threading.Thread):
                 fail_streak += 1
                 set_status("parsefail")
                 print(f"[{now}] 수량 파싱 실패({fail_streak}) — "
-                      f"직전 간격 {interval:.0f}초 유지")
+                      f"직전 간격 {interval:.0f}초 유지 "
+                      f"(OCR 원문='{_last_tank_ocr}')")
                 # 접속 끊김 확인 — GUI에서는 종료하지 않고 '대기'로 전환
                 if _detect_disconnect():
                     print("\n[긴급] 게임이 튕겼습니다")
@@ -1871,8 +1887,14 @@ class DomimanApp:
                 if qty is not None:
                     _last_tank = qty
                 on_result(qty)          # 결과 먼저 알림(원격 N 응답을 빠르게)
-                # 낚시 상태 확인 후 '낚시 시작'(대기 중)이면 눌러서 재개
-                if is_fishing_active() is False:
+                # 낚시 상태 확인 후 '낚시 시작'(대기 중)이면 눌러서 재개.
+                # 단 회수해야 할 수량(특히 최대치 초과)이면 눌러도 낚시가 안
+                # 걸리므로 헛클릭 대신 알리기만 한다 — 감시 워커가 돌고 있으면
+                # 다음 사이클에 회수 루틴이 받아간다.
+                if qty is not None and _tank_needs_collect(qty):
+                    print(f"[낚시 상태 확인] 살림망 {qty[0]}/{qty[1]} — 회수가 필요한 "
+                          "수량이라 재개 클릭을 생략합니다(회수 후 자동 재개).")
+                elif is_fishing_active() is False:
                     print("[낚시 상태 확인] '낚시 시작' 상태 — 자동으로 재개합니다.")
                     _resume_fishing()
             except Exception:
