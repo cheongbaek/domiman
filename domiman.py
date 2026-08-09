@@ -311,7 +311,7 @@ def _ntfy_stream_loop():
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260809c"
+APP_VERSION = "260809d"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -902,7 +902,9 @@ def _ocr_region(region):
 
 
 # 마지막으로 파싱한 살림망 수량. (cur, mx)면 성공, None이면 직전 실패/미파싱.
-# 감시 루프가 매 사이클 갱신하고, '실시간 수량확인' 버튼(_query_tank)이 읽는다.
+# 원래 '실시간 수량확인'이 캐시로 읽었으나, 260728b에서 캐시 우선 분기를
+# 없애며(항상 창을 불러 새로 읽음) 읽는 쪽이 사라졌다 — 지금은 기록만 되고
+# 참조하는 곳이 없다.
 _last_tank = None
 _last_tank_ocr = ""   # 마지막으로 읽은 수량 OCR 원문(판독 실패 원인 추적용)
 
@@ -1288,7 +1290,7 @@ class FishingWorker(threading.Thread):
             _ensure_watch_capture()
 
             qty = read_tank_quantity()
-            _last_tank = qty          # 실시간 수량확인 버튼용 캐시(성공=(cur,mx)/실패=None)
+            _last_tank = qty          # 기록만 (성공=(cur,mx)/실패=None, 위 정의 주석 참고)
             minsec = read_min_gain_time()
 
             if minsec is not None:
