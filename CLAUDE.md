@@ -520,6 +520,122 @@ Sheet2=메인 제어, A-E열=대략 레이아웃/G열=상세설명):**
 - 로그 창은 PC(접기 가능)와 달리 항상 펼쳐진 상태로 마지막 8줄만
   유지(`MobileLogBuffer`).
 
+---
+
+## domiman_m.py — 모바일용 Python 모듈 (구조·API)
+
+**정체:** 안드로이드 앱에 Chaquopy로 내장되는 Python 모듈이자 Kotlin 포팅
+레퍼런스. 737행 5개 섹션. `domiman.py`에서 **데스크톱 전용 코드(tkinter,
+pyautogui/win32 클릭, WGC 캡처, OCR, 낚시 자동화 루틴)를 전부 뺀** 것으로,
+① ntfy 프로토콜 ② 로그인/최근로그인 저장 규칙 ③ 화면 상태·전환 규칙만 담는다.
+
+**'제어(dB)' 역할만 맡는다(중요):** 자기 앞으로 온 명령을 받아 실행하는
+**피제어(d3) 로직(`domiman.py`의 `_handle_command`)은 아예 없다.** 휴대폰은
+PC를 조종하는 쪽이지 조종당하는 쪽이 아니므로 의도된 비대칭이다.
+
+**의존성 제약(깨지 말 것):** `requests` + 표준 라이브러리(`json/re/time/
+threading/queue/dataclasses/enum/collections`)만 쓴다. Chaquopy로 APK에 넣기
+때문에 플랫폼 의존 패키지를 넣으면 빌드가 막힌다. 위젯 렌더링·화면 전환
+애니메이션·뒤로가기 인터셉트·Toast·알림·다크모드 감지·실제 영속 저장소는
+**전부 Kotlin 책임**이고, 이 모듈은 "무엇을 언제 어떻게 바꿀지" 규칙만 갖는다.
+
+### 섹션·API 지도
+
+| 섹션 | 내용 |
+|---|---|
+| 상단 (모듈 전역) | `is_valid_id`/`is_valid_channel`(PC와 같은 정규식), `STATUS_TEXT`·`REPORT_TEXT`·`REPORT_STATUS`(domiman.py에서 **그대로 복제**), `NOTIFY_KEYS`+`notify_key_for_report` |
+| `[1]` 프로토콜 | `DomimanClient` — 세션 하나(`my_id`/`target_id`/`channel`) |
+| `[2]` 로그인 저장 | `SavedLogin`(dataclass), `LoginStore` |
+| `[3]` 화면 상태 | `Screen`(Enum: LOGIN/RECENT_LOGINS/MAIN), `LoginFormState` |
+| `[4]` 화면 전환 규칙 | `LoginFlow` |
+| `[5]` 로그 창 | `MobileLogBuffer`(deque, 기본 8줄) |
+
+**`DomimanClient`** — 명령 빌더는 전부 `send_command(body, kind)` 한 겹 위에
+얹혀 있고, 보내면서 `pending={"kind","sent"}`에 들어간다(`resolve_pending`,
+`check_pending_timeout` = `PENDING_TIMEOUT_SEC` 15초, PC와 동일):
+`cmd_login`(=`S`, **로그인은 상태 질의다**) `cmd_start`(G) `cmd_stop`(P)
+`cmd_sched_exit_ask`(Y) `cmd_sched_exit_set`(Y,n) `cmd_collect_now`(W)
+`cmd_exit_program`(Q) `cmd_set_resolution`(V,a|1080|1440) `cmd_set_timer`(T,n)
+`cmd_set_flags`(C,로그[,낚싯대,미끼]) `cmd_tank_query`(N).
+수신은 `stream()`(권장, 연결 1개 유지) / `poll()`(폴백) / `stream_disconnect()`
+(다른 스레드에서 강제 close해 블로킹 `iter_lines`를 깨움 — PC의
+`ntfy_stream_disconnect`와 같은 패턴). 파싱은 `dispatch()` →
+`parse_status()` / `report_text()` / `parse_tank_reply()`.
+
+**`dispatch()`가 발신자 필터까지 겸한다:** `title != target_id`면 버리므로
+**내가 보낸 메시지(Title=my_id)가 저절로 걸러진다** — PC의 스트림 루프처럼
+따로 자기 발신분 제외 코드를 두지 않는다. 응답은 `{my_id},Z,...`,
+보고는 `,Z,F,...`(무명 브로드캐스트) 두 갈래만 인정한다.
+
+### Chaquopy JSON 브리지 (설계 결정 — 이 패턴을 따를 것)
+
+Kotlin이 `Map<PyObject,PyObject>` 변환을 다루지 않도록, **Python이 JSON
+문자열로만 돌려준다.** 새 반환값을 Kotlin에 넘길 일이 생기면 PyObject API를
+파헤치지 말고 같은 방식으로 `*_json` 헬퍼를 추가한다.
+- `attempt_login_json(client)` — 실패 시 문자열 `"null"`
+- `dispatch_json(client, title, body)` — 아래 스키마
+- `LoginStore.to_json()` / `from_json()` — SharedPreferences에 문자열 하나로
+
+`dispatch_json` 반환 키: `kind`(reply|report|null) · `status` · `tank`/`tank_fail`
+· `echo` · `sched_minutes` · `report_text` · `report_status_key` ·
+`report_notify_key`.
+
+**`echo` 분기가 있는 이유(함정, 재발 방지):** `G/P/W/Q/Y` 응답은 domiman.py가
+상태 필드 없이 **명령 글자만 되돌려주는 에코**다(시작 성공 → `,Z,G`). 예전엔
+이 분기가 없어 그 응답이 `parse_status`에서 `None`으로 버려져, **모바일에서
+'시작/중지'를 눌러도 running/pending이 갱신되지 않는 버그**가 있었다.
+상태 응답(S/V/T/C)은 첫 필드가 타이머 숫자라 이 글자들과 겹치지 않으므로
+`rest[0]`로 안전하게 구분된다.
+
+**`parse_status`의 '실행중' 필드는 5번째 고정(PC와 반드시 같이 맞출 것):**
+낚싯대/미끼 필드처럼 있다 없다 하면 자리가 밀려 파싱이 꼬인다. PC 프로토콜을
+바꾸면 이 함수도 같이 고쳐야 한다.
+
+### 실제로 쓰이는 것 / 레퍼런스로만 남은 것
+
+`LoginFlow`는 **앱에서 쓰지 않는다** — 화면전환 책임이 Kotlin의
+Navigation3/ViewModel과 겹쳐서, `DomimanRepository`는 그보다 낮은
+`LoginStore`/`DomimanClient`/`attempt_login_json`만 직접 호출한다.
+`Screen`/`LoginFormState`/`LoginFlow`는 **규칙을 읽기 위한 참고 구현**으로
+남겨둔 것이고, 그 안의 정책(아래)은 Kotlin 쪽에 그대로 구현돼 있다:
+- `add_or_bump` — 같은 (id,피제어PC,채널)이면 갱신 후 맨 위로(중복 없음, 상한 없음)
+- `update` — 수정은 **맨 위로 옮기지 않는다**(재로그인이 아니라 정보 수정이므로)
+- `logout` — 자동로그인 **무장만 해제**. 목록과 폼의 마지막 값은 유지
+  (로그아웃 ≠ 데이터 삭제)
+- `attempt_login` — 스트림을 열고 0.3초 뒤 `cmd_login()`, 15초 대기.
+  앱에서는 Foreground Service가 이미 `stream()`을 돌리므로 그 큐를 재사용하면
+  되고 매번 스트림을 여닫을 필요는 없다(콜드 스타트 자동로그인용 독립 버전)
+
+**스모크 테스트:** `python domiman_m.py <내 ID> <대상PC> <채널>` — 로그인 →
+최근 로그인 저장 → 로그아웃 → 자동로그인 재시도(무장 꺼져 시도 안 되는지)까지
+한 번에 확인한다. 프로토콜을 고쳤을 때 PC 없이 1차 검증하는 수단.
+
+### ⚠️ 사본 동기화 (자동화 없음)
+
+`domiman_m.py`는 안드로이드 프로젝트의 `app/src/main/python/`으로 **손으로
+복사**해야 반영된다(`Copy-Item`, gradle 자동 태스크 없음). **원본만 고치고
+끝내면 앱은 옛 코드로 계속 돈다.**
+
+**2026-08-10 점검 결과 — 아래 '실제 안드로이드 프로젝트' 항목의 경로가 현재
+PC와 맞지 않는다:**
+- 문서에 적힌 `C:\Users\windo\dev\domiman-android`가 **이 PC에 없다**
+  (`C:\Users\windo\dev` 자체가 없음).
+- 대신 `C:\Users\windo\DomimanApp`이 있는데, 문서가 기술한 트리와 **다른
+  프로젝트**다: 패키지 `com.domiman.app`(문서는 `com.example.domiman`),
+  소스 폴더 `kotlin/`(문서는 `java/`), 화면 2개(`LoginScreen`/`ControlScreen`
+  — 최근 로그인·알림 설정 화면 없음), `DomimanPollService`(스트리밍 아닌 폴링),
+  위젯·`NotificationPrefs`·Navigation3 파일 전부 없음, **git 저장소가 아님**
+  (문서는 커밋 `e082da7`로 백업 중이라고 기술).
+- 그곳의 `domiman_m.py` 사본은 **287행**(원본 737행)이고 docstring이 "ntfy
+  프로토콜 클라이언트" — **UI 전면 재설계 이전 버전**이다.
+
+→ 즉 **문서가 기술하는 최종 앱은 이 PC에서 확인할 수 없다.** 앱을 다시
+만질 일이 생기면 **먼저 실제 프로젝트 위치를 사용자에게 확인**하고, 그 경로를
+이 문서에 갱신한 뒤 작업할 것. `DomimanApp`을 문서의 그 프로젝트로 착각해
+고치지 말 것.
+
+---
+
 **실제 안드로이드 프로젝트(구현됨) — 위치가 이 저장소 밖입니다(중요):**
 `C:\Users\windo\dev\domiman-android` (Kotlin/Compose, Chaquopy 17.0.0으로
 `domiman_m.py`를 그대로 내장). **이 `macro` 폴더 안이 아니다** — AGP/Chaquopy가
