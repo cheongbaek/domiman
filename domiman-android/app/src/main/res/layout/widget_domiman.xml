@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 4x1 홈 위젯: [새로고침] | 수량(0/0 또는 '로그인') | [다운로드=즉시회수] | [재생/중지].
+     아이콘은 제공된 초록 원형 세트(widget_ic_*). 각 버튼은 눌림 하이라이트(widget_btn_bg). -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="horizontal"
+    android:background="@drawable/widget_bg"
+    android:padding="6dp"
+    android:baselineAligned="false">
+
+    <ImageView
+        android:id="@+id/widget_refresh"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:padding="4dp"
+        android:background="@drawable/widget_btn_bg"
+        android:scaleType="fitCenter"
+        android:src="@drawable/widget_ic_refresh"
+        android:contentDescription="실시간 수량확인" />
+
+    <TextView
+        android:id="@+id/widget_qty"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:gravity="center"
+        android:maxLines="1"
+        android:text="0/0"
+        android:textColor="#202020"
+        android:textSize="16sp"
+        android:textStyle="bold" />
+
+    <ImageView
+        android:id="@+id/widget_collect"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:padding="4dp"
+        android:background="@drawable/widget_btn_bg"
+        android:scaleType="fitCenter"
+        android:src="@drawable/widget_ic_collect"
+        android:contentDescription="즉시 회수" />
+
+    <ImageView
+        android:id="@+id/widget_toggle"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:padding="4dp"
+        android:background="@drawable/widget_btn_bg"
+        android:scaleType="fitCenter"
+        android:src="@drawable/widget_ic_play"
+        android:contentDescription="시작/중지" />
+</LinearLayout>

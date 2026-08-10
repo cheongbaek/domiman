@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- ntfy.sh HTTP 통신(스트리밍 구독 + 발신)에 필요 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 백그라운드 알림 게시(Android 13+) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 백그라운드에서 프로세스를 살려두는 포그라운드 서비스.
+         dataSync는 Android 14+에서 하루 6시간 제한이 있어 장기 방치 시 종료된다
+         → 시간 제한이 없는 specialUse를 주 타입으로 쓰고, 구버전 폴백으로 dataSync 병기. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- 절전모드(배터리 최적화) 예외 요청 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <application
+        android:name=".DomimanApplication"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:windowSoftInputMode="adjustResize"
+        android:theme="@style/Theme.Domiman">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 백그라운드 ntfy 수신·알림 유지용 포그라운드 서비스.
+             specialUse|dataSync: 34+는 시간제한 없는 specialUse, 그 미만은 dataSync. -->
+        <service
+            android:name=".DomimanService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse|dataSync">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="ntfy_remote_control" />
+        </service>
+
+        <!-- 홈 위젯(4x1). 커스텀 액션 PendingIntent는 명시적(자기 UID)이라
+             exported=false로 충분. 시스템의 APPWIDGET_UPDATE는 프레임워크가 전달. -->
+        <receiver
+            android:name=".DomimanWidgetProvider"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/domiman_widget_info" />
+        </receiver>
+    </application>
+
+</manifest>

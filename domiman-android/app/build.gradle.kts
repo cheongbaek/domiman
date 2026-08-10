@@ -1,0 +1,116 @@
+plugins {
+  alias(libs.plugins.android.application)
+  alias(libs.plugins.compose.compiler)
+  alias(libs.plugins.kotlin.serialization)
+  alias(libs.plugins.chaquopy)
+}
+
+android {
+    namespace = "com.example.domiman"
+    compileSdk = 36
+    defaultConfig {
+        applicationId = "com.example.domiman"
+        minSdk = 24
+        targetSdk = 36
+        versionCode = 1
+        versionName = "1.0"
+        ndk {
+            // Chaquopy가 Python 인터프리터를 내장할 ABI(에뮬레이터=x86_64, 실기기=arm64-v8a)
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    buildFeatures {
+      compose = true
+      aidl = false
+      buildConfig = false
+      shaders = false
+    }
+
+    packaging {
+      resources {
+        excludes += "/META-INF/{AL2.0,LGPL2.1}"
+      }
+    }
+}
+
+kotlin {
+    jvmToolchain(17)
+}
+
+chaquopy {
+    defaultConfig {
+        version = "3.13"
+        // 이 컴퓨터의 py 런처 -V:3.13 슬롯이 (스토어 스텁)이라 자동 탐지가
+        // 실패한다(CLAUDE.md에 이미 기록된 함정과 같은 종류) — python.org
+        // 정식 설치 경로를 명시적으로 지정.
+        buildPython("C:/Users/windo/AppData/Local/Programs/Python/Python313/python.exe")
+        pip {
+            // domiman_m.py가 쓰는 유일한 3rd-party 의존성 (requests)
+            install("requests")
+        }
+    }
+    sourceSets {
+        getByName("main") {
+            // domiman_m.py(및 향후 파생 모듈)가 여기에 위치
+            srcDir("src/main/python")
+        }
+    }
+}
+
+dependencies {
+  val composeBom = platform(libs.androidx.compose.bom)
+  implementation(composeBom)
+  androidTestImplementation(composeBom)
+
+  // Core Android dependencies
+  implementation(libs.androidx.core.ktx)
+  implementation(libs.androidx.lifecycle.runtime.ktx)
+  implementation(libs.androidx.activity.compose)
+
+  // Arch Components
+  implementation(libs.androidx.lifecycle.runtime.compose)
+  implementation(libs.androidx.lifecycle.viewmodel.compose)
+
+  // Compose
+  implementation(libs.androidx.compose.ui)
+  implementation(libs.androidx.compose.ui.tooling.preview)
+  implementation(libs.androidx.compose.material3)
+  // Tooling
+  debugImplementation(libs.androidx.compose.ui.tooling)
+  // Instrumented tests
+  androidTestImplementation(libs.androidx.compose.ui.test.junit4)
+  debugImplementation(libs.androidx.compose.ui.test.manifest)
+
+  // Local tests: jUnit, coroutines, Android runner
+  testImplementation(libs.junit)
+  testImplementation(libs.kotlinx.coroutines.test)
+
+  // Instrumented tests: jUnit rules and runners
+  androidTestImplementation(libs.androidx.test.core)
+  androidTestImplementation(libs.androidx.test.ext.junit)
+  androidTestImplementation(libs.androidx.test.runner)
+  androidTestImplementation(libs.androidx.test.espresso.core)
+
+  // Navigation
+  implementation(libs.androidx.navigation3.ui)
+  implementation(libs.androidx.navigation3.runtime)
+  implementation(libs.androidx.lifecycle.viewmodel.navigation3)
+
+  // JSON (Chaquopy 경계에서 PyObject 대신 JSON 문자열로 주고받기 위함)
+  implementation(libs.kotlinx.serialization.json)
+}
+
+// APK 배포 위치: 빌드는 기본 경로(app/build/outputs/apk/debug/app-debug.apk)에 하고,
+// 완료 후 C:\Users\windo\OneDrive - 한국교통대학교\domiman.apk 로 '복사'해 배포한다.
+// (자동 copy 태스크는 두지 않음 — 매 빌드 후 수동/스크립트 복사.)

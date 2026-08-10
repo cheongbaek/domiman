@@ -310,7 +310,32 @@ background=`@drawable/ic_launcher_scene`, foreground=투명). 구버전용 밀�
 
 ---
 
-## 12. 아직 안 한 것 / 주의
+## 12. 다른 PC에서 재현하기 (프로젝트 소스는 이 리포에 포함됨)
+
+안드로이드 프로젝트 소스가 이 리포의 **`domiman-android/`** 폴더에 들어 있다
+(빌드 산출물 `build/`·`.gradle/`·기계별 `local.properties`는 제외 — 각 PC에서
+생성됨). 다른 PC에서 같은 앱을 만들려면:
+
+1. **리포를 ASCII 경로에 클론**하고 `domiman-android/`를 ASCII 전용 경로로
+   옮긴다(예: `C:\Users\<계정>\dev\domiman-android`). ⚠️ **경로에 한글/비ASCII가
+   있으면 AGP/Chaquopy 빌드가 거부된다.**
+2. **도구 설치**(§2 참고): Android Studio(→ 내장 JBR), Android SDK 컴포넌트
+   `platform-tools`·`build-tools/36.1.0`·`platforms/android-36`(+ 원하면
+   `emulator`+`system-images/android-36/google_apis/x86_64`), python.org 정식
+   Python 3.13(buildPython용). `ANDROID_HOME` 환경변수 지정.
+3. **`local.properties` 생성**: `sdk.dir=<그 PC의 SDK 경로>` 한 줄(예:
+   `C\:\\Users\\<계정>\\AppData\\Local\\Android\\Sdk`).
+4. **buildPython 경로 수정**: `app/build.gradle.kts`의
+   `chaquopy.defaultConfig.buildPython("C:/.../Python313/python.exe")`를 그 PC의
+   python.org 3.13 경로로 바꾼다(현재 하드코딩됨).
+5. **빌드**: `$env:JAVA_HOME="<Studio>\jbr"; .\gradlew.bat assembleDebug`
+   → `app/build/outputs/apk/debug/app-debug.apk`.
+
+원본 `domiman_m.py`는 리포 루트에 있고, 프로젝트 안 사본
+(`domiman-android/app/src/main/python/domiman_m.py`)이 실제 빌드에 쓰인다 —
+루트 원본을 고치면 사본에도 재복사(수동).
+
+## 13. 아직 안 한 것 / 주의
 
 - 시스템 뒤로가기 버튼 실제 인터셉트(`OnBackPressedCallback`) — 지금은 화면 내
   '로그아웃' 버튼으로만 2단계 확인.

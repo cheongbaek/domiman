@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 전체 장면(록맨 낚시)을 background로 꽉 채우면 One UI가 알아서 둥근 모양으로
+     마스킹한다. foreground는 투명(장면이 안전영역 축소 없이 가장자리까지 차게). -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_scene" />
+    <foreground android:drawable="@android:color/transparent" />
+</adaptive-icon>

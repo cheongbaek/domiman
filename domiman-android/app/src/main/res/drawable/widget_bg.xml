@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 위젯 배경(둥근 모서리 밝은 패널). 위젯은 테마 attr 해석이 불안정해 고정색 사용. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="#F2F2F2" />
+    <corners android:radius="16dp" />
+</shape>
