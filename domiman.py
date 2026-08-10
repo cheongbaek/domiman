@@ -311,7 +311,7 @@ def _ntfy_stream_loop():
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260809e"
+APP_VERSION = "260810b"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -625,8 +625,10 @@ def to_screen(coords):
     return int(ox + fx / 1920.0 * cw), int(oy + fy / 1080.0 * ch)
 
 
-def click_real(coords, delay=1.0):
-    """coords는 항상 FHD 좌표. to_screen이 실제 화면 좌표로 변환."""
+def click_real(coords, delay=0.5):
+    """coords는 항상 FHD 좌표. to_screen이 실제 화면 좌표로 변환.
+    클릭 후 대기(delay)는 **전 호출부 0.5초로 통일**되어 있다 — 호출부에서
+    delay를 따로 넘기지 말고 이 기본값을 쓸 것(값 대장 참고)."""
     x, y = to_screen(coords)
     ctypes.windll.user32.SetCursorPos(x, y)
     time.sleep(0.1)
@@ -803,11 +805,11 @@ def solve_quiz_step(region_q, answer_slots, side_label=""):
                 best_diff, best_center, best_index = diff, slot["center"], slot["index"]
         if best_center and best_diff < 80.0:
             print(f"    매칭 답안: {best_index}번 칸 (유사도 오차: {best_diff:.1f})")
-            click_real(best_center, delay=0.5)
+            click_real(best_center)
             return True
         elif best_center:
             print(f"    [경고] 오차가 높음 ({best_diff:.1f}), 그래도 최선: {best_index}번 칸")
-            click_real(best_center, delay=0.5)
+            click_real(best_center)
             return True
         print("    [실패] 매칭 답안을 찾지 못함")
         return False
@@ -1025,7 +1027,7 @@ def _use_card(row, col):
     """'사용하기' 클릭 -> ESC 2번(리스트 창 + 밑에 깔린 팝업). '낚시 시작'은
     누르지 않는다 — 누르기 전에 뭔가 더 확인할 게 있는 쪽(낚싯대 교체)이
     이 단계까지만 쓴다."""
-    click_real(BAIT_USE_BTNS[row][col], delay=1.0)
+    click_real(BAIT_USE_BTNS[row][col])
     press_esc(delay=0.5)
     press_esc(delay=1.0)
 
@@ -1033,7 +1035,7 @@ def _use_card(row, col):
 def _use_card_and_restart(row, col):
     """'사용하기' 클릭 -> ESC 2번(리스트 창 + 밑에 깔린 팝업) -> '낚시 시작'."""
     _use_card(row, col)
-    click_real(COORD_FISHING_BTN, delay=1.0)
+    click_real(COORD_FISHING_BTN)
 
 
 def _resume_fishing():
@@ -1042,7 +1044,7 @@ def _resume_fishing():
     press_esc(delay=0.5)
     press_esc(delay=0.5)
     press_esc(delay=0.5)
-    click_real(COORD_FISHING_BTN, delay=1.0)
+    click_real(COORD_FISHING_BTN)
 
 
 # ============================================================
@@ -1064,7 +1066,7 @@ def run_bait_swap_routine():
     press_esc(delay=0.5)
     press_esc(delay=0.5)
     press_esc(delay=0.5)
-    click_real(COORD_BAIT_LIST_BTN, delay=1.5)
+    click_real(COORD_BAIT_LIST_BTN)
 
     found = None
     for page in range(BAIT_MAX_PAGE_MOVES + 1):
@@ -1076,7 +1078,7 @@ def run_bait_swap_routine():
             break
         if page < BAIT_MAX_PAGE_MOVES:
             print(f" -> {page + 1}페이지 미감지 — 다음 페이지로 넘깁니다.")
-            click_real(COORD_BAIT_NEXT_BTN, delay=1.2)
+            click_real(COORD_BAIT_NEXT_BTN)
 
     fallback = found is None
     if fallback:
@@ -1109,23 +1111,26 @@ def _restart_or_collect_after_rod_swap():
     판정은 `_tank_needs_collect`로 감시 루프와 같은 기준을 쓴다.
 
     반환값: 회수 루틴을 실행했으면 True, 그냥 낚시를 재개했으면 False."""
-    time.sleep(1.0)          # 교체한 낚싯대 기준으로 수량 표시가 갱신될 시간
+    time.sleep(0.5)          # 교체한 낚싯대 기준으로 수량 표시가 갱신될 시간
+                             # (갱신 자체는 즉시. 화면 지연·순간 오류 대비분)
     qty = read_tank_quantity()
     if qty is None:
         print(" -> [살림망 확인 실패] 판독 불가 — 평소대로 낚시를 시작합니다.")
-        click_real(COORD_FISHING_BTN, delay=1.0)
+        click_real(COORD_FISHING_BTN)
         return False
 
     cur, mx = qty
     if not _tank_needs_collect(qty):
         print(f" -> [살림망 {cur}/{mx}] 여유 있음 — 낚시를 시작합니다.")
-        click_real(COORD_FISHING_BTN, delay=1.0)
+        click_real(COORD_FISHING_BTN)
         return False
 
     reason = "최대치 초과" if cur > mx else "회수 조건 충족"
     print(f" -> [살림망 {cur}/{mx}] {reason} — '낚시 시작' 대신 회수 루틴으로 넘어갑니다.")
     _stop_watch_capture()
-    run_fishing_routine()
+    # 교체 루틴이 방금 ESC로 화면을 정리했고 '낚시 시작'도 누르지 않았으므로
+    # 회수 루틴의 초반 절차(Enter+ESC 반복 + '낚시 취소')는 건너뛴다.
+    run_fishing_routine(skip_cancel=True)
     return True
 
 
@@ -1147,7 +1152,7 @@ def run_rod_swap_routine():
     press_esc(delay=0.5)
     press_esc(delay=0.5)
     press_esc(delay=0.5)
-    click_real(COORD_ROD_LIST_BTN, delay=1.5)
+    click_real(COORD_ROD_LIST_BTN)
 
     cards = _find_cards_by_pattern(ROD_TARGET_PATTERN)
     if cards:
@@ -1168,8 +1173,14 @@ def run_rod_swap_routine():
     set_status("fishing")
 
 
-def run_fishing_routine():
-    """살림망 수거(퀴즈 풀이) 루틴. 성공 여부와 무관하게 낚시를 재시작한다."""
+def run_fishing_routine(skip_cancel=False):
+    """살림망 수거(퀴즈 풀이) 루틴. 성공 여부와 무관하게 낚시를 재시작한다.
+
+    skip_cancel=True면 맨 앞의 Enter+ESC 반복과 '낚시 취소' 클릭을 **무조건**
+    건너뛰고 바로 '살림망 확인'으로 직행한다. 낚싯대 교체 직후처럼 부르는 쪽이
+    이미 ESC로 화면을 정리했고 낚시가 멈춰 있는 것이 확실한 경우에 쓴다 —
+    닫을 창이 없는데 연타할 이유가 없고, 취소할 게 없는 상태에서 같은 좌표를
+    누르면 오히려 낚시가 새로 시작돼 버리는 함정도 피한다."""
     print("\n=== 낚시 수거 루틴 시작 ===")
     set_status("collect")
 
@@ -1196,19 +1207,24 @@ def run_fishing_routine():
         # 낚시 취소(진행 중)면 기존 그대로, 낚시 시작(대기 중)이 확인되면
         # 취소할 게 없으므로 ESC/Enter+취소 클릭을 생략하고 바로 수량 확인으로.
         # 판독 불가(None)면 안전하게 기존 동작(진행 중 가정) 유지.
-        if is_fishing_active() is not False:
+        # skip_cancel이면 판독조차 하지 않고 생략한다(부르는 쪽이 이미 앎).
+        if skip_cancel:
+            print("1. 낚싯대 교체 직후 — 화면이 이미 정리돼 있어 취소 절차 생략")
+        elif is_fishing_active() is not False:
             print("1. 낚시 취소")
+            # Enter+ESC 연타는 혹시 떠 있을 **게임 내부 창**을 닫기 위한 것.
+            # (게임 창들은 게임 자체 레이아웃이며 별도 Windows 창으로 뜨지 않음)
             for _ in range(4):
                 press_key(VK_RETURN, 0.5)
                 press_key(VK_ESCAPE, 0.5)
 
-            click_real(COORD_FISHING_BTN, delay=2)
+            click_real(COORD_FISHING_BTN)
             print(f" -> [종료 시각] {time.strftime('%Y-%m-%d %H:%M:%S')}")
         else:
             print("1. '낚시 시작' 상태 확인 — 취소 절차 생략")
 
         print("2. 살림망 확인")
-        click_real(COORD_TANK_BTN, delay=1.5)
+        click_real(COORD_TANK_BTN)
 
         answer_slots = get_answer_slot_regions(REGION_ANSWERS)
         max_retries = 10
@@ -1218,7 +1234,7 @@ def run_fishing_routine():
         while attempt < max_retries:
             attempt += 1
             print(f"\n[시도 {attempt}/{max_retries}] 퀴즈 풀이 프로세스 시작")
-            click_real(COORD_MYROOM_BTN, delay=2.5)
+            click_real(COORD_MYROOM_BTN)
             solve_quiz_step(REGION_Q_LEFT, answer_slots, "왼쪽")
             time.sleep(0.5)
             solve_quiz_step(REGION_Q_RIGHT, answer_slots, "오른쪽")
@@ -1235,11 +1251,11 @@ def run_fishing_routine():
                 print(" -> [경고] 최대 재시도(10회) 초과. 강제 진행합니다.")
 
         print("4. 완료 확인")
-        click_real(COORD_CONFIRM_BTN, delay=1)
+        click_real(COORD_CONFIRM_BTN)
 
         print("5. 낚시 다시 시작")
         print(f" -> [시작 시각] {time.strftime('%Y-%m-%d %H:%M:%S')}")
-        click_real(COORD_FISHING_BTN, delay=1)
+        click_real(COORD_FISHING_BTN)
 
         result_str = "SUCCESS" if verify_success else f"FAIL (tried {attempt})"
         print(f"=== 루틴 완료 [{result_str}] ===")
@@ -1326,7 +1342,7 @@ class FishingWorker(threading.Thread):
                 # (뒤에 두면 회수 분기가 continue로 삼켜 도달하지 못한다).
                 if self.rod_swap and (minsec == 1 or _tank_needs_collect(qty)):
                     run_rod_swap_routine()
-                    self.stop_event.wait(2.0)
+                    self.stop_event.wait(0.5)
                     continue
 
                 # 낚싯대 자동교체가 꺼져 있을 때의 회수 경로
@@ -1334,13 +1350,13 @@ class FishingWorker(threading.Thread):
                     print(" -> [회수 조건 충족] 회수 루틴을 실행합니다.")
                     _stop_watch_capture()
                     run_fishing_routine()
-                    self.stop_event.wait(3.0)
+                    self.stop_event.wait(0.5)
                     continue
 
                 # 매 사이클 팝업 확인(체크박스로 개별 on/off)
                 if self.bait_swap and _detect_no_bait_popup():
                     run_bait_swap_routine()
-                    self.stop_event.wait(2.0)
+                    self.stop_event.wait(0.5)
                     continue
 
                 # 살림망 수량이 3회 이상 그대로 — 낚시가 멈춰있을 수 있으니 확인
@@ -1350,7 +1366,7 @@ class FishingWorker(threading.Thread):
                         print(f" -> [낚시 정지 감지] 살림망 수량이 {same_count}회 연속 "
                               f"동일 + '낚시 시작' 확인 — 재개합니다.")
                         _resume_fishing()
-                        self.stop_event.wait(2.0)
+                        self.stop_event.wait(0.5)
                         continue
             else:
                 fail_streak += 1
