@@ -616,23 +616,43 @@ Navigation3/ViewModel과 겹쳐서, `DomimanRepository`는 그보다 낮은
 복사**해야 반영된다(`Copy-Item`, gradle 자동 태스크 없음). **원본만 고치고
 끝내면 앱은 옛 코드로 계속 돈다.**
 
-**2026-08-10 점검 결과 — 아래 '실제 안드로이드 프로젝트' 항목의 경로가 현재
-PC와 맞지 않는다:**
-- 문서에 적힌 `C:\Users\windo\dev\domiman-android`가 **이 PC에 없다**
-  (`C:\Users\windo\dev` 자체가 없음).
-- 대신 `C:\Users\windo\DomimanApp`이 있는데, 문서가 기술한 트리와 **다른
-  프로젝트**다: 패키지 `com.domiman.app`(문서는 `com.example.domiman`),
-  소스 폴더 `kotlin/`(문서는 `java/`), 화면 2개(`LoginScreen`/`ControlScreen`
-  — 최근 로그인·알림 설정 화면 없음), `DomimanPollService`(스트리밍 아닌 폴링),
-  위젯·`NotificationPrefs`·Navigation3 파일 전부 없음, **git 저장소가 아님**
-  (문서는 커밋 `e082da7`로 백업 중이라고 기술).
-- 그곳의 `domiman_m.py` 사본은 **287행**(원본 737행)이고 docstring이 "ntfy
-  프로토콜 클라이언트" — **UI 전면 재설계 이전 버전**이다.
+**2026-08-10 점검 결과 — 아래 문서 내용은 맞다. 다만 Kotlin 소스가 이 PC에
+없다(빌드 산출물만 있다).**
 
-→ 즉 **문서가 기술하는 최종 앱은 이 PC에서 확인할 수 없다.** 앱을 다시
-만질 일이 생기면 **먼저 실제 프로젝트 위치를 사용자에게 확인**하고, 그 경로를
-이 문서에 갱신한 뒤 작업할 것. `DomimanApp`을 문서의 그 프로젝트로 착각해
-고치지 말 것.
+**① 배포된 APK가 문서 내용을 증명한다.** `C:\Users\windo\OneDrive -
+한국교통대학교\domiman.apk`(약 47MB, 2026-07-28 13:32)를 열어 확인:
+- 패키지 `com.example.domiman` (dex 내 클래스 참조 348건) — 문서 그대로
+- 문서가 기술한 클래스가 **전부 존재**: `DomimanApplication` `MainActivity`
+  `NavigationKt` `DomimanService` `DomimanWidgetProvider` `NotificationSettings`
+  `data/{DomimanRepository, DomimanNotifications, NotificationPrefs, NotifyItem,
+  DomimanStatus, DispatchResult, SavedLoginJson, LoginStoreJson}`
+  `ui/{login, main, notif, recent}` `theme/`
+- Chaquopy(Python 3.13, `libpython3.13.so`), dex 11개
+- 내장 Python은 **`assets/chaquopy/app.imy` 안의 `domiman_m.pyc` 하나뿐**
+  (44,422 bytes). `attempt_login_json`·`dispatch_json`·`notify_key_for_report`
+  ·`NOTIFY_KEYS`·`stream_disconnect`·`parse_tank_reply`·`LoginFlow`
+  ·`MobileLogBuffer` 심볼과 이 저장소 원본의 한글 docstring이 그대로 들어 있어
+  **737행 최신 원본으로 빌드된 것**이 확인된다.
+
+  ※ 검증 방법(재사용): apk는 zip이다. `unzip -o apk 'classes*.dex'
+  'assets/chaquopy/app.imy'` 후 dex를 바이너리 그대로 훑어
+  `Lcom/...;` 문자열을 뽑고, `app.imy`(역시 zip)에서 `domiman_m.pyc`를 꺼내
+  심볼 문자열을 확인한다.
+
+**② 그런데 Kotlin 소스는 이 PC에 없다.** 문서에 적힌
+`C:\Users\windo\dev\domiman-android`가 없고(`C:\Users\windo\dev` 자체가 없음),
+`DomimanService.kt`·`NotificationPrefs.kt`·`DomimanRepository.kt`
+·`DomimanWidgetProvider.kt`를 **C 드라이브 전체에서 찾아도 하나도 없다.**
+`domiman_android.md`·`domiman_protocol.md`·`domiman-release.jks`도 없다.
+→ **Kotlin 쪽 수정 요청은 소스를 확보하기 전에는 착수할 수 없다.** 먼저
+사용자에게 실제 프로젝트 위치(다른 PC인지 등)를 확인하고 이 문서를 갱신할 것.
+
+**③ 헷갈리기 쉬운 '가짜' 폴더 3개 — 문서의 그 프로젝트가 아니다:**
+| 경로 | 정체 |
+|---|---|
+| `C:\Users\windo\DomimanApp` | 초기 시제품. 패키지 `com.domiman.app`, 소스 폴더 `kotlin/`, 화면 2개(`LoginScreen`/`ControlScreen`), `DomimanPollService`(폴링), 위젯·알림설정 없음, git 아님. `domiman_m.py` 사본이 **287행**(재설계 이전) |
+| `C:\humble\workspace\domiman` | 또 다른 시제품(2026-07-20~21). 패키지 `com.domiman.control`, `App/Bus/ControlService/Prefs/StreamCallback.kt` + `bridge.py`. 상위 git은 무관한 ROS 워크스페이스 |
+| `C:\Program Files\domiman`, `macro\dist\domiman` | **PC판 exe** 설치본/빌드 산출물. 안드로이드와 무관 |
 
 ---
 
