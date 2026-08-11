@@ -311,7 +311,7 @@ def _ntfy_stream_loop():
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260811a"
+APP_VERSION = "260812a"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -954,7 +954,9 @@ def _tank_needs_collect(qty):
       1. 감시 루프의 회수 조건
       2. 낚싯대 교체 직후 재확인(_restart_or_collect_after_rod_swap)
       3. 실시간 수량확인(_tank_check_and_resume)의 재개 클릭 생략 판정
-    (낚싯대 교체 트리거로도 쓰였으나 제거됨 — 트리거는 minsec==1 하나뿐)"""
+    낚싯대 교체 트리거(`minsec==1 or cur>mx`)는 이 함수를 쓰지 **않는다** —
+    한때 이 조건 전체를 트리거로 썼다가 멀쩡한 낚싯대까지 갈아 끼워 뺐고,
+    지금 남은 건 더 좁은 `cur > mx`(초과)뿐이다."""
     cur, mx = qty
     return cur >= mx - TANK_COLLECT_MARGIN
 
@@ -1338,13 +1340,18 @@ class FishingWorker(threading.Thread):
                 else:
                     same_qty, same_count = qty, 1
 
-                # --- 낚싯대 교체 트리거: 최소 획득 시간이 '1초' 하나뿐 ---
-                # 교체가 필요하면 게임이 최소 획득 시간을 '1초'로 표시하는 것을
-                # 이용한다. 낚싯대 **전용** 신호라는 점이 핵심.
-                # 예전엔 '살림망이 최대치 5개 이내(cur+5>=mx)'를 OR로 함께 봤으나
-                # 제거했다 — 살림망이 찬 것은 낚싯대 상태와 무관하고, 아래 회수
-                # 분기가 처리할 일을 가로채 멀쩡한 낚싯대까지 교체했다.
-                if self.rod_swap and minsec == 1:
+                # --- 낚싯대 교체 트리거 (둘 중 하나면 OR로 발동) ---
+                #  ① 최소 획득 시간이 '1초' — 교체가 필요하면 게임이 그렇게 표시
+                #  ② cur > mx (예: 570/420) — 최대치가 더 작은 낚싯대로 바뀌어
+                #     살림망이 넘친 상태. 이때는 '낚시 시작'을 눌러도 낚시가 걸리지
+                #     않으므로 회수만으로는 재개하지 못한다. 최대치가 더 큰 낚싯대로
+                #     갈아 끼워 초과 상태 자체를 벗어난다.
+                # ②는 아래 회수 조건(cur+5>=mx)의 부분집합이라 반드시 그보다
+                # **먼저** 본다(뒤에 두면 회수 분기의 continue가 삼켜 도달 못 함).
+                # 260811a에서 뺀 것은 ②가 아니라 회수 조건 **전체**(cur+5>=mx)였다
+                # — 그건 467/470처럼 멀쩡한 낚싯대까지 갈아 끼웠다. cur>mx는 낚싯대
+                # 최대치가 실제로 모자란 상태만 가리키므로 그 오작동이 없다.
+                if self.rod_swap and (minsec == 1 or qty[0] > qty[1]):
                     run_rod_swap_routine()
                     self.stop_event.wait(0.5)
                     continue
