@@ -311,7 +311,7 @@ def _ntfy_stream_loop():
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260810b"
+APP_VERSION = "260811a"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -951,9 +951,10 @@ def _tank_needs_collect(qty):
     (가득차기 TANK_COLLECT_MARGIN칸 전부터 True, 최대치 초과 cur > mx도 포함).
 
     한 기준을 세 곳이 공유한다:
-      1. 감시 루프의 낚싯대 교체 트리거 ② (평시에 '살림망이 가득 차' 오류 예방)
-      2. 감시 루프의 회수 조건 (낚싯대 자동교체가 꺼져 있을 때)
-      3. 낚싯대 교체 직후 재확인(_restart_or_collect_after_rod_swap)"""
+      1. 감시 루프의 회수 조건
+      2. 낚싯대 교체 직후 재확인(_restart_or_collect_after_rod_swap)
+      3. 실시간 수량확인(_tank_check_and_resume)의 재개 클릭 생략 판정
+    (낚싯대 교체 트리거로도 쓰였으나 제거됨 — 트리거는 minsec==1 하나뿐)"""
     cur, mx = qty
     return cur >= mx - TANK_COLLECT_MARGIN
 
@@ -1097,9 +1098,7 @@ def _restart_or_collect_after_rod_swap():
     **낚싯대마다 최대 살림망 개수가 다르므로 교체로 mx가 바뀐다.** 그래서 교체
     전 판단을 그대로 쓸 수 없고, 새 낚싯대 기준으로 한 번 더 보고 갈라야 한다:
     - `cur + 5 < mx` (예: 465 -> 465/920으로 최대치가 커짐) → 회수할 필요가
-      없어졌다. 그대로 '낚시 시작'을 눌러 재개한다. 감시 루프의 교체 트리거 ②
-      (`cur+5>=mx`)가 노리는 것이 바로 이 경로 — 회수 없이 낚시를 이어가며
-      '살림망이 가득 차' 오류를 미리 피한다.
+      없어졌다. 그대로 '낚시 시작'을 눌러 재개한다.
     - `cur + 5 >= mx` (최대치가 그대로거나 더 작아 초과, 예: 535/470) →
       '낚시 시작'을 눌러도 낚시가 걸리지 않는다. 누르지 않고 곧바로 회수
       루틴으로 넘긴다. 회수 루틴은 맨 앞에서 is_fishing_active()로 버튼 글자를
@@ -1245,8 +1244,16 @@ def run_fishing_routine(skip_cancel=False):
                 verify_success = True
                 break
             if attempt < max_retries:
-                print(" -> [확인 실패] 다시 시도합니다...")
-                time.sleep(2.0)
+                # 실패했다는 건 이전 시도의 창/팝업이 화면에 그대로 남아 있다는
+                # 뜻이라, '마이룸 보내기'부터 다시 눌러 봐야 같은 화면을 헛돈다.
+                # ESC 3번으로 종류 불문 정리한 뒤 '살림망 확인'부터 다시 밟아
+                # 퀴즈 창을 새로 연다. (ESC/클릭의 기본 0.5초 대기가 곧 재시도
+                #  간격이 되므로 별도 sleep은 두지 않는다)
+                print(" -> [확인 실패] 화면을 정리하고 살림망 확인부터 다시 시도합니다...")
+                press_esc(delay=0.5)
+                press_esc(delay=0.5)
+                press_esc(delay=0.5)
+                click_real(COORD_TANK_BTN)
             else:
                 print(" -> [경고] 최대 재시도(10회) 초과. 강제 진행합니다.")
 
@@ -1331,21 +1338,18 @@ class FishingWorker(threading.Thread):
                 else:
                     same_qty, same_count = qty, 1
 
-                # --- 낚싯대 교체 트리거 (둘 중 하나면 OR로 발동) ---
-                #  ① 최소 획득 시간이 '1초'  ② 살림망이 최대치 5개 이내(cur+5>=mx)
-                # ②는 '살림망이 가득 차 낚시를 진행할 수 없습니다' 오류가 뜨는
-                # 상황을 평시에 미리 막기 위한 것이다. 교체한 낚싯대의 최대치가
-                # 더 크면 회수 없이 그대로 낚시가 이어지고, 그렇지 않으면 교체
-                # 루틴 끝의 재확인(_restart_or_collect_after_rod_swap)이 회수로
-                # 넘긴다 — 그래서 여기서 회수를 따로 부르지 않는다.
-                # ②는 아래 회수 분기와 같은 조건이라 반드시 그보다 **먼저** 본다
-                # (뒤에 두면 회수 분기가 continue로 삼켜 도달하지 못한다).
-                if self.rod_swap and (minsec == 1 or _tank_needs_collect(qty)):
+                # --- 낚싯대 교체 트리거: 최소 획득 시간이 '1초' 하나뿐 ---
+                # 교체가 필요하면 게임이 최소 획득 시간을 '1초'로 표시하는 것을
+                # 이용한다. 낚싯대 **전용** 신호라는 점이 핵심.
+                # 예전엔 '살림망이 최대치 5개 이내(cur+5>=mx)'를 OR로 함께 봤으나
+                # 제거했다 — 살림망이 찬 것은 낚싯대 상태와 무관하고, 아래 회수
+                # 분기가 처리할 일을 가로채 멀쩡한 낚싯대까지 교체했다.
+                if self.rod_swap and minsec == 1:
                     run_rod_swap_routine()
                     self.stop_event.wait(0.5)
                     continue
 
-                # 낚싯대 자동교체가 꺼져 있을 때의 회수 경로
+                # 회수 경로 (살림망이 찼을 때의 정상 처리)
                 if _tank_needs_collect(qty):
                     print(" -> [회수 조건 충족] 회수 루틴을 실행합니다.")
                     _stop_watch_capture()
