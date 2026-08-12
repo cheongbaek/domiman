@@ -311,7 +311,7 @@ def _ntfy_stream_loop():
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260812a"
+APP_VERSION = "260813a"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -373,6 +373,7 @@ REGION_VERIFY_TEXT = (832, 503, 255, 38)
 
 REGION_TANK_QTY = (825, 989, 130, 36)   # 살림망 수량 'cur/max'
 REGION_MIN_TIME = (940, 916, 72, 34)    # 최소 획득 시간 'n초'
+REGION_MAX_TIME = (1035, 916, 80, 34)   # 최대 획득 시간 'n초' (만료 교차 확인용)
 TANK_COLLECT_MARGIN = 5                 # 회수 조건: cur >= max - 5 (가득차기 5칸 전)
 
 # --- 미끼 자동 교체 ---
@@ -954,17 +955,17 @@ def _tank_needs_collect(qty):
       1. 감시 루프의 회수 조건
       2. 낚싯대 교체 직후 재확인(_restart_or_collect_after_rod_swap)
       3. 실시간 수량확인(_tank_check_and_resume)의 재개 클릭 생략 판정
-    낚싯대 교체 트리거(`minsec==1 or cur>mx`)는 이 함수를 쓰지 **않는다** —
+    낚싯대 교체 트리거(만료 확인 or `cur>mx`)는 이 함수를 쓰지 **않는다** —
     한때 이 조건 전체를 트리거로 썼다가 멀쩡한 낚싯대까지 갈아 끼워 뺐고,
     지금 남은 건 더 좁은 `cur > mx`(초과)뿐이다."""
     cur, mx = qty
     return cur >= mx - TANK_COLLECT_MARGIN
 
 
-def read_min_gain_time(retries=3, delay=0.2):
-    """최소 획득 시간(초) 또는 None."""
+def _read_gain_time(region, retries=3, delay=0.2):
+    """획득 시간 영역('n초')에서 초를 읽는다. 실패면 None."""
     for i in range(retries):
-        txt = _ocr_region(REGION_MIN_TIME)
+        txt = _ocr_region(region)
         if txt:
             m = re.search(r'(\d+)', txt)
             if m:
@@ -974,6 +975,33 @@ def read_min_gain_time(retries=3, delay=0.2):
         if i < retries - 1:
             time.sleep(delay)
     return None
+
+
+def read_min_gain_time(retries=3, delay=0.2):
+    """최소 획득 시간(초) 또는 None. 폴링 간격 + 낚싯대 만료 신호로 쓴다."""
+    return _read_gain_time(REGION_MIN_TIME, retries, delay)
+
+
+def read_max_gain_time(retries=3, delay=0.2):
+    """최대 획득 시간(초) 또는 None. **낚싯대 만료 교차 확인 전용**이라
+    `minsec == 1`일 때만 읽는다(평시 사이클의 OCR 부담은 그대로).
+
+    왜 필요한가(실측): easyocr이 **'11초'를 '1초'로 잘못 읽는다.** 리포의
+    `20260813001332.jpg`(최소 11초 / 최대 12초인 정상 낚시 화면)에서 최소가
+    '1초'로 읽혀 낚싯대 교체가 헛발동했다. **확신도로는 못 거른다** — 틀린
+    '1초'가 0.57~0.95, 맞는 '11초'가 0.51~0.54로 오히려 뒤집힌다. 영역을
+    넓혀도(잘림이 아니라 인식 오류라) 그대로이고, 확대 배율에 따라 답이
+    오락가락한다(x2/x3는 '11초', x4는 '1초').
+
+    대신 **낚싯대 기간이 만료되면 최소·최대가 둘 다 '1초'** 라는 성질을 쓴다.
+    보유 표본 실측: `expire_20260719025713`은 최소 1초/최대 1초, 정상 화면은
+    30/60·20/70·11/12로 **최대가 항상 더 크다.** 따라서 최대가 1이 아니면
+    최소의 '1'은 오인식이다.
+
+    영역 (1035,916,80,34)은 후보 3개를 위 표본 전부에 돌려 고른 것 —
+    60초·1초·70초·12초를 모두 맞히면서 최저 확신도가 0.83으로 가장 높았다
+    (다른 후보들은 특정 표본에서 0.39까지 떨어졌다)."""
+    return _read_gain_time(REGION_MAX_TIME, retries, delay)
 
 
 def _detect_no_bait_popup():
@@ -1318,6 +1346,7 @@ class FishingWorker(threading.Thread):
         fail_streak = 0
         same_qty = None
         same_count = 0
+        misread_warned = False    # 같은 오인식 상태의 로그 반복 억제
 
         while not self.stop_event.is_set():
             _ensure_watch_capture()
@@ -1325,6 +1354,25 @@ class FishingWorker(threading.Thread):
             qty = read_tank_quantity()
             _last_tank = qty          # 기록만 (성공=(cur,mx)/실패=None, 위 정의 주석 참고)
             minsec = read_min_gain_time()
+
+            # '1초'는 낚싯대 만료 신호지만 **'11초'의 오인식일 수도** 있다
+            # (실측 사례는 read_max_gain_time 참고). 만료면 최대 획득 시간도
+            # 1초이므로 그걸로 교차 확인한다. 확인 안 되면 minsec을 버려
+            # 폴링 간격까지 1초로 오염되는 것도 막는다(그러면 3초마다 폴링).
+            rod_expired = False
+            if minsec == 1:
+                maxsec = read_max_gain_time()
+                rod_expired = (maxsec == 1)
+                if not rod_expired:
+                    if not misread_warned:
+                        detail = ("판독 실패" if maxsec is None else f"{maxsec}초")
+                        print(f"[{time.strftime('%H:%M:%S')}] 최소 획득 시간이 "
+                              f"'1초'로 읽혔으나 최대 획득 시간이 {detail} — "
+                              f"만료가 아니라고 보고 교체하지 않습니다.")
+                        misread_warned = True
+                    minsec = None
+            else:
+                misread_warned = False
 
             if minsec is not None:
                 last_interval = float(minsec)
@@ -1341,7 +1389,9 @@ class FishingWorker(threading.Thread):
                     same_qty, same_count = qty, 1
 
                 # --- 낚싯대 교체 트리거 (둘 중 하나면 OR로 발동) ---
-                #  ① 최소 획득 시간이 '1초' — 교체가 필요하면 게임이 그렇게 표시
+                #  ① 최소·최대 획득 시간이 둘 다 '1초'(= rod_expired) — 교체가
+                #     필요하면 게임이 그렇게 표시한다. 최소만 보면 '11초'를
+                #     '1초'로 읽는 오인식에 걸리므로 위에서 교차 확인해 둔다.
                 #  ② cur > mx (예: 570/420) — 최대치가 더 작은 낚싯대로 바뀌어
                 #     살림망이 넘친 상태. 이때는 '낚시 시작'을 눌러도 낚시가 걸리지
                 #     않으므로 회수만으로는 재개하지 못한다. 최대치가 더 큰 낚싯대로
@@ -1351,7 +1401,7 @@ class FishingWorker(threading.Thread):
                 # 260811a에서 뺀 것은 ②가 아니라 회수 조건 **전체**(cur+5>=mx)였다
                 # — 그건 467/470처럼 멀쩡한 낚싯대까지 갈아 끼웠다. cur>mx는 낚싯대
                 # 최대치가 실제로 모자란 상태만 가리키므로 그 오작동이 없다.
-                if self.rod_swap and (minsec == 1 or qty[0] > qty[1]):
+                if self.rod_swap and (rod_expired or qty[0] > qty[1]):
                     run_rod_swap_routine()
                     self.stop_event.wait(0.5)
                     continue
