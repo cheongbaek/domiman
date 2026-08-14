@@ -7,13 +7,15 @@ domiman.py — 테일즈러너 낚시 자동화 GUI (낚시.py의 GUI 재구성�
 - 자동화 로직은 낚시.py에서 이식: FHD=pyautogui / QHD=WGC 캡처,
   윤곽선 매칭 퀴즈 풀이, 살림망 감시 모드, 미끼/낚싯대 자동 교체,
   접속 끊김 감지(GUI에서는 종료하지 않고 대기).
-- ntfy 원격 제어: 같은 채널의 다른 PC(domiman)를 최상단 제어PC 버튼으로
-  선택해 간접 제어. 프로토콜 규격은 [2. 설정 파일 + ntfy] 섹션 주석 참고.
-  이름/채널/PC 리스트는 domiman_config.json에 보존.
+- domichat 원격 제어: 피제어 PC마다 채팅방 하나(domi_fishing_{ID})를 쓰고,
+  최상단 제어PC 버튼으로 그 방에 들어가 간접 제어한다. 프로토콜 규격은
+  [2. 설정 · 자격 + domichat 통신] 섹션 주석 참고. 서버 IP·ID·PC 리스트는
+  domiman_config.json, 비밀번호는 domiman_secrets.dat(DPAPI 암호화)에 보존.
 - exe 패키징(콘솔 창 없이 GUI만):
     pyinstaller --noconsole --onedir --add-data "ocr_model;ocr_model" domiman.py
 """
 import ctypes
+import hashlib
 import time
 import sys
 import os
@@ -22,6 +24,8 @@ import random
 import json
 import queue
 import socket
+import ssl
+import struct
 import subprocess
 import threading
 import traceback
@@ -140,24 +144,47 @@ sys.excepthook = _unhandled_exception_hook
 
 
 # ============================================================
-# [2. 설정 파일 + ntfy.sh 프로토콜 통신 (양방향 원격 제어)]
+# [2. 설정 · 자격 + domichat 프로토콜 통신 (양방향 원격 제어)]
 # ------------------------------------------------------------
-# 메시지 규격 (같은 채널의 PC들이 이름으로 서로를 지목, 대소문자 구분):
+# 메시지 규격은 ntfy 시절과 **글자 하나 다르지 않다**:
 #   명령:   "(대상PC),(명령)[,인자...]"   예) GOD3,S / GOD3,T,30
 #   응답:   "(요청자PC),Z,..."            예) BGOD,Z,0,1080,a,f,t,t
-#           (요청자가 무명(휴대폰 등)이면 ",Z,..." 로 시작) /.
 #   보고:   ",Z,F,(코드)[,(서브)]"        예) ,Z,F,y,b (미끼 교체 성공)
-# 발신자 식별은 ntfy Title(=발신 PC 이름). 규격 외 메시지는 무시.
+#
+# 바뀐 것은 전송 계층뿐이다. ntfy 채널 하나를 여러 PC가 공유하던 방식에서,
+# **피제어 PC마다 domichat 채팅방 하나**를 쓰는 방식으로 옮겼다:
+#   - 방 이름 = domi_fishing_{피제어 PC의 로그인 ID}
+#   - 방 유형 = 비밀번호 방(고정 비번). 일반 domichat 사용자의 오진입만 막는 용도로,
+#     방장(피제어 PC)이 없어도 제어 PC가 바로 들어갈 수 있어 승인 왕복이 없다.
+#   - 피제어 PC가 실행되면 자기 방을 만들고(있으면 입장) 방장이 된다.
+#   - 제어 PC는 대상 ID로 방 이름을 계산해 들어가 구독하고, 예전처럼 S 질의부터 보낸다.
+#   - 피제어 PC가 꺼지면 방장이 방에서 빠지고(member in=false) 제어가 자동 종료된다.
+#
+# **PC 이름 설정 항목은 없앴다.** 발신자 식별은 domichat 로그인 ID이며(서버가 찍어
+# 주므로 위조 불가), 예전 ntfy 이름 설정은 무시한다.
 # ============================================================
-CONFIG_PATH = os.path.join(LOG_DIR, "domiman_config.json")
-NTFY_SERVER = "https://ntfy.sh"
-DEFAULT_NTFY_TOPIC = "talesrunnerisgood"
-_ntfy_enabled = False
-NTFY_SEND_ATTEMPTS = 3       # 발신 재시도 총 횟수(일시적 실패·순간 한도 대비)
-NTFY_SEND_DEADLINE = 8.0     # 재시도 총 제한(초) — 요청자의 15초 응답 대기 안에 끝나야 한다
-NTFY_QUOTA_COOLDOWN = 900.0  # 일일 한도(42908) 감지 후 발신을 멈추는 시간(초)
-_ntfy_quota_reported = 0.0   # 한도 조회 로그 도배 방지용 타임스탬프
-_ntfy_quota_until = 0.0      # 이 시각까지 발신 보류(일일 한도 소진 상태)
+# 설정·자격 저장 위치. DOMIMAN_DIR 환경변수로 바꿀 수 있다(테스트·다중 프로필용).
+_CFG_DIR = os.environ.get("DOMIMAN_DIR") or LOG_DIR
+os.makedirs(_CFG_DIR, exist_ok=True)
+CONFIG_PATH = os.path.join(_CFG_DIR, "domiman_config.json")
+SECRETS_PATH = os.path.join(_CFG_DIR, "domiman_secrets.dat")
+
+CHAT_PORT = 47821                       # domiserver 기본 포트
+ROOM_PREFIX = "domi_fishing_"
+ROOM_PW = "domi_fishing_9714"           # 고정(오진입 방지용)
+FRAME_HEAD = struct.Struct(">IB")       # [길이 4][종류 1] — domichat.md 참고
+MAX_FRAME = 1024 * 1024
+CONNECT_TIMEOUT = 6.0
+READ_TIMEOUT = 60.0                     # 서버 ping 15초 → 60초 침묵이면 죽은 연결
+RECONNECT_BACKOFF = (1, 2, 5, 10, 30)
+
+chat_enabled = False                    # 'domichat 메시지' 체크박스와 연동
+MY_ID = ""                              # 로그인 ID(예전 PC 이름 자리)
+MY_ROOM = ""                            # domi_fishing_{MY_ID}
+
+
+def room_of(uid):
+    return f"{ROOM_PREFIX}{uid}"
 
 
 def load_config():
@@ -170,124 +197,319 @@ def load_config():
         return {}
 
 
-def save_config(name, channel, pc_list):
-    """이름/채널/저장된 PC 리스트를 설정 파일에 보존."""
+def save_config(ip, uid, pc_list):
+    """서버 IP·로그인 ID·제어 대상 PC 리스트를 보존."""
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as fp:
-            json.dump({"name": name, "channel": channel, "pc_list": pc_list},
+            json.dump({"ip": ip, "id": uid, "pc_list": pc_list},
                       fp, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[경고] 설정 저장 실패: {e}")
 
 
-# 기본 이름: 호스트명(영문+숫자가 아니면 "TR"). 설정 파일 값이 있으면 그것을 우선.
-_default_name = socket.gethostname()
-if not re.fullmatch(r"[A-Za-z0-9]+", _default_name or ""):
-    _default_name = "TR"
-_cfg = load_config()
-PC_NAME = _cfg.get("name") if re.fullmatch(
-    r"[A-Za-z0-9]+", str(_cfg.get("name") or "")) else _default_name
-NTFY_TOPIC = _cfg.get("channel") if re.fullmatch(
-    r"[A-Za-z0-9_\-]+", str(_cfg.get("channel") or "")) else DEFAULT_NTFY_TOPIC
-NTFY_URL = f"{NTFY_SERVER}/{NTFY_TOPIC}"
+class _BLOB(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.c_uint32),
+                ("pbData", ctypes.POINTER(ctypes.c_char))]
 
 
-def _ntfy_quota_text():
-    """이 PC(공인 IP)의 ntfy 발신 사용량을 한 줄로 돌려준다. 실패하면 빈 문자열.
-    ntfy.sh 무료 한도는 계정이 아니라 **IP 단위**(`"basis": "ip"`)라 같은
-    공유기를 쓰는 PC·휴대폰이 한 버킷을 공유한다. 429 진단용으로만 호출한다."""
+def _dpapi(data, protect):
+    """Windows DPAPI 암·복호화(같은 PC·같은 사용자만 복호화된다). 실패하면 None."""
     try:
-        data = requests.get(f"{NTFY_SERVER}/v1/account", timeout=5).json()
-        st, lim = data.get("stats", {}), data.get("limits", {})
-        hours = int(lim.get("messages_expiry_duration", 43200)) // 3600
-        return (f"이 IP 발신량 {st.get('messages')}/{lim.get('messages')}건"
-                f" (최근 {hours}시간 기준, 남음 {st.get('messages_remaining')})")
+        src = _BLOB(len(data), ctypes.cast(ctypes.create_string_buffer(data),
+                                           ctypes.POINTER(ctypes.c_char)))
+        out = _BLOB()
+        fn = (ctypes.windll.crypt32.CryptProtectData if protect
+              else ctypes.windll.crypt32.CryptUnprotectData)
+        if not fn(ctypes.byref(src), None, None, None, None, 0, ctypes.byref(out)):
+            return None
+        res = ctypes.string_at(out.pbData, out.cbData)
+        ctypes.windll.kernel32.LocalFree(out.pbData)
+        return res
+    except Exception:
+        return None
+
+
+def load_secret_pw():
+    """저장된 로그인 비밀번호. 없으면 빈 문자열.
+    평문으로 두지 않는다 — 파일이 복사돼도 다른 PC·사용자는 못 푼다."""
+    try:
+        with open(SECRETS_PATH, "rb") as fp:
+            raw = fp.read()
+    except Exception:
+        return ""
+    plain = _dpapi(raw, protect=False)
+    try:
+        return json.loads((plain or raw).decode("utf-8")).get("pw", "")
     except Exception:
         return ""
 
 
-def ntfy_send(body, wait=False):
-    """프로토콜 메시지 발신(Title=내 PC 이름). 기본 비동기(GUI 블로킹 방지).
-    ntfy 비활성화 상태면 무시.
+def save_secret_pw(pw):
+    raw = json.dumps({"pw": pw}, ensure_ascii=False).encode("utf-8")
+    enc = _dpapi(raw, protect=True)
+    try:
+        with open(SECRETS_PATH, "wb") as fp:
+            fp.write(enc if enc is not None else raw)
+    except Exception as e:
+        print(f"[경고] 자격 저장 실패: {e}")
 
-    **HTTP 상태를 반드시 확인한다(함정, 260814a에서 고침):** `requests.post`는
-    429·5xx에도 예외를 던지지 않으므로 `status_code`를 안 보면 **서버가 버린
-    메시지를 '[ntfy 발신]' 성공으로 로그에 찍는다.** 이 때문에 특정 PC가 원격
-    S 질의를 받아 응답을 '발신했다'고 로그에 남기는데도 제어 PC는 15초 무응답
-    으로 로컬 복귀하는 현상을 오래 못 잡았다(채널을 직접 구독해 확인한 결과
-    그 PC의 메시지는 애초에 채널에 도달하지 않았다).
 
-    원인은 ntfy.sh 무료 발신 한도 — **IP당 12시간 250건**(구독=GET은 별도
-    한도)이라, 한도를 태운 PC는 **수신만 정상이고 발신 전부가 429로 죽는다.**
-    증상이 '한 PC만 응답을 못 한다'로 보여 문자열·이름 문제로 오인하기 쉽다.
-    (실측 260814a: TR1이 `{"code":42908,"error":"daily message quota reached"}`로
-    12시간 동안 단 한 건도 발행하지 못하는데, 같은 랜의 TR2는 정상이었다.
-    ntfy 방문자 버킷은 egress IP 단위라 같은 공유기라도 나가는 IP가 다르면
-    한도가 분리된다.)
+def clear_secret_pw():
+    try:
+        os.remove(SECRETS_PATH)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[경고] 자격 삭제 실패: {e}")
 
-    그러니 상태를 확인해 사실대로 로그에 남기고(429면 남은 한도까지 같이),
-    일시적 실패는 짧게 재시도한다. **단 일일 한도(42908)는 재시도하지 않고
-    냉각한다** — 기다려도 회복되지 않는 실패에 요청을 더 던지면 같은 버킷의
-    요청 토큰만 태워 상황을 악화시킨다."""
-    if not _ntfy_enabled:
-        return False
 
-    def _run():
-        global _ntfy_quota_reported, _ntfy_quota_until
-        if time.time() < _ntfy_quota_until:
-            left = int(_ntfy_quota_until - time.time()) // 60 + 1
-            print(f"[ntfy 발신 보류] {body} (일일 한도 소진, 약 {left}분 후 재시도)")
-            return False
-        deadline = time.time() + NTFY_SEND_DEADLINE
-        for attempt in range(1, NTFY_SEND_ATTEMPTS + 1):
-            status, quota_hit = None, False
+# ---------- 소켓 · TLS (domichat.py와 같은 규격 — domichat.md가 기준) ----------
+# 클라이언트 계층은 domichat.py에서 **복제**했다. import 하지 않는 이유: 두 앱은
+# 각자 자기 .py 하나만 교체하는 방식으로 업데이트되므로, 공용 모듈을 만들면 그
+# 규약이 깨진다(자세한 것은 domichat.md '구현 시 주의').
+
+
+class CertChanged(Exception):
+    def __init__(self, host, old, new):
+        super().__init__(f"{host}: {old[:16]}… → {new[:16]}…")
+        self.host, self.old, self.new = host, old, new
+
+
+def _local_addrs():
+    addrs = {"127.0.0.1", "localhost", "::1"}
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            addrs.add(info[4][0])
+    except Exception:
+        pass
+    return addrs
+
+
+def connect_any(ip, port, timeout=CONNECT_TIMEOUT):
+    """서버가 도는 PC에서 자기 IP를 적어도 붙도록 로컬 폴백을 둔다."""
+    try:
+        return socket.create_connection((ip, port), timeout)
+    except OSError:
+        if ip in _local_addrs():
+            return socket.create_connection(("127.0.0.1", port), timeout)
+        raise
+
+
+def _tls_context():
+    """자체 서명 인증서를 쓰므로 검증은 끄고 지문 고정으로 신뢰한다.
+    **TLS 1.2로 고정**한다 — 수신·송신 스레드가 한 소켓을 나눠 쓰는 구조라
+    1.3의 핸드셰이크 후 메시지 때문에 record layer가 깨진다(domichat.md 참고)."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    no_reneg = getattr(ssl, "OP_NO_RENEGOTIATION", 0)
+    if no_reneg:
+        ctx.options |= no_reneg
+    return ctx
+
+
+def connect_secure(ip, port, pinned):
+    """(소켓, 지문|None). 서버가 TLS를 안 쓰면 평문으로 다시 붙는다."""
+    raw = connect_any(ip, port)
+    try:
+        sock = _tls_context().wrap_socket(raw)
+        fp = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
+    except (ssl.SSLError, OSError) as e:
+        try:
+            raw.close()
+        except Exception:
+            pass
+        print(f"[TLS] 서버가 TLS를 쓰지 않는 것 같습니다({e}) — 평문으로 접속합니다.")
+        return connect_any(ip, port), None
+    if pinned and pinned != fp:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        raise CertChanged(f"{ip}:{port}", pinned, fp)
+    return sock, fp
+
+
+class ChatClient:
+    """domiserver 세션 하나(접속 유지 + 자동 재연결).
+    수신 프레임과 내부 사건을 전부 self.q로 넘긴다(GUI는 메인 스레드에서만 처리)."""
+
+    def __init__(self):
+        self.q = queue.Queue()
+        self.txq = queue.Queue()
+        self.sock = None
+        self.ip = self.uid = self.pw = None
+        self.port = CHAT_PORT
+        self.pinned = None
+        self.want = False
+        self.first_try = True
+        self.logged_in = threading.Event()
+        self._send_lock = threading.Lock()
+
+    # ---------- 저수준 ----------
+    def _raw_send(self, sock, obj):
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        with self._send_lock:
+            sock.sendall(FRAME_HEAD.pack(len(data), ord("T")) + data)
+
+    @staticmethod
+    def _recv_exact(sock, n):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        return bytes(buf)
+
+    def _recv_obj(self, sock):
+        head = self._recv_exact(sock, FRAME_HEAD.size)
+        if head is None:
+            return None
+        ln, typ = FRAME_HEAD.unpack(head)
+        if ln > MAX_FRAME:
+            raise OSError("프레임 과대")
+        body = self._recv_exact(sock, ln) if ln else b""
+        if body is None:
+            return None
+        if chr(typ) != "T":
+            return {}                      # 이미지 등 — 매크로는 쓰지 않는다
+        return json.loads(body.decode("utf-8"))
+
+    # ---------- 세션 ----------
+    def start(self, ip, port, uid, pw, pinned=None):
+        self.ip, self.port, self.uid, self.pw = ip, port, uid, pw
+        self.pinned = pinned
+        self.want = True
+        self.first_try = True
+        threading.Thread(target=self._session_loop, daemon=True).start()
+
+    def _session_loop(self):
+        idx = 0
+        while self.want:
             try:
-                resp = requests.post(NTFY_URL, data=body.encode("utf-8"),
-                                     headers={"Title": PC_NAME, "Priority": "3"},
-                                     timeout=(5, 10))
-            except Exception as e:
-                reason, retry = f"({e})", True
-            else:
-                if resp.status_code < 300:
-                    if _ntfy_quota_until:
-                        print("[ntfy] 발신 한도가 회복되었습니다.")
-                        _ntfy_quota_until = 0.0
-                    print(f"[ntfy 발신] {body}")
-                    return True
-                status = resp.status_code
-                # 응답 본문에 사유가 들어온다(예: daily limit reached) — 그대로 남긴다
-                detail = resp.text.strip().replace(chr(10), " ")[:120]
-                reason = f"HTTP {status} {detail}"
-                # 42908 = 일일 메시지 한도 소진. 재시도가 무의미한 유일한 429.
-                quota_hit = status == 429 and ("42908" in detail
-                                               or "daily" in detail.lower())
-                retry = not quota_hit and (status == 429 or status >= 500)
-            if (not retry or attempt == NTFY_SEND_ATTEMPTS
-                    or time.time() >= deadline):
-                # 한도 조회는 **최종 실패 줄에** 붙인다(중간 시도에 붙이면
-                # 정작 남는 로그에서 빠진다). 60초 스로틀로 도배 방지.
-                if status == 429 and time.time() - _ntfy_quota_reported > 60:
-                    _ntfy_quota_reported = time.time()
-                    quota = _ntfy_quota_text()
-                    if quota:
-                        reason += f" / {quota}"
-                print(f"[ntfy 발신 실패] {body} {reason}")
-                if quota_hit:
-                    _ntfy_quota_until = time.time() + NTFY_QUOTA_COOLDOWN
-                    print(f"[ntfy 한도] 이 PC는 ntfy 일일 발신 한도(IP 기준)를"
-                          f" 소진해 **원격 응답·보고를 보낼 수 없습니다.**"
-                          f" {int(NTFY_QUOTA_COOLDOWN // 60)}분간 발신을 멈춥니다"
-                          f" (수신은 계속 정상).")
-                return False
-            # 429는 토큰 충전(5~10초당 1개)을 기다려야 의미가 있다
-            nap = 5.0 if status == 429 else 1.5 * attempt
-            time.sleep(max(0.0, min(nap, deadline - time.time())))
-        return False
+                sock, fp = connect_secure(self.ip, self.port, self.pinned)
+                if fp and not self.pinned:
+                    self.pinned = fp
+                    self.q.put({"_ev": "cert_pinned", "fp": fp})
+            except CertChanged as e:
+                self.want = False
+                self.q.put({"_ev": "cert_changed", "old": e.old, "new": e.new})
+                return
+            except OSError as e:
+                if self.first_try:
+                    self.want = False
+                    self.q.put({"_ev": "connect_fail", "msg": str(e)})
+                    return
+                self.q.put({"_ev": "disconnected", "msg": str(e)})
+                time.sleep(RECONNECT_BACKOFF[min(idx, len(RECONNECT_BACKOFF) - 1)])
+                idx += 1
+                continue
 
-    if wait:
-        return _run()
-    threading.Thread(target=_run, daemon=True).start()
-    return None
+            # 접속 타임아웃이 소켓에 남으면 조용할 때마다 끊긴다 → 읽기 타임아웃으로 교체
+            sock.settimeout(READ_TIMEOUT)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except OSError:
+                pass
+            self.sock = sock
+            threading.Thread(target=self._tx_loop, args=(sock,), daemon=True).start()
+            logged = False
+            try:
+                self._raw_send(sock, {"t": "login", "id": self.uid, "pw": self.pw})
+                while self.want:
+                    d = self._recv_obj(sock)
+                    if d is None:
+                        break
+                    t = d.get("t")
+                    if t == "ping":
+                        self._raw_send(sock, {"t": "pong"})
+                        continue
+                    if t == "welcome":
+                        self.logged_in.set()
+                        logged = True
+                    self.q.put(d)
+            except Exception:
+                pass
+            finally:
+                self.logged_in.clear()
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                self.sock = None
+
+            if not self.want:
+                break
+            self.first_try = False
+            if logged:
+                idx = 0            # 한 번이라도 붙었으면 백오프를 되돌린다
+            self.q.put({"_ev": "disconnected", "msg": "연결이 끊겼습니다"})
+            time.sleep(RECONNECT_BACKOFF[min(idx, len(RECONNECT_BACKOFF) - 1)])
+            idx += 1
+
+    def _tx_loop(self, sock):
+        while self.want and self.sock is sock:
+            if not self.logged_in.wait(0.2):
+                continue
+            try:
+                obj = self.txq.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                self._raw_send(sock, obj)
+            except Exception:
+                self.txq.put(obj)          # 재연결 후 다시 보낸다
+                return
+
+    def send(self, obj, wait=False):
+        """wait=True면 지금 소켓으로 바로 보낸다(종료 직전 응답처럼 순서가 중요한 것)."""
+        if wait:
+            sock = self.sock
+            if sock is None or not self.logged_in.is_set():
+                return False
+            try:
+                self._raw_send(sock, obj)
+                return True
+            except Exception:
+                return False
+        self.txq.put(obj)
+        return True
+
+    def logout(self):
+        self.want = False
+        self.logged_in.clear()
+        sock = self.sock
+        if sock:
+            try:
+                self._raw_send(sock, {"t": "logout"})
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+        self.sock = None
+        with self.txq.mutex:
+            self.txq.queue.clear()
+
+
+CHAT = ChatClient()
+
+
+def chat_send(body, room=None, wait=False):
+    """프로토콜 메시지 발신. room 을 안 주면 **내 방**(피제어 역할)으로 보낸다.
+    ntfy 시절 발신 함수 자리를 그대로 대신한다."""
+    if not chat_enabled or not CHAT.logged_in.is_set():
+        return False
+    target = room or MY_ROOM
+    if not target:
+        return False
+    ok = CHAT.send({"t": "msg", "room": target, "body": body}, wait=wait)
+    print(f"[발신] {body}" if ok else f"[발신 보류] {body} (연결 없음)")
+    return ok
 
 
 def send_report(code):
@@ -295,90 +517,8 @@ def send_report(code):
     코드: s(루틴 시작) g(회수 성공) f(회수 실패)
           rs/bs(낚싯대/미끼 교체 시작) y,r/y,b(낚싯대/미끼 교체 성공)
           x,d/x,r/x,b(튕김/낚싯대/미끼 실패)"""
-    ntfy_send(f",Z,F,{code}", wait=True)
+    chat_send(f",Z,F,{code}")
 
-
-_ntfy_queue = queue.Queue()
-_ntfy_stream_resp = None          # 현재 스트리밍 응답(외부에서 중단할 핸들)
-_ntfy_stream_lock = threading.Lock()
-
-
-def ntfy_stream_disconnect():
-    """열려 있는 스트리밍 연결을 강제 종료.
-    ntfy 비활성화·채널 변경 시 메인 스레드가 호출하면, 스트림 스레드가
-    블로킹 읽기에서 즉시 풀려 나와 조건(중단/재연결)을 다시 판단한다.
-    (keepalive만 기다리면 반응이 최대 수십 초 늦으므로 능동적으로 끊는다.)"""
-    global _ntfy_stream_resp
-    with _ntfy_stream_lock:
-        r, _ntfy_stream_resp = _ntfy_stream_resp, None
-    if r is not None:
-        try:
-            r.close()
-        except Exception:
-            pass
-
-
-def _ntfy_stream_loop():
-    """전용 데몬 스레드: ntfy 스트리밍 구독을 지속 유지한다(폴링 대체).
-
-    반복 GET 폴링(5초당 1요청) 대신 연결 하나(`/json` 스트림)를 열어두고
-    도착하는 메시지를 실시간 수신한다. 요청 토큰을 **연결당 1회만** 소비하므로
-    (ntfy 무료 한도는 GET/POST가 같은 IP 버킷을 공유·5~10초당 1개 충전),
-    같은 공유기(같은 공인 IP)를 쓰는 휴대폰의 발신이 한도에 밀려 실패하던
-    문제를 없애고 수신 지연도 폴링(최대 5초)에서 사실상 즉시로 줄인다.
-
-    수신 즉시 큐에 넣기만 하고, 실제 프로토콜 처리(응답 매칭/명령 실행)는
-    기존과 동일하게 메인 스레드(_poll_ntfy_queue)가 한다.
-
-    ※ since는 쓰지 않는다 — 살아있는 연결은 메시지를 정확히 한 번만 전달하므로,
-      재연결 시 과거 명령을 되받아 **중복 실행**할 위험이 없다. 재연결 공백에
-      끼어 놓친 명령은 15초 응답 타임아웃 후 재시도로 처리한다(중복 실행보다
-      깔끔한 실패-재시도가 안전).
-    ※ 자기 이름(PC_NAME) Title로 되돌아오는 자기 발신분은 여기서 걸러낸다
-      (기존 poll_ntfy와 동일)."""
-    global _ntfy_stream_resp
-    while True:
-        if not _ntfy_enabled:
-            time.sleep(0.5)
-            continue
-        active_topic = NTFY_TOPIC
-        url = f"{NTFY_SERVER}/{active_topic}/json"
-        resp = None
-        try:
-            # connect=10s / read=90s. 정상 연결은 ntfy keepalive(기본 45s)가
-            # 계속 도착해 유지된다. keepalive마저 끊기면 read 타임아웃으로 재연결.
-            resp = requests.get(url, stream=True, timeout=(10, 90))
-            if resp.status_code == 200:
-                with _ntfy_stream_lock:
-                    _ntfy_stream_resp = resp
-                for line in resp.iter_lines(decode_unicode=True):
-                    # 비활성화·채널 변경이면 이 연결을 끊고 루프 top에서 재판단
-                    if not _ntfy_enabled or NTFY_TOPIC != active_topic:
-                        break
-                    if not line:
-                        continue                     # keepalive 사이 빈 줄
-                    try:
-                        data = json.loads(line)
-                    except (json.JSONDecodeError, TypeError):
-                        continue
-                    if data.get("event") != "message":
-                        continue                     # open/keepalive 이벤트 무시
-                    title = data.get("title", "")
-                    if title == PC_NAME:
-                        continue                     # 내가 보낸 것 제외
-                    _ntfy_queue.put((title, data.get("message", "").strip()))
-        except Exception:
-            pass          # 네트워크 블립·강제 종료 → finally 후 재연결
-        finally:
-            with _ntfy_stream_lock:
-                _ntfy_stream_resp = None
-            if resp is not None:
-                try:
-                    resp.close()
-                except Exception:
-                    pass
-        if _ntfy_enabled:
-            time.sleep(1.0)   # 재연결 전 짧은 대기(연타 방지)
 
 
 # ============================================================
@@ -394,7 +534,7 @@ def _ntfy_stream_loop():
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260814a"
+APP_VERSION = "260815a"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -1573,19 +1713,25 @@ class DomimanApp:
         self._sched_ticking = False
         self.manual_collect = None   # 즉시 회수 스레드
 
-        # --- 원격 제어(ntfy) 상태 ---
+        # --- 원격 제어(domichat) 상태 ---
+        _cfg = load_config()
+        self.server_ip = str(_cfg.get("ip") or "")
+        self.saved_id = str(_cfg.get("id") or "")
+        self.cert_fp = str(_cfg.get("cert_fp") or "") or None
         self.pc_list = [str(n) for n in _cfg.get("pc_list", [])
-                        if re.fullmatch(r"[A-Za-z0-9]+", str(n)) and n != PC_NAME]
-        self.remote_target = None        # None=로컬(이 PC), str=제어 중인 PC명
+                        if re.fullmatch(r"[A-Za-z0-9_-]+", str(n))]
+        self.remote_target = None        # None=로컬(이 PC), str=제어 중인 PC(ID)
         self.pending = None              # {"kind": str, "sent": epoch} 응답 대기
         self.remote_running_shown = None # 원격 시작/중지 버튼 표시 상태
         self.remote_exit_deadline = None # 원격 예약 종료(표시 전용)
         self._local_snapshot = None      # 원격 진입 전 로컬 설정 백업
         self._applying_remote = False    # 원격 상태 반영 중(트레이스 발신 억제)
         self._timer_debounce_id = None   # 원격 타이머 3초 디바운스
-        self._chan_debounce_id = None    # 채널 변경 후 스트림 재연결 디바운스
         self._sched_top = None           # 예약 종료 팝업(원격) 위젯들
         self._res_top = None             # 해상도 팝업 위젯들
+        self._login_top = None           # 로그인 창
+        self.my_room_ready = False       # 내 방(피제어용) 준비 완료 여부
+        self.joining_room = None         # 제어 대상 방 입장 시도 중
 
         root.title("domiman.py")
         try:
@@ -1599,27 +1745,26 @@ class DomimanApp:
         self._apply_theme()
         self._update_swap_visibility()
         self.set_status("loading")
+        self._set_login_display()
         self._apply_ui_locks()
 
         global _status_cb
         _status_cb = self._post_status
 
-        threading.Thread(target=_ntfy_stream_loop, daemon=True).start()
         threading.Thread(target=self._load_ocr, daemon=True).start()
         self.root.after(300, self._auto_detect_resolution)
         self.root.after(100, self._poll_log_queue)
-        self.root.after(250, self._poll_ntfy_queue)
+        self.root.after(250, self._poll_chat_queue)
 
-        print(f"[시스템] domiman 시작 (이름: {PC_NAME}, 채널: {NTFY_TOPIC}). "
-              "OCR 모델을 불러오는 중입니다...")
-        if PC_NAME != _default_name:
-            print(f"[안내] 설정 파일의 사용자 지정 이름 '{PC_NAME}'을 사용 중입니다 "
-                  f"(이 PC 호스트명: {_default_name}). 이름칸에서 바꿀 수 있습니다.")
+        print("[시스템] domiman 시작. OCR 모델을 불러오는 중입니다...")
 
-        # 체크박스 기본값을 전역 _ntfy_enabled에 반영(둘이 어긋나는 일 없도록
-        # 토글 핸들러를 그대로 재사용). 스트림 스레드는 0.5초 주기로 이 값을
-        # 다시 보므로 위에서 먼저 띄워도 곧바로 구독을 시작한다.
-        self.on_ntfy_toggle()
+        # 체크박스 기본값을 전역 chat_enabled 에 반영(둘이 어긋나지 않도록 토글
+        # 핸들러를 그대로 재사용한다).
+        self.on_chat_toggle()
+        # 로그아웃하지 않았다면 저장된 자격으로 자동 로그인한다.
+        if self.server_ip and self.saved_id and load_secret_pw():
+            self.root.after(400, lambda: self.do_login(
+                self.server_ip, self.saved_id, load_secret_pw(), auto=True))
 
     # ---------- 위젯 구성 (엑셀 B2:H26 목업 기반) ----------
     def _build_widgets(self):
@@ -1634,7 +1779,7 @@ class DomimanApp:
         pad_r = {"padx": (12, 6), "pady": 3}
 
         # -- 최상단: 제어PC 변경 버튼(창 폭 대부분) + 업데이트 확인 버튼(우측 끝) --
-        self.bt_pc = tk.Button(f, text=PC_NAME, font=FONT, bg=BTN_GRAY,
+        self.bt_pc = tk.Button(f, text=MY_ID, font=FONT, bg=BTN_GRAY,
                                command=self.on_pc_button)
         self.bt_pc.grid(row=0, column=0, columnspan=3, sticky="ew",
                         padx=6, pady=(3, 8))
@@ -1672,12 +1817,12 @@ class DomimanApp:
         self.lb_timer_hint.grid(row=3, column=0, columnspan=3, sticky="w", **pad)
 
         # -- 체크박스 2x2 + 시작/중지 큰 버튼 --
-        # 기본 켜짐. 실제 활성화(_ntfy_enabled)는 __init__ 끝의 on_ntfy_toggle()이
+        # 기본 켜짐. 실제 활성화(chat_enabled)는 __init__ 끝의 on_chat_toggle()이
         # 이 값에서 맞춰가므로, 기본값은 여기 한 곳만 고치면 된다.
-        self.var_ntfy = tk.BooleanVar(value=True)
-        self.cb_ntfy = tk.Checkbutton(f, text="ntfy 메시지", font=FONT,
-                                      variable=self.var_ntfy, command=self.on_ntfy_toggle)
-        self.cb_ntfy.grid(row=4, column=0, sticky="w", **pad)
+        self.var_chat = tk.BooleanVar(value=True)
+        self.cb_chat = tk.Checkbutton(f, text="domichat 메시지", font=FONT,
+                                      variable=self.var_chat, command=self.on_chat_toggle)
+        self.cb_chat.grid(row=4, column=0, sticky="w", **pad)
 
         self.var_rod = tk.BooleanVar(value=True)
         self.cb_rod = tk.Checkbutton(f, text="낚싯대 자동교체", font=FONT,
@@ -1706,12 +1851,15 @@ class DomimanApp:
             font=FONT_SMALL)
         self.lb_swap_hint.grid(row=6, column=0, columnspan=2, sticky="w", **pad)
 
-        # -- 이름 입력 + 예약 종료/즉시 회수 (상시 작동 버튼) --
-        self.lb_name_t = tk.Label(f, text="ntfy/SMS에 표시될 이름", font=FONT)
-        self.lb_name_t.grid(row=7, column=0, sticky="w", **pad)
-        self.var_name = tk.StringVar(value=PC_NAME)
-        self.var_name.trace_add("write", lambda *a: self._validate_name())
-        self.en_name = tk.Entry(f, textvariable=self.var_name, font=FONT, width=18)
+        # -- 로그인/로그아웃 + 접속 정보 표시 + 예약 종료/즉시 회수 --
+        # 예전의 '이름'·'채널' 입력란 자리를 그대로 쓴다: 라벨 자리에는 버튼,
+        # 입력란 자리에는 **읽기 전용 표시**(위=IP, 아래=ID).
+        self.bt_login = tk.Button(f, text="로그인", font=FONT, bg=BTN_GRAY,
+                                  command=self.open_login)
+        self.bt_login.grid(row=7, column=0, sticky="ew", **pad)
+        self.var_name = tk.StringVar(value="")      # 접속된 서버 IP 표시
+        self.en_name = tk.Label(f, textvariable=self.var_name, font=FONT,
+                                width=18, anchor="w")
         self.en_name.grid(row=7, column=1, sticky="w", **pad)
 
         self.bt_sched_exit = tk.Button(f, text="예약 종료", font=FONT, bg=BTN_GRAY,
@@ -1721,19 +1869,15 @@ class DomimanApp:
                                         command=self.on_collect_now)
         self.bt_collect_now.grid(row=7, column=3, sticky="ew", **pad)
 
-        # -- ntfy 채널 이름 --
-        self.lb_chan_t = tk.Label(f, text="ntfy 채널 이름", font=FONT)
-        self.lb_chan_t.grid(row=8, column=0, sticky="w", **pad)
-        self.var_chan = tk.StringVar(value=NTFY_TOPIC)
-        self.var_chan.trace_add("write", lambda *a: self._on_channel_changed())
-        vcmd_chan = (r.register(
-            lambda P: re.fullmatch(r"[A-Za-z0-9_\-]*", P) is not None), "%P")
-        self.en_chan = tk.Entry(f, textvariable=self.var_chan, font=FONT,
-                                width=18, validate="key", validatecommand=vcmd_chan)
+        self.bt_logout = tk.Button(f, text="로그아웃", font=FONT, bg=BTN_GRAY,
+                                   command=self.do_logout)
+        self.bt_logout.grid(row=8, column=0, sticky="ew", **pad)
+        self.var_chan = tk.StringVar(value="")      # 로그인한 ID 표시
+        self.en_chan = tk.Label(f, textvariable=self.var_chan, font=FONT,
+                                width=18, anchor="w")
         self.en_chan.grid(row=8, column=1, sticky="w", **pad)
 
-        self.lb_name_warn = tk.Label(f, text="영문+숫자만 이용 가능합니다.",
-                                     font=FONT_SMALL, fg="red")
+        self.lb_name_warn = tk.Label(f, text="", font=FONT_SMALL, fg="red")
         self.lb_name_warn.grid(row=9, column=0, columnspan=2, sticky="w", **pad)
         self.lb_name_warn.grid_remove()
 
@@ -1795,16 +1939,18 @@ class DomimanApp:
         for fr in (self.frame, self.frame_loghdr, self.frame_log):
             fr.configure(bg=t["bg"])
         labels = [self.lb_res_t, self.lb_res, self.lb_timer_t, self.lb_timer_min,
-                  self.lb_timer_hint, self.lb_swap_hint, self.lb_name_t,
-                  self.lb_chan_t, self.lb_status_t, self.lb_status, self.lb_log_t]
+                  self.lb_timer_hint, self.lb_swap_hint,
+                  self.lb_status_t, self.lb_status, self.lb_log_t,
+                  # 접속 정보 표시(예전 이름·채널 입력란 자리, 이제 읽기 전용 라벨)
+                  self.en_name, self.en_chan]
         for lb in labels:
             lb.configure(bg=t["bg"], fg=t["fg"])
         self.lb_name_warn.configure(bg=t["bg"])   # 경고는 항상 빨간 글씨
-        for cb in (self.cb_ntfy, self.cb_rod, self.cb_bait, self.cb_logsave):
+        for cb in (self.cb_chat, self.cb_rod, self.cb_bait, self.cb_logsave):
             cb.configure(bg=t["bg"], fg=t["fg"], activebackground=t["bg"],
                          activeforeground=t["fg"], selectcolor=t["select"],
                          disabledforeground="#888888")
-        for en in (self.en_timer, self.en_name, self.en_chan):
+        for en in (self.en_timer,):
             en.configure(bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"],
                          disabledbackground=t["bg"], disabledforeground="#888888")
         self.txt_log.configure(bg=t["log_bg"], fg=t["fg"], insertbackground=t["fg"])
@@ -1812,7 +1958,7 @@ class DomimanApp:
         for bt in (self.bt_pc, self.bt_update, self.bt_res_manual, self.bt_res_auto,
                    self.bt_tank_check, self.bt_sched_exit, self.bt_collect_now,
                    self.bt_dark, self.bt_exit, self.bt_log_fold, self.bt_log_clear,
-                   self.bt_log_export):
+                   self.bt_log_export, self.bt_login, self.bt_logout):
             bt.configure(bg=BTN_GRAY, fg="black")
 
     def on_dark_toggle(self):
@@ -1997,47 +2143,115 @@ class DomimanApp:
             return
         self._send_command(f"T,{val}", "T")
 
-    def _validate_name(self):
-        global PC_NAME
-        val = self.var_name.get()
-        if re.fullmatch(r"[A-Za-z0-9]*", val):
-            self.lb_name_warn.grid_remove()
-            # 로컬 모드에서 유효한 이름이면 즉시 반영(상단 버튼/ntfy 제목)
-            if (val and not self.remote_target and not self._applying_remote
-                    and val != PC_NAME):
-                PC_NAME = val
-                self.bt_pc.configure(text=val)
-            return True
-        self.lb_name_warn.grid()
-        return False
+    # ---------- 로그인 / 로그아웃 ----------
+    def _set_login_display(self):
+        """접속 정보 표시(위=IP, 아래=ID)와 버튼 상태를 현재 상태에 맞춘다."""
+        self.var_name.set(f"{self.server_ip}" if MY_ID else "(로그인 안 됨)")
+        self.var_chan.set(MY_ID or "-")
+        self.bt_pc.configure(text=(self.remote_target or MY_ID or "로그인 필요"))
 
-    def _on_channel_changed(self):
-        """ntfy 채널 입력 트레이스: 유효하면 URL 즉시 반영 +
-        타이핑이 멈춘 뒤(1.5초) 스트림을 새 채널로 재연결(키 입력마다 재연결 방지)."""
-        global NTFY_TOPIC, NTFY_URL
-        val = self.var_chan.get().strip()
-        if re.fullmatch(r"[A-Za-z0-9_\-]+", val) and val != NTFY_TOPIC:
-            NTFY_TOPIC = val
-            NTFY_URL = f"{NTFY_SERVER}/{NTFY_TOPIC}"
-            if self._chan_debounce_id is not None:
-                self.root.after_cancel(self._chan_debounce_id)
-            self._chan_debounce_id = self.root.after(1500, self._reconnect_stream)
+    def open_login(self):
+        """로그인 창(IP·ID·PW). 회원가입은 두지 않는다 — 계정은 domichat 쪽에서
+        만들고 서버 콘솔에서 승인한다."""
+        if self._login_top is not None:
+            try:
+                self._login_top.lift()
+                return
+            except Exception:
+                self._login_top = None
+        top = tk.Toplevel(self.root)
+        self._login_top = top
+        top.title("domichat 로그인")
+        top.resizable(False, False)
+        top.grab_set()
+        t = THEME["dark" if self.dark else "light"]
+        top.configure(bg=t["bg"])
 
-    def _reconnect_stream(self):
-        """스트림 스레드를 현재 채널로 재연결시킨다(연결만 끊으면 루프가 재접속)."""
-        self._chan_debounce_id = None
-        if _ntfy_enabled:
-            ntfy_stream_disconnect()
+        body = tk.Frame(top, bg=t["bg"], padx=14, pady=12)
+        body.pack(fill="both", expand=True)
+        vars_ = []
+        for i, (label, init, show) in enumerate(
+                (("IP 주소", self.server_ip, None), ("ID", self.saved_id, None),
+                 ("PW", "", "*"))):
+            tk.Label(body, text=label, font=FONT, bg=t["bg"], fg=t["fg"]).grid(
+                row=i, column=0, sticky="e", padx=(0, 8), pady=3)
+            v = tk.StringVar(value=init)
+            e = tk.Entry(body, textvariable=v, font=FONT, width=22, show=show,
+                         bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"])
+            e.grid(row=i, column=1, pady=3)
+            vars_.append(v)
+        msg = tk.Label(body, text="", font=FONT_SMALL, bg=t["bg"], fg="#d9302e",
+                       wraplength=240, justify="left")
+        msg.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self._login_msg = msg
+
+        btns = tk.Frame(body, bg=t["bg"])
+        btns.grid(row=4, column=0, columnspan=2, pady=(10, 0))
+
+        def do_ok():
+            ip, uid, pw = (v.get().strip() for v in vars_)
+            if not ip or not uid or not pw:
+                msg.configure(text="IP·ID·PW를 모두 입력하세요.")
+                return
+            self.do_login(ip, uid, pw)
+
+        tk.Button(btns, text="로그인", font=FONT, bg=BTN_GRAY, width=8,
+                  command=do_ok).pack(side="left", padx=4)
+        tk.Button(btns, text="취소", font=FONT, bg=BTN_GRAY, width=8,
+                  command=self._close_login).pack(side="left", padx=4)
+        top.protocol("WM_DELETE_WINDOW", self._close_login)
+
+    def _close_login(self):
+        if self._login_top is not None:
+            try:
+                self._login_top.destroy()
+            except Exception:
+                pass
+        self._login_top = None
+        self._login_msg = None
+
+    def do_login(self, ip, uid, pw, auto=False):
+        """domiserver 접속 시도. 'IP:포트' 형식도 받는다."""
+        port = CHAT_PORT
+        if ip.count(":") == 1:
+            ip, _, p = ip.partition(":")
+            if p.isdigit():
+                port = int(p)
+        self._pending_login = (ip.strip(), port, uid, pw, auto)
+        self.server_ip = ip.strip() if port == CHAT_PORT else f"{ip.strip()}:{port}"
+        print(f"[domichat] {self.server_ip} 에 '{uid}'로 접속합니다...")
+        CHAT.logout()
+        globals()["CHAT"] = ChatClient()
+        CHAT.start(ip.strip(), port, uid, pw, pinned=self.cert_fp)
+
+    def do_logout(self):
+        """로그인 정보를 지운다. 다시 실행해도 자동 로그인하지 않는다."""
+        global MY_ID, MY_ROOM
+        if self.remote_target:
+            self._exit_remote()
+        CHAT.logout()
+        MY_ID, MY_ROOM = "", ""
+        self.my_room_ready = False
+        self.saved_id = ""
+        clear_secret_pw()
+        save_config(self.server_ip, "", self.pc_list)
+        self._set_login_display()
+        self._apply_ui_locks()
+        print("[domichat] 로그아웃했습니다.")
 
     # ---------- 체크박스 ----------
-    def on_ntfy_toggle(self):
-        global _ntfy_enabled
-        _ntfy_enabled = self.var_ntfy.get()
-        if _ntfy_enabled:
-            print(f" -> [설정] ntfy 수/발신 활성화 (이름: {PC_NAME}, 채널: {NTFY_TOPIC})")
+    def on_chat_toggle(self):
+        """'domichat 메시지' — 수/발신 전체 스위치. 끄면 접속을 끊는다."""
+        global chat_enabled
+        chat_enabled = self.var_chat.get()
+        if chat_enabled:
+            print(" -> [설정] domichat 수/발신 활성화")
+            if MY_ID == "" and self.server_ip and self.saved_id and load_secret_pw():
+                self.do_login(self.server_ip, self.saved_id, load_secret_pw(),
+                              auto=True)
         else:
-            print(" -> [설정] ntfy 비활성화")
-            ntfy_stream_disconnect()   # 열린 스트림을 즉시 끊어 반응 지연 없앰
+            print(" -> [설정] domichat 비활성화")
+            CHAT.logout()
 
     # ---------- 실시간 수량 확인 ----------
     def _tank_check_and_resume(self, on_result):
@@ -2097,7 +2311,7 @@ class DomimanApp:
             if self.pending is None:
                 self._send_command("N", "N")
             return
-        name = PC_NAME
+        name = MY_ID
 
         def report(qty):
             if qty is None:
@@ -2168,24 +2382,154 @@ class DomimanApp:
         self.root.after(100, self._poll_log_queue)
 
     # ============================================================
-    # ntfy 프로토콜 — 수신 디스패치 (메인 스레드, 250ms 주기)
+    # domichat 프로토콜 — 수신 디스패치 (메인 스레드, 250ms 주기)
     # 스트림 스레드가 큐에 넣은 메시지를 메인 스레드에서 꺼내 처리(tkinter 안전).
     # ============================================================
-    def _poll_ntfy_queue(self):
+    def _poll_chat_queue(self):
+        """domichat 수신·상태 이벤트를 메인 스레드에서 처리(tkinter 안전)."""
         try:
             while True:
-                title, body = _ntfy_queue.get_nowait()
+                d = CHAT.q.get_nowait()
                 try:
-                    self._dispatch_ntfy(title, body)
+                    self._on_chat_event(d)
                 except Exception:
-                    print(f"[경고] ntfy 메시지 처리 실패: {body}")
+                    print(f"[경고] 메시지 처리 실패: {d}")
                     traceback.print_exc()
         except queue.Empty:
             pass
         self._check_pending_timeout()
-        self.root.after(250, self._poll_ntfy_queue)
+        self.root.after(250, self._poll_chat_queue)
 
-    def _dispatch_ntfy(self, title, body):
+    def _on_chat_event(self, d):
+        """서버 프레임과 클라이언트 내부 사건을 분배한다."""
+        ev = d.get("_ev")
+        if ev == "connect_fail":
+            return self._login_failed(f"서버에 접속할 수 없습니다. ({d.get('msg')})")
+        if ev == "cert_changed":
+            return self._login_failed(
+                "서버 인증서가 바뀌었습니다. 서버를 재설치한 것이 아니라면 "
+                "누군가 가로채는 중일 수 있습니다.")
+        if ev == "cert_pinned":
+            self.cert_fp = d.get("fp")
+            save_config(self.server_ip, self.saved_id, self.pc_list)
+            return
+        if ev == "disconnected":
+            if MY_ID:
+                print("[domichat] 연결이 끊겼습니다. 다시 접속하는 중...")
+                self.my_room_ready = False
+            return
+        if ev:
+            return
+
+        t = d.get("t")
+        if t == "welcome":
+            return self._on_chat_welcome(d)
+        if t == "msg":
+            frm = d.get("from")
+            if frm == MY_ID:
+                return                      # 서버는 발신자에게도 돌려준다 — 내 것은 무시
+            return self._dispatch_msg(frm, d.get("body", ""))
+        if t == "ok":
+            of = d.get("of")
+            if of == "room_create":
+                return self._after_my_room(d.get("room"))
+            return
+        if t == "joined":
+            room = d.get("room")
+            if room == MY_ROOM:
+                return self._after_my_room(room)
+            if room == self.joining_room:
+                self.joining_room = None
+                CHAT.send({"t": "sub", "room": room, "on": True})
+                print(f"[원격] '{self.remote_target}' 채팅방에 들어갔습니다. 상태를 질의합니다...")
+                self._send_command("S", "connect")
+            return
+        if t == "denied":
+            room, reason = d.get("room"), d.get("reason")
+            if room == self.joining_room:
+                self.joining_room = None
+                print(f"[원격] 입장할 수 없습니다({reason}). 이 PC 제어로 복귀합니다.")
+                self._exit_remote()
+            return
+        if t == "member":
+            # 방장(피제어 PC)이 방에서 빠지면 제어를 끝낸다
+            if (self.remote_target and not d.get("in")
+                    and d.get("id") == self.remote_target
+                    and d.get("room") == room_of(self.remote_target)):
+                print(f"[원격] {self.remote_target}가 접속을 종료했습니다. "
+                      "이 PC 제어로 복귀합니다.")
+                self._exit_remote()
+            return
+        if t == "room_deleted":
+            if self.remote_target and d.get("room") == room_of(self.remote_target):
+                self._exit_remote()
+            elif d.get("room") == MY_ROOM:
+                self.my_room_ready = False
+                self._ensure_my_room()
+            return
+        if t == "error":
+            code, msg = d.get("code"), d.get("msg", "")
+            if code == "room_name_taken":
+                # 내 방이 이미 있다 — 만들 필요 없이 들어가면 된다
+                return CHAT.send({"t": "join", "room": MY_ROOM, "pw": ROOM_PW})
+            if code in ("bad_login", "already_online", "disabled"):
+                return self._login_failed(msg or "로그인에 실패했습니다.")
+            print(f"[domichat] 오류: {msg} ({code})")
+            return
+
+    def _login_failed(self, msg):
+        CHAT.logout()
+        print(f"[domichat] {msg}")
+        if self._login_top is not None and self._login_msg is not None:
+            try:
+                self._login_msg.configure(text=msg)
+            except Exception:
+                pass
+        else:
+            self.lb_name_warn.configure(text=msg)
+            self.lb_name_warn.grid()
+            self.root.after(6000, self.lb_name_warn.grid_remove)
+
+    def _on_chat_welcome(self, d):
+        """로그인 성공 — 자격을 저장하고 내 방을 준비한다."""
+        global MY_ID, MY_ROOM
+        MY_ID = d.get("id") or ""
+        MY_ROOM = room_of(MY_ID)
+        self.saved_id = MY_ID
+        pend = getattr(self, "_pending_login", None)
+        if pend:
+            save_secret_pw(pend[3])
+            self._pending_login = None
+        save_config(self.server_ip, MY_ID, self.pc_list)
+        self._close_login()
+        self._set_login_display()
+        self._apply_ui_locks()
+        print(f"[domichat] '{MY_ID}'로 로그인했습니다. (서버 {self.server_ip})")
+
+        rooms = {r.get("name") for r in d.get("rooms", [])}
+        if MY_ROOM in rooms:
+            CHAT.send({"t": "join", "room": MY_ROOM, "pw": ROOM_PW})
+        else:
+            self._ensure_my_room()
+        if self.remote_target:            # 재접속이면 제어하던 방에도 다시 들어간다
+            self.joining_room = room_of(self.remote_target)
+            CHAT.send({"t": "join", "room": self.joining_room, "pw": ROOM_PW})
+
+    def _ensure_my_room(self):
+        """내 방(domi_fishing_{내ID})을 만든다. 이미 있으면 error(room_name_taken)가
+        오고 그때 입장한다 — '없으면 만들고 있으면 들어간다'."""
+        if not MY_ROOM:
+            return
+        CHAT.send({"t": "room_create", "name": MY_ROOM, "kind": "pw", "pw": ROOM_PW})
+
+    def _after_my_room(self, room):
+        if room != MY_ROOM or self.my_room_ready:
+            return
+        self.my_room_ready = True
+        CHAT.send({"t": "sub", "room": MY_ROOM, "on": True})
+        print(f"[domichat] 내 채팅방 '{MY_ROOM}' 준비 완료 — 원격 제어를 받을 수 있습니다.")
+
+    def _dispatch_msg(self, title, body):
         """수신 메시지 분배. 규격에 맞지 않는 메시지는 전부 무시.
         - 원격 제어 중(dB): 내 앞으로 온 응답({내이름},Z,*)과 제어 대상의
           보고(,Z,F,*)만 처리. 내 앞으로 온 '명령'은 무시(제어에만 집중).
@@ -2195,7 +2539,7 @@ class DomimanApp:
             return
 
         if self.remote_target:
-            if (parts[0] == PC_NAME and parts[1] == "Z"
+            if (parts[0] == MY_ID and parts[1] == "Z"
                     and title == self.remote_target):
                 self._handle_remote_reply(parts[2:], body)
             elif (parts[0] == "" and parts[1] == "Z"
@@ -2205,7 +2549,7 @@ class DomimanApp:
             return
 
         # 로컬 모드: 나를 지목한 명령만 처리 (Z=응답은 명령이 아님)
-        if parts[0] == PC_NAME and parts[1] != "Z":
+        if parts[0] == MY_ID and parts[1] != "Z":
             self._handle_command(title, parts[1:], body)
 
     # ---------- 피제어(응답) 측 ----------
@@ -2230,7 +2574,7 @@ class DomimanApp:
         print(f"[원격 명령] {raw} (from '{sender or '무명'}')")
 
         def reply(tail):
-            ntfy_send(f"{sender},Z,{tail}")
+            chat_send(f"{sender},Z,{tail}")
 
         if cmd == "S":
             reply(self._status_string())
@@ -2265,7 +2609,7 @@ class DomimanApp:
             self.on_collect_now()
 
         elif cmd == "Q":
-            ntfy_send(f"{sender},Z,Q", wait=True)   # 종료 전 동기 발신
+            chat_send(f"{sender},Z,Q", wait=True)   # 종료 전 동기 발신
             self.on_exit()
 
         elif cmd == "V":
@@ -2314,7 +2658,7 @@ class DomimanApp:
     # ---------- 제어(요청) 측 ----------
     def _send_command(self, cmdbody, kind):
         """제어 명령 발송 + 응답 대기(pending) 진입. 대기 중엔 대부분 봉인."""
-        ntfy_send(f"{self.remote_target},{cmdbody}")
+        chat_send(f"{self.remote_target},{cmdbody}", room_of(self.remote_target))
         self.pending = {"kind": kind, "sent": time.time()}
         self._apply_ui_locks()
 
@@ -2327,7 +2671,7 @@ class DomimanApp:
         if self.pending is None or time.time() - self.pending["sent"] <= 15.0:
             return
         p = self._resolve_pending()
-        print("[ntfy] 응답이 없습니다")
+        print("[원격] 응답이 없습니다")
         self._flash_noresp()
         kind = p["kind"]
         if kind == "connect":
@@ -2339,7 +2683,7 @@ class DomimanApp:
             target = self.remote_target
             self._close_sched_dialog()
             if target:
-                ntfy_send(f"{target},Y,0")
+                chat_send(f"{target},Y,0", room_of(target))
         elif kind == "V":
             self._close_res_dialog()
 
@@ -2355,7 +2699,7 @@ class DomimanApp:
 
     def _handle_remote_reply(self, rest, raw):
         """제어 대상에게서 온 응답({내이름},Z,...) 처리."""
-        print(f"[ntfy 응답] {raw}")
+        print(f"[원격 응답] {raw}")
         p = self._resolve_pending() if self.pending else None
         first = rest[0] if rest else ""
 
@@ -2467,12 +2811,12 @@ class DomimanApp:
 
         def refill(select_name=None):
             lbx.delete(0, "end")
-            lbx.insert("end", f"{PC_NAME} (이 PC)")
+            lbx.insert("end", f"{MY_ID} (이 PC)")
             for n in self.pc_list:
                 lbx.insert("end", n)
-            target = select_name or self.remote_target or PC_NAME
+            target = select_name or self.remote_target or MY_ID
             idx = 0
-            if target != PC_NAME and target in self.pc_list:
+            if target != MY_ID and target in self.pc_list:
                 idx = 1 + self.pc_list.index(target)
             lbx.selection_set(idx)
             lbx.see(idx)
@@ -2493,7 +2837,7 @@ class DomimanApp:
             if not re.fullmatch(r"[A-Za-z0-9]+", name):
                 print("[안내] PC 이름은 영문+숫자만 가능합니다.")
                 return
-            if name == PC_NAME or name in self.pc_list:
+            if name == MY_ID or name in self.pc_list:
                 print("[안내] 이미 리스트에 있는 이름입니다.")
                 return
             self.pc_list.append(name)
@@ -2513,10 +2857,10 @@ class DomimanApp:
 
         def on_ok():
             sel = lbx.curselection()
-            target = PC_NAME if not sel or sel[0] == 0 else self.pc_list[sel[0] - 1]
-            save_config(PC_NAME, NTFY_TOPIC, self.pc_list)
+            target = MY_ID if not sel or sel[0] == 0 else self.pc_list[sel[0] - 1]
+            save_config(self.server_ip, MY_ID, self.pc_list)
             top.destroy()
-            if target == PC_NAME:
+            if target == MY_ID:
                 if self.remote_target:
                     self._exit_remote()
             else:
@@ -2530,8 +2874,12 @@ class DomimanApp:
                   command=on_ok).pack(pady=(6, 12))
 
     def _enter_remote(self, target):
-        """원격 제어 모드 진입: 로컬 설정 백업 -> S 질의로 상태 동기화."""
-        global _ntfy_enabled
+        """원격 제어 모드 진입: 대상 PC의 채팅방에 들어간다.
+        입장에 성공하면(joined) 구독하고 예전처럼 S 질의로 상태를 맞춘다."""
+        global chat_enabled
+        if not MY_ID:
+            print("[원격] 먼저 domichat에 로그인하세요.")
+            return
         if self._local_snapshot is None:
             self._local_snapshot = {
                 "timer": self.var_timer.get(),
@@ -2539,27 +2887,29 @@ class DomimanApp:
                 "rod": self.var_rod.get(),
                 "bait": self.var_bait.get(),
                 "res_label": self.lb_res.cget("text"),
-                "name": self.var_name.get(),
                 "status": self.current_status_key,
             }
-        if not self.var_ntfy.get():          # ntfy는 강제 활성화 후 봉인
-            self.var_ntfy.set(True)
-            _ntfy_enabled = True
-            print(" -> [설정] 원격 제어를 위해 ntfy를 활성화합니다.")
+        if not self.var_chat.get():          # 메시지는 강제 활성화 후 봉인
+            self.var_chat.set(True)
+            chat_enabled = True
+            print(" -> [설정] 원격 제어를 위해 domichat 메시지를 활성화합니다.")
 
         self.remote_target = target
         self.remote_running_shown = False
         self.remote_exit_deadline = None
-        self._applying_remote = True
-        self.var_name.set(target)
-        self._applying_remote = False
         self.bt_pc.configure(text=target)
         self._set_start_button_remote()
-        print(f"\n[원격] '{target}' 제어를 시작합니다. 상태를 질의합니다...")
-        self._send_command("S", "connect")
+        self.joining_room = room_of(target)
+        print(f"\n[원격] '{target}' 제어를 시작합니다. 채팅방에 입장합니다...")
+        CHAT.send({"t": "join", "room": self.joining_room, "pw": ROOM_PW})
 
     def _exit_remote(self):
-        """원격 제어 종료: 이 PC 제어로 복귀, 로컬 설정 복원."""
+        """원격 제어 종료: 상대 방에서 나오고 이 PC 제어로 복귀, 로컬 설정 복원."""
+        if self.remote_target:
+            room = room_of(self.remote_target)
+            CHAT.send({"t": "sub", "room": room, "on": False})
+            CHAT.send({"t": "leave", "room": room})
+        self.joining_room = None
         self.remote_target = None
         self.pending = None
         self.remote_running_shown = None
@@ -2579,10 +2929,9 @@ class DomimanApp:
                 self.var_rod.set(snap["rod"])
                 self.var_bait.set(snap["bait"])
                 self.lb_res.configure(text=snap["res_label"])
-                self.var_name.set(snap["name"])
             finally:
                 self._applying_remote = False
-        self.bt_pc.configure(text=PC_NAME)
+        self._set_login_display()
         if self._running():
             self.bt_start.configure(text="중지", bg="#d9302e", fg="white",
                                     state="normal")
@@ -2619,10 +2968,12 @@ class DomimanApp:
 
         st(self.bt_pc, not running)
         st(self.bt_update, not running)
-        # 이름/채널/ntfy — 원격에선 항상 봉인, 로컬에선 실행 중 봉인
-        settings_ok = (not running) and (not remote)
-        for w in (self.en_name, self.en_chan, self.cb_ntfy):
-            st(w, settings_ok)
+        # 'domichat 메시지' — 원격에선 항상 봉인, 로컬에선 실행 중 봉인
+        st(self.cb_chat, (not running) and (not remote))
+        # 로그인/로그아웃은 **낚시 중에도 잠그지 않는다** — 원격 제어가 끊겼을 때
+        # 되살릴 수단이 필요하기 때문이다. 원격 제어 중에만 봉인한다.
+        st(self.bt_login, not remote and not MY_ID)
+        st(self.bt_logout, not remote and bool(MY_ID))
         # 타이머/자동교체/로그저장/해상도 — 원격에선 응답 대기 중만 봉인
         flags_ok = (not pending) if remote else (not running)
         for w in (self.en_timer, self.cb_rod, self.cb_bait, self.cb_logsave,
@@ -2780,7 +3131,7 @@ class DomimanApp:
                 self._resolve_pending()      # 응답 대기 포기
             self._close_sched_dialog()
             if target:
-                ntfy_send(f"{target},Y,0")
+                chat_send(f"{target},Y,0", room_of(target))
 
         bt_ok.configure(command=on_ok)
         bt_cancel.configure(command=on_cancel)
@@ -2854,16 +3205,8 @@ class DomimanApp:
             except ValueError:
                 print("[안내] 타이머 값이 올바르지 않습니다. (분 단위 숫자, 0=감시 모드)")
                 return False
-        name = self.var_name.get()
-        if not re.fullmatch(r"[A-Za-z0-9]+", name):
-            print("[안내] 이름은 영문+숫자만 가능합니다.")
-            self.lb_name_warn.grid()
-            return False
-
-        global PC_NAME, _ntfy_enabled
-        if not self.remote_target:   # 원격 모드에선 이름칸=상대 이름 — 내 이름 갱신 금지
-            PC_NAME = name
-        _ntfy_enabled = self.var_ntfy.get()
+        global chat_enabled
+        chat_enabled = self.var_chat.get()
 
         self.worker = FishingWorker(
             mode=mode, interval_min=interval_min,
@@ -2983,7 +3326,7 @@ class DomimanApp:
             return
         print("[업데이트] 적용 후 재시작합니다...")
         try:
-            save_config(PC_NAME, NTFY_TOPIC, self.pc_list)
+            save_config(self.server_ip, MY_ID, self.pc_list)
             self._save_log_on_exit()
         except Exception:
             pass
@@ -3005,13 +3348,10 @@ class DomimanApp:
         (로그 저장과 무관하게) 창이 '응답 없음'으로 늦게 꺼졌다 → 데몬/네이티브
         스레드 대기를 건너뛰는 os._exit(0)로 해결. 소켓은 OS가 닫아준다."""
         try:
-            # 원격 모드로 종료돼도 '이 PC'의 이름만 저장(상대 이름 유출 방지)
-            name = PC_NAME
-            if self.remote_target and self._local_snapshot:
-                snap_name = self._local_snapshot.get("name", "")
-                if re.fullmatch(r"[A-Za-z0-9]+", snap_name):
-                    name = snap_name
-            save_config(name, NTFY_TOPIC, self.pc_list)
+            save_config(self.server_ip, MY_ID, self.pc_list)
+            # 방장이 방을 나가는 것을 상대가 곧바로 알도록 정상 로그아웃을 보낸다
+            # (이걸 안 하면 서버가 최대 45초 뒤에야 이탈로 처리한다).
+            CHAT.logout()
             if self._running():
                 self.worker.stop()
             self._save_log_on_exit()   # 로그 저장 OFF면 즉시 반환

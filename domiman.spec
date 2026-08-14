@@ -39,8 +39,17 @@ for pkg in [
 hiddenimports += ['win32gui', 'win32con', 'win32api', 'win32process']
 
 # domiman.py가 runpy로 동적 로드되어 정적 분석에 안 잡히는 의존성들을 명시.
+# **최상위 import 를 하나도 빠짐없이 적는다** — 빠뜨리면 스크립트로는 되는데 exe에서만
+# 시작조차 못 한다(domichat 에서 `import uuid` 하나로 실제로 그렇게 죽었다).
+# 검사: python scripts/check_domiman_spec.py
 hiddenimports += ['pyautogui', 'requests', 'numpy',
-                   'tkinter', 'tkinter.font', 'tkinter.messagebox']
+                   'tkinter', 'tkinter.font', 'tkinter.messagebox',
+                   # domichat 통신에 쓰는 것들(260815a 이식분)
+                   'ssl', 'struct', 'hashlib',
+                   # 표준 라이브러리(다른 패키지에 딸려 들어오지만 명시해 둔다)
+                   'ctypes', 'json', 'os', 'queue', 'random', 're', 'socket',
+                   'subprocess', 'sys', 'threading', 'time', 'traceback',
+                   'warnings']
 
 # OCR 모델 동봉 (다운로드 불가 시스템 대응). 런타임엔 sys._MEIPASS/ocr_model 로 접근.
 datas += [('ocr_model', 'ocr_model')]
