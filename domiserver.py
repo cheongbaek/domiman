@@ -23,9 +23,12 @@ import os
 import queue
 import re
 import secrets
+import shutil
 import socket
 import sqlite3
+import ssl
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -38,7 +41,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "domiserver.json")
 DB_PATH = os.path.join(BASE_DIR, "domiserver.db")
 
-APP_VERSION = "260815d"
+APP_VERSION = "260815e"
 PROTO_VER = 1
 
 MAX_FRAME = 1024 * 1024          # 'T' 프레임 상한(1MB). 넘으면 규격 위반으로 끊는다
@@ -63,7 +66,19 @@ DEFAULT_CONFIG = {
     "msg_max_len": 4000,
     "ping_sec": 15,
     "pong_timeout_sec": 45,
+    "tls": True,                # 자체 서명 인증서로 TLS 제공(없으면 첫 실행에 생성)
+    "require_tls": False,       # True면 평문 접속을 거부한다(전환이 끝난 뒤 켤 것)
+    "file_max_mb": 32,          # 한 이미지 최대 크기(변환 후 PNG 기준)
+    "file_max_concurrent": 3,   # 한 연결이 동시에 보낼 수 있는 전송 수
 }
+
+FILE_CHUNK_MAX = 65536          # 'B' 프레임 한 개의 데이터 상한
+FILE_HEAD = struct.Struct(">16sI")   # 'B' 프레임 머리: fid 16바이트 + seq 4바이트
+
+CERT_PATH = os.path.join(BASE_DIR, "domiserver.crt")
+KEY_PATH = os.path.join(BASE_DIR, "domiserver.key")
+SSL_CTX = None                  # TLS 사용 가능하면 SSLContext, 아니면 None
+CERT_FP = None                  # 인증서 SHA-256 지문(클라이언트가 고정하는 값)
 
 CONFIG = dict(DEFAULT_CONFIG)
 
@@ -344,6 +359,137 @@ def rooms_snapshot(uid):
     return out
 
 
+# === [3-1. TLS — 자체 서명 인증서 + 지문 고정] ===
+# 브라우저가 아니라 우리 클라이언트만 붙으므로 도메인·Let's Encrypt가 필요 없다.
+# 클라이언트는 인증서를 검증하지 않고 **지문(SHA-256)을 처음 접속에서 기억해 고정**
+# 한다(SSH와 같은 방식). 첫 접속만 신뢰하면 그 뒤로는 중간자 개입을 막는다.
+
+
+def _find_openssl():
+    """인증서 생성용 openssl. 파이썬 표준 라이브러리로는 X.509를 만들 수 없어
+    외부 도구가 필요하다(Windows에는 Git 설치본에 들어 있다)."""
+    p = shutil.which("openssl")
+    if p:
+        return p
+    for cand in (r"C:\Program Files\Git\usr\bin\openssl.exe",
+                 r"C:\Program Files (x86)\Git\usr\bin\openssl.exe",
+                 os.path.expandvars(r"%LOCALAPPDATA%\Programs\Git\usr\bin\openssl.exe")):
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def ensure_cert():
+    """인증서·키가 없으면 만든다. 만들 수 없으면 None(평문으로 계속 운영)."""
+    if os.path.isfile(CERT_PATH) and os.path.isfile(KEY_PATH):
+        return True
+    ossl = _find_openssl()
+    if not ossl:
+        log("[TLS] openssl 을 찾지 못해 인증서를 만들 수 없습니다 — 평문으로 운영합니다.")
+        return False
+    try:
+        subprocess.run(
+            [ossl, "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes",
+             "-days", "7300", "-subj", "/CN=domiserver",
+             "-keyout", KEY_PATH, "-out", CERT_PATH],
+            check=True, capture_output=True, timeout=120)
+    except Exception as e:
+        log(f"[TLS] 인증서 생성 실패: {e} — 평문으로 운영합니다.")
+        return False
+    log("[TLS] 자체 서명 인증서를 새로 만들었습니다(domiserver.crt/.key)."
+        " 키 파일은 절대 공유하지 마세요.")
+    return True
+
+
+def cert_fingerprint():
+    """인증서 SHA-256 지문(소문자 hex). 클라이언트가 고정하는 값과 같다."""
+    try:
+        with open(CERT_PATH, encoding="ascii") as fp:
+            der = ssl.PEM_cert_to_DER_cert(fp.read())
+        return hashlib.sha256(der).hexdigest()
+    except Exception:
+        return None
+
+
+def _pin_tls12(ctx):
+    """**TLS 1.2로 고정하고 재협상을 금지한다(중요한 이유가 있다).**
+
+    이 서버는 연결마다 스레드가 하나 붙어 그 소켓을 읽고, 다른 연결의 스레드가
+    같은 소켓에 팬아웃을 쓴다(클라이언트도 수신 스레드와 송신 스레드가 나뉘어
+    있다). 즉 **하나의 SSL 소켓을 서로 다른 스레드가 읽고 쓴다.**
+
+    TLS 1.3은 핸드셰이크가 끝난 뒤에도 서버가 NewSessionTicket을 보내고
+    KeyUpdate가 오갈 수 있어, 읽기 경로가 내부적으로 쓰기 상태를 건드린다.
+    그래서 읽기와 쓰기가 겹치면 record layer가 깨진다 — 실측 증상은 서버의
+    `[SSL: RECORD_LAYER_FAILURE]`와 클라이언트의 갑작스러운 EOF였고, 접속 직후
+    8초쯤에 재현됐다.
+
+    TLS 1.2에서는 핸드셰이크 이후 방향별 record layer가 분리돼 '한 스레드가 읽고
+    한 스레드가 쓰는' 구조가 안전하다(재협상만이 예외이므로 그것도 막는다).
+    암호화 강도는 이 용도에 충분하다. **1.3으로 올리려면 먼저 양쪽 I/O를 단일
+    스레드(selectors/asyncio)로 바꿔야 한다.**"""
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    no_reneg = getattr(ssl, "OP_NO_RENEGOTIATION", 0)
+    if no_reneg:
+        ctx.options |= no_reneg
+
+
+def setup_tls():
+    global SSL_CTX, CERT_FP
+    if not CONFIG["tls"]:
+        log("[TLS] 설정에서 꺼져 있습니다 — 평문으로 운영합니다.")
+        return
+    if not ensure_cert():
+        return
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(CERT_PATH, KEY_PATH)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        _pin_tls12(ctx)
+    except Exception as e:
+        log(f"[TLS] 인증서를 읽지 못했습니다: {e} — 평문으로 운영합니다.")
+        return
+    SSL_CTX, CERT_FP = ctx, cert_fingerprint()
+    log(f"[TLS] 사용 중 (지문 {CERT_FP[:16]}…)"
+        + ("  ※ 평문 접속은 거부합니다." if CONFIG["require_tls"]
+           else "  평문 접속도 함께 받습니다."))
+
+
+def wrap_if_tls(sock):
+    """접속 직후 첫 바이트를 **엿봐서**(MSG_PEEK) TLS 핸드셰이크(0x16)면 감싼다.
+    평문도 계속 받아주므로 **서버를 먼저 올려도 옛 클라이언트가 죽지 않는다**
+    (require_tls=True면 평문을 거부한다). 반환 (소켓|None, TLS여부)."""
+    try:
+        sock.settimeout(10)
+        head = sock.recv(1, socket.MSG_PEEK)
+    except OSError:
+        return None, False
+    if not head:
+        return None, False
+
+    is_tls_hello = head[0] == 0x16
+    if not is_tls_hello:
+        if CONFIG["require_tls"]:
+            log("[TLS] 평문 접속을 거부했습니다(require_tls).")
+            return None, False
+        try:
+            sock.settimeout(None)
+        except OSError:
+            pass
+        return sock, False
+
+    if SSL_CTX is None:
+        log("[TLS] 클라이언트가 TLS로 접속했지만 서버에 인증서가 없습니다.")
+        return None, False
+    try:
+        secure = SSL_CTX.wrap_socket(sock, server_side=True)
+        secure.settimeout(None)
+        return secure, True
+    except (ssl.SSLError, OSError) as e:
+        log(f"[TLS] 핸드셰이크 실패: {e}")
+        return None, False
+
+
 # === [4. 프레임 입출력] ===
 # [길이 4바이트][종류 1바이트][본문] — 종류 'T'=UTF-8 JSON, 'B'=파일 청크(추후).
 
@@ -395,8 +541,11 @@ class Conn:
         self.sock = sock
         self.addr = addr
         self.uid = None
+        self.tls = False          # 이 연결이 TLS인지(관리 화면 표시용)
+        self.ready = False        # TLS 감싸기까지 끝났는지 — 끝나기 전엔 아무것도 보내면 안 된다
         self.rooms = set()        # 팬아웃 대상 방(창이 열렸거나 구독 중)
         self.subs = set()         # 구독 표시(서버는 관리 표시용으로만 보관)
+        self.tx_files = {}        # 이 연결이 지금 보내는 중인 이미지: fid -> {room,size,got}
         self.send_lock = threading.Lock()
         self.last_rx = now()
         self.msg_times = deque()
@@ -423,6 +572,22 @@ class Conn:
                 pass
             return False
 
+    def send_bytes(self, data):
+        """이미 프레임으로 만들어진 바이트를 그대로 보낸다(이미지 청크 중계용)."""
+        if not self.alive:
+            return False
+        try:
+            with self.send_lock:
+                self.sock.sendall(data)
+            return True
+        except Exception:
+            self.alive = False
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            return False
+
     def err(self, code, msg, ref=None):
         o = {"t": "error", "code": code, "msg": msg}
         if ref:
@@ -430,10 +595,11 @@ class Conn:
         return self.send(o)
 
 
-def fanout(room, obj, sender=None, cid=None):
-    """방에 든 모든 연결에 전달. sender에게만 cid를 되돌려 전송 확인에 쓴다."""
+def fanout(room, obj, sender=None, cid=None, exclude=None):
+    """방에 든 모든 연결에 전달. sender에게만 cid를 되돌려 전송 확인에 쓴다.
+    exclude 로 지정한 연결은 건너뛴다(이미지는 보낸 쪽이 이미 화면에 그려뒀다)."""
     with STATE_LOCK:
-        targets = [c for c in CONNS if c.uid and room in c.rooms]
+        targets = [c for c in CONNS if c.uid and room in c.rooms and c is not exclude]
     for c in targets:
         if c is sender and cid is not None:
             o = dict(obj)
@@ -441,6 +607,14 @@ def fanout(room, obj, sender=None, cid=None):
             c.send(o)
         else:
             c.send(obj)
+
+
+def fanout_bytes(room, data, exclude=None):
+    """이미지 청크 프레임을 방의 다른 연결들에 그대로 흘려보낸다(서버는 저장하지 않음)."""
+    with STATE_LOCK:
+        targets = [c for c in CONNS if c.uid and room in c.rooms and c is not exclude]
+    for c in targets:
+        c.send_bytes(data)
 
 
 def broadcast_all(obj):
@@ -466,15 +640,24 @@ def close_conn(conn, reason=""):
         if conn.uid and ONLINE.get(conn.uid) is conn:
             del ONLINE[conn.uid]
         uid, rooms = conn.uid, set(conn.rooms)
+        pending_files = list(conn.tx_files.items())
+        conn.tx_files.clear()
         conn.rooms.clear()
     try:
         conn.sock.close()
     except Exception:
         pass
     if uid:
+        # 보내던 이미지가 있으면 받는 쪽이 반쪽 데이터를 붙들고 있지 않게 알려준다
+        for fid, tr in pending_files:
+            fanout(tr["room"], {"t": "file_abort", "fid": fid}, exclude=conn)
         for room in rooms:
             fanout(room, {"t": "member", "room": room, "id": uid, "in": False})
         log(f"[해제] {uid} 접속 종료{(' — ' + reason) if reason else ''}")
+    elif reason:
+        # 로그인 전에 끊긴 연결도 사유가 있으면 남긴다 — 안 남기면 TLS·규격 문제로
+        # 조용히 끊겼을 때 원인을 볼 수가 없다.
+        log(f"[해제] {conn.addr[0]}:{conn.addr[1]} (로그인 전) — {reason}")
 
 
 def probe_dead(old):
@@ -540,7 +723,7 @@ def handle_login(conn, d):
     db_x("UPDATE users SET last_login=? WHERE id=?", (now(), uid))
     conn.send({"t": "welcome", "id": uid, "ver": PROTO_VER,
                "server_time": now(), "rooms": rooms_snapshot(uid)})
-    log(f"[로그인] {uid} ({conn.addr[0]})")
+    log(f"[로그인] {uid} ({conn.addr[0]}, {'TLS' if conn.tls else '평문'})")
 
     # 방장이 접속했으니 밀린 입장 요청을 알려준다
     for r in db_q("SELECT DISTINCT room FROM room_pending"):
@@ -814,6 +997,83 @@ def handle_unblock(conn, d):
     log(f"[블랙 해제] '{name}' {uid} (방장 {conn.uid})")
 
 
+# ---------- 이미지(첨부) 중계 ----------
+# **서버는 이미지를 저장하지 않는다.** 청크를 받는 즉시 방의 다른 접속자에게 흘려보내고
+# 아무것도 남기지 않는다(대화 내용을 저장하지 않는 원칙과 같다). 그래서 받는 쪽이 접속해
+# 있지 않으면 그 이미지는 못 받으며, 받은 쪽 로컬에는 그 방의 기록으로 남는다.
+
+
+def _safe_name(name):
+    """받는 쪽에서 파일로 저장하므로 경로 탈출·제어문자를 서버에서 먼저 막는다."""
+    if not isinstance(name, str):
+        return None
+    name = os.path.basename(name.replace("\\", "/")).strip()
+    if not name or name in (".", "..") or any(ord(c) < 32 for c in name):
+        return None
+    for ch in '<>:"|?*':
+        name = name.replace(ch, "_")
+    return name[:100]
+
+
+def handle_file_begin(conn, d):
+    room = clean_room_name(d.get("room"))
+    name = _safe_name(d.get("name"))
+    fid = d.get("fid")
+    size = d.get("size")
+    if room not in conn.rooms:
+        return conn.err("not_joined", "입장하지 않은 방입니다.")
+    if not name or not isinstance(fid, str) or not re.fullmatch(r"[0-9a-f]{32}", fid):
+        return conn.err("bad_frame", "이미지 정보가 규격에 맞지 않습니다.")
+    if not isinstance(size, int) or not (0 < size <= CONFIG["file_max_mb"] * 1024 * 1024):
+        return conn.err("file_too_big",
+                        f"이미지는 최대 {CONFIG['file_max_mb']}MB 까지 보낼 수 있습니다.")
+    if len(conn.tx_files) >= CONFIG["file_max_concurrent"]:
+        return conn.err("file_busy", "동시에 보낼 수 있는 이미지 수를 넘었습니다.")
+
+    conn.tx_files[fid] = {"room": room, "size": size, "got": 0}
+    with STATE_LOCK:
+        seq = SEQS.get(room, 0) + 1
+        SEQS[room] = seq
+    db_x("UPDATE rooms SET last_msg=? WHERE name=?", (now(), room))
+    fanout(room, {"t": "file_begin", "room": room, "from": conn.uid, "fid": fid,
+                  "name": name, "size": size, "sha256": d.get("sha256"),
+                  "w": d.get("w"), "h": d.get("h"),
+                  "mid": f"{RUN_ID}-{seq}", "ts": now()}, exclude=conn)
+
+
+def handle_file_end(conn, d):
+    fid = d.get("fid")
+    tr = conn.tx_files.pop(fid, None)
+    if not tr:
+        return
+    fanout(tr["room"], {"t": "file_end", "room": tr["room"], "fid": fid,
+                        "ok": tr["got"] == tr["size"]}, exclude=conn)
+    # 보낸 쪽에는 도달 확인만 돌려준다(이미 자기 화면에 그려뒀으므로 다시 안 보낸다)
+    conn.send({"t": "ok", "of": "file_end", "fid": fid,
+               "sent": tr["got"], "size": tr["size"]})
+
+
+def relay_file_chunk(conn, body):
+    """'B' 프레임: [fid 16바이트][seq 4바이트][데이터]. 그대로 중계한다."""
+    if len(body) < FILE_HEAD.size:
+        return conn.err("bad_frame", "이미지 청크가 너무 짧습니다.")
+    raw_fid, _seq = FILE_HEAD.unpack(body[:FILE_HEAD.size])
+    fid = raw_fid.hex()
+    tr = conn.tx_files.get(fid)
+    if not tr:
+        return                      # file_begin 없이 온 청크 — 조용히 버린다
+    data_len = len(body) - FILE_HEAD.size
+    if data_len > FILE_CHUNK_MAX:
+        conn.tx_files.pop(fid, None)
+        return conn.err("bad_frame", "이미지 청크가 너무 큽니다.")
+    tr["got"] += data_len
+    if tr["got"] > tr["size"]:
+        conn.tx_files.pop(fid, None)
+        fanout(tr["room"], {"t": "file_abort", "fid": fid}, exclude=conn)
+        return conn.err("file_too_big", "선언한 크기보다 많이 보냈습니다.")
+    fanout_bytes(tr["room"], pack_frame("B", body), exclude=conn)
+
+
 def handle_pong(conn, d):
     pass                                 # last_rx는 프레임 수신 자체로 갱신된다
 
@@ -828,23 +1088,46 @@ HANDLERS = {
     "pending": handle_pending, "approve": handle_approve, "kick": handle_kick,
     "blocklist": handle_blocklist, "unblock": handle_unblock,
     "room_pw": handle_room_pw, "pong": handle_pong,
+    "file_begin": handle_file_begin, "file_end": handle_file_end,
 }
 
 
 def serve_conn(conn):
-    """연결 하나를 담당하는 스레드."""
+    """연결 하나를 담당하는 스레드.
+    TLS 감싸기를 **여기서** 한다 — accept 루프에서 하면 느린/불량 클라이언트 하나가
+    새 접속 수락을 막는다."""
+    sock, is_tls = wrap_if_tls(conn.sock)
+    if sock is None:
+        close_conn(conn, "TLS 처리 실패 또는 거부")
+        return
+    conn.sock, conn.tls = sock, is_tls
+    conn.ready = True
+
+    reason = ""
     while not STOP.is_set() and conn.alive:
         try:
             got = recv_frame(conn.sock)
         except ProtoError as e:
             conn.err("bad_frame", str(e))
+            reason = f"규격 위반({e})"
             break
-        except OSError:
+        except OSError as e:
+            reason = f"소켓 오류({e})"
             break
         if got is None:
+            reason = "상대가 연결을 닫음"
             break
         typ, body = got
         conn.last_rx = now()
+        if typ == "B":
+            if not conn.uid:
+                conn.err("unauth", "로그인이 필요합니다.")
+                break
+            try:
+                relay_file_chunk(conn, body)
+            except Exception as e:
+                log(f"[경고] {conn.who()} 이미지 청크 중계 실패: {e}")
+            continue
         if typ != "T":
             conn.err("bad_frame", "지원하지 않는 프레임 종류입니다.")
             break
@@ -859,6 +1142,7 @@ def serve_conn(conn):
             break
 
         if t == "logout":
+            reason = "로그아웃"
             break
         try:
             if t in PUBLIC_HANDLERS:
@@ -872,7 +1156,7 @@ def serve_conn(conn):
         except Exception as e:
             log(f"[경고] {conn.who()} '{t}' 처리 실패: {e}")
             conn.err("server_error", "서버에서 처리 중 오류가 났습니다.")
-    close_conn(conn)
+    close_conn(conn, reason or "연결 종료")
 
 
 def accept_loop(srv):
@@ -907,7 +1191,12 @@ def maintenance_loop():
         for c in conns:
             if c.last_rx < limit:
                 close_conn(c, "응답 없음(타임아웃)")
-            else:
+            elif c.ready:
+                # **핸드셰이크가 끝나기 전에는 절대 쓰지 않는다(함정):** TLS 감싸기
+                # 도중에 평문 ping 프레임을 끼워 넣으면 그 연결의 record layer가
+                # 깨져 접속이 실패한다. ping 주기가 15초라 접속 타이밍에 따라
+                # 간헐적으로만 터져서 원인을 찾기 어려웠다
+                # (증상: 서버에 [SSL: RECORD_LAYER_FAILURE], 클라이언트엔 EOF).
                 c.send({"t": "ping"})
 
         if now() - last_sweep >= 60:
@@ -933,7 +1222,7 @@ HELP = """\
        disable <ID> | enable <ID> | online | kick <ID>
 채팅방 rooms | room <이름> | delroom <이름>
        delrooms all|open|limited|owner <ID>   (일괄 삭제, 확인 후 진행)
-기타   addr | set <키> <값> | config | help | quit"""
+기타   addr | cert | set <키> <값> | config | help | quit"""
 
 
 def cmd_users(_):
@@ -1020,11 +1309,22 @@ def cmd_online(_):
     with STATE_LOCK:
         items = [(uid, c) for uid, c in ONLINE.items()]
         rooms = {uid: sorted(c.rooms) for uid, c in items}
+        tls = {uid: c.tls for uid, c in items}
     if not items:
         return print("접속 중인 사용자가 없습니다.")
     for uid, c in sorted(items):
         r = ", ".join(rooms[uid]) or "-"
-        print(f"  {uid:<20} {c.addr[0]:<16} 방: {r}")
+        print(f"  {uid:<20} {c.addr[0]:<16} {'TLS' if tls[uid] else '평문':<4} 방: {r}")
+
+
+def cmd_cert(_):
+    """클라이언트가 고정한 지문과 맞춰볼 때 쓴다."""
+    if SSL_CTX is None:
+        return print("TLS를 쓰지 않습니다(설정 tls=false 또는 인증서 없음).")
+    print(f"인증서 : {CERT_PATH}")
+    print(f"지문   : {CERT_FP}")
+    print("클라이언트가 처음 접속할 때 이 지문을 기억하며, 이후 바뀌면 접속을 거부합니다."
+          " 서버를 재설치해 인증서가 바뀌면 클라이언트에서 재신뢰가 필요합니다.")
 
 
 def cmd_kick(args):
@@ -1153,7 +1453,7 @@ def cmd_addr(_):
 
 
 COMMANDS = {
-    "addr": cmd_addr,
+    "addr": cmd_addr, "cert": cmd_cert,
     "users": cmd_users, "pending": cmd_pending, "approve": cmd_approve,
     "reject": cmd_reject, "deluser": cmd_deluser, "disable": cmd_disable,
     "enable": cmd_enable, "online": cmd_online, "kick": cmd_kick,
@@ -1195,6 +1495,7 @@ def repl():
 def main():
     load_config()
     db_init()
+    setup_tls()
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

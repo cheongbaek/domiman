@@ -22,8 +22,10 @@ AppVersion={#MyAppVersion}
 DefaultDirName={localappdata}\domichat
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
+; lowest 로 못박는다. PrivilegesRequiredOverridesAllowed=dialog 를 두면 관리자로
+; 실행됐을 때 Setup이 **관리자 모드로 전환**돼(HKLM 등록, 공용 설치) ⟳ 업데이트가
+; domichat.py 를 덮어쓸 때 권한을 요구하게 된다 — 실측으로 확인해 제거했다.
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
 OutputDir=Output
 OutputBaseFilename=도미챗_설치
 SetupIconFile=domichat.ico

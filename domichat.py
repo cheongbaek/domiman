@@ -13,13 +13,16 @@
 `ttk` 위젯은 쓰지 않는다 — OS 테마 엔진이 배경색 지정을 무시해 블랙 테마가 깨진다.
 """
 
+import base64
 import ctypes
 import hashlib
+import io
 import json
 import os
 import queue
 import re
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -27,7 +30,17 @@ import threading
 import time
 import tkinter as tk
 import urllib.request
-from tkinter import messagebox
+import uuid
+from tkinter import filedialog, messagebox
+
+# 이미지 기능(PNG 변환·클립보드 붙여넣기·인라인 표시)에만 Pillow가 필요하다.
+# 없으면 이미지 기능만 비활성되고 채팅은 그대로 동작한다.
+try:
+    from PIL import Image, ImageGrab
+    HAS_PIL = True
+except Exception:
+    Image = ImageGrab = None
+    HAS_PIL = False
 
 # === [1. 상수 · 경로 · 테마] ===
 
@@ -45,6 +58,15 @@ READ_TIMEOUT = 60.0
 CONNECT_TIMEOUT = 6.0
 HISTORY_LOAD = 500                        # 창을 열 때 로컬 기록에서 읽어올 최대 줄 수
 MSG_MAX = 4000
+
+# --- 이미지 ---
+FILE_HEAD = struct.Struct(">16sI")        # 'B' 프레임 머리: fid 16바이트 + seq 4바이트
+IMG_CHUNK = 64 * 1024                     # 청크 크기(서버 상한과 같음)
+IMG_MAX_BYTES = 32 * 1024 * 1024          # 변환 후 PNG 최대 크기(서버 기본값과 같음)
+IMG_MAX_SIDE = 2560                       # 이 이상 크면 줄여서 보낸다(PNG는 쉽게 커진다)
+IMG_VIEW_W = 320                          # 말풍선 안 표시 폭
+IMG_EXTS = [("이미지", "*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff"),
+            ("모든 파일", "*.*")]
 
 # 데이터 폴더. DOMICHAT_DIR 환경변수로 바꿀 수 있다(테스트·다중 프로필용).
 APP_DIR = os.environ.get("DOMICHAT_DIR") or os.path.join(
@@ -96,7 +118,7 @@ if os.name == "nt":       # 흐릿한 글자 방지. root 생성 전에 해둬�
 #
 # 리포는 domiman과 공유하고 **파일 이름으로 구분**한다(domichat_version.txt /
 # domichat.py) — 리포를 새로 만들지 않아도 되고 domiman 업데이트와 섞이지 않는다.
-APP_VERSION = "260815a"
+APP_VERSION = "260815b"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -173,6 +195,60 @@ def connect_any(ip, port, timeout=CONNECT_TIMEOUT):
         raise
 
 
+class CertChanged(Exception):
+    """고정해둔 서버 인증서 지문과 다르다 — 중간자이거나 서버를 재설치한 것이다."""
+
+    def __init__(self, host, old, new):
+        super().__init__(f"{host}: {old[:16]}… → {new[:16]}…")
+        self.host, self.old, self.new = host, old, new
+
+
+def _tls_context():
+    """자체 서명 인증서를 쓰므로 체인·호스트명 검증은 끄고, **지문 고정**으로 신뢰한다
+    (SSH와 같은 방식). 검증을 끈다고 암호화가 약해지는 건 아니며, 중간자 방어는
+    지문 비교가 담당한다."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    # **TLS 1.2로 고정 + 재협상 금지(중요):** 이 클라이언트는 수신 스레드가 읽고
+    # 송신 스레드가 쓰므로 **한 SSL 소켓을 두 스레드가 읽고 쓴다.** TLS 1.3은
+    # 핸드셰이크 후에도 세션 티켓·KeyUpdate가 오가 읽기 경로가 쓰기 상태를
+    # 건드리기 때문에, 이 구조에서는 record layer가 깨진다(실측: 서버에
+    # RECORD_LAYER_FAILURE, 이쪽은 갑작스러운 EOF). 1.2는 방향별 record layer가
+    # 분리돼 안전하다. 서버(domiserver._pin_tls12)와 같은 이유·같은 설정이다.
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    no_reneg = getattr(ssl, "OP_NO_RENEGOTIATION", 0)
+    if no_reneg:
+        ctx.options |= no_reneg
+    return ctx
+
+
+def connect_secure(ip, port, want_tls, pinned):
+    """(소켓, 지문|None) 반환. 지문이 고정값과 다르면 CertChanged.
+    서버가 TLS를 안 쓰는 경우엔 평문으로 다시 붙는다(전환기 대응)."""
+    raw = connect_any(ip, port)
+    if not want_tls:
+        return raw, None
+    try:
+        sock = _tls_context().wrap_socket(raw)
+        fp = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
+    except (ssl.SSLError, OSError) as e:
+        try:
+            raw.close()
+        except Exception:
+            pass
+        print(f"[TLS] 서버가 TLS를 쓰지 않는 것 같습니다({e}) — 평문으로 접속합니다.")
+        return connect_any(ip, port), None
+    if pinned and pinned != fp:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        raise CertChanged(f"{ip}:{port}", pinned, fp)
+    return sock, fp
+
+
 class ChatClient:
     """세션 하나(접속 유지 + 자동 재연결). 수신·상태는 전부 self.q로 보낸다.
 
@@ -193,10 +269,16 @@ class ChatClient:
         self.want = False          # 접속을 유지하고 싶은 상태(로그아웃하면 False)
         self.logged_in = threading.Event()
         self.first_try = True
+        self.want_tls = True
+        self.pinned = None         # 고정해둔 서버 인증서 지문(없으면 첫 접속에 기억)
         self._send_lock = threading.Lock()
 
     # ---------- 저수준 ----------
     def _raw_send(self, sock, obj):
+        if isinstance(obj, bytes):          # 이미 프레임으로 만들어진 이미지 청크
+            with self._send_lock:
+                sock.sendall(obj)
+            return
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         with self._send_lock:
             sock.sendall(FRAME_HEAD.pack(len(data), ord("T")) + data)
@@ -212,6 +294,7 @@ class ChatClient:
         return bytes(buf)
 
     def _recv_obj(self, sock):
+        """'T'는 JSON dict, 'B'(이미지 청크)는 내부 이벤트 dict로 돌려준다."""
         head = self._recv_exact(sock, FRAME_HEAD.size)
         if head is None:
             return None
@@ -221,7 +304,14 @@ class ChatClient:
         body = self._recv_exact(sock, ln) if ln else b""
         if body is None:
             return None
-        if chr(typ) != "T":
+        kind = chr(typ)
+        if kind == "B":
+            if len(body) < FILE_HEAD.size:
+                return {}
+            raw_fid, seq = FILE_HEAD.unpack(body[:FILE_HEAD.size])
+            return {"t": "bin", "fid": raw_fid.hex(), "seq": seq,
+                    "data": body[FILE_HEAD.size:]}
+        if kind != "T":
             return {}
         return json.loads(body.decode("utf-8"))
 
@@ -229,7 +319,14 @@ class ChatClient:
     def register(self, ip, port, uid, pw):
         def run():
             try:
-                sock = connect_any(ip, port)
+                sock, fp = connect_secure(ip, port, self.want_tls, self.pinned)
+                if fp and not self.pinned:
+                    self.q.put({"_ev": "cert_pinned", "host": f"{ip}:{port}",
+                                "fp": fp})
+            except CertChanged as e:
+                self.q.put({"_ev": "register_result", "ok": False,
+                            "msg": f"서버 인증서가 바뀌었습니다({e}). 로그인으로 확인하세요."})
+                return
             except OSError as e:
                 self.q.put({"_ev": "register_result", "ok": False,
                             "msg": f"서버에 접속할 수 없습니다. ({e})"})
@@ -259,8 +356,9 @@ class ChatClient:
         threading.Thread(target=run, daemon=True).start()
 
     # ---------- 세션 ----------
-    def start(self, ip, port, uid, pw):
+    def start(self, ip, port, uid, pw, want_tls=True, pinned=None):
         self.ip, self.port, self.uid, self.pw = ip, port, uid, pw
+        self.want_tls, self.pinned = want_tls, pinned
         self.want = True
         self.first_try = True
         threading.Thread(target=self._session_loop, daemon=True).start()
@@ -269,7 +367,18 @@ class ChatClient:
         idx = 0
         while self.want:
             try:
-                sock = connect_any(self.ip, self.port)
+                sock, fp = connect_secure(self.ip, self.port, self.want_tls,
+                                          self.pinned)
+                if fp and not self.pinned:
+                    # 첫 접속 — 이 지문을 기억해 다음부터 고정한다(TOFU)
+                    self.pinned = fp
+                    self.q.put({"_ev": "cert_pinned",
+                                "host": f"{self.ip}:{self.port}", "fp": fp})
+            except CertChanged as e:
+                self.want = False
+                self.q.put({"_ev": "cert_changed", "host": e.host,
+                            "old": e.old, "new": e.new})
+                return
             except OSError as e:
                 if self.first_try:
                     self.want = False
@@ -346,6 +455,11 @@ class ChatClient:
     def send(self, obj):
         self.txq.put(obj)
 
+    def send_chunk(self, fid_hex, seq, data):
+        """이미지 청크를 프레임으로 만들어 송신 큐에 넣는다(순서 보장)."""
+        body = FILE_HEAD.pack(bytes.fromhex(fid_hex), seq) + data
+        self.txq.put(FRAME_HEAD.pack(len(body), ord("B")) + body)
+
     def logout(self):
         self.want = False
         self.logged_in.clear()
@@ -362,6 +476,116 @@ class ChatClient:
         self.sock = None
         with self.txq.mutex:
             self.txq.queue.clear()
+
+
+# === [2-1. 이미지 — PNG 변환 · 클립보드] ===
+# **보내는 쪽에서 무조건 PNG로 바꿔 올린다.** 그러면 받는 쪽은 tkinter가 기본으로 읽는
+# 형식만 다루면 되고(PhotoImage는 PNG/GIF만 읽는다), 채팅방에는 항상 PNG로 보인다.
+# 서버는 저장하지 않고 흘려보내기만 하므로, 이미지는 **받은 쪽 로컬 기록으로 남는다**
+# (그 방의 대화를 지우거나 방이 삭제될 때 함께 사라진다).
+
+
+def to_png(img):
+    """Pillow 이미지 → PNG 바이트. 너무 크면 줄인다(PNG는 사진에서 쉽게 수십MB가 된다)."""
+    if img.mode not in ("RGB", "RGBA", "L", "P"):
+        img = img.convert("RGBA")
+    w, h = img.size
+    if max(w, h) > IMG_MAX_SIDE:
+        r = IMG_MAX_SIDE / max(w, h)
+        img = img.resize((max(1, int(w * r)), max(1, int(h * r))), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue(), img.size
+
+
+def png_from_file(path):
+    """이미지 파일을 PNG 바이트로. 실패하면 (None, 사유)."""
+    if not HAS_PIL:
+        return None, "이미지 기능에는 Pillow가 필요합니다."
+    try:
+        with Image.open(path) as im:
+            im.load()
+            data, size = to_png(im)
+    except Exception as e:
+        return None, f"이미지를 읽지 못했습니다: {e}"
+    if len(data) > IMG_MAX_BYTES:
+        return None, f"변환 후 크기가 너무 큽니다({len(data)//1024//1024}MB)."
+    return (data, size), None
+
+
+def png_from_clipboard():
+    """클립보드의 이미지(또는 복사된 이미지 파일) → PNG 바이트. 없으면 (None, 사유)."""
+    if not HAS_PIL:
+        return None, "이미지 기능에는 Pillow가 필요합니다."
+    try:
+        got = ImageGrab.grabclipboard()
+    except Exception as e:
+        return None, f"클립보드를 읽지 못했습니다: {e}"
+    if got is None:
+        return None, None                     # 이미지가 아니다 → 평소 붙여넣기로
+    if isinstance(got, list):                 # 파일을 복사한 경우
+        for p in got:
+            res, err = png_from_file(p)
+            if res:
+                return res, None
+        return None, "복사된 파일에서 이미지를 찾지 못했습니다."
+    try:
+        data, size = to_png(got)
+    except Exception as e:
+        return None, f"이미지 변환 실패: {e}"
+    if len(data) > IMG_MAX_BYTES:
+        return None, "변환 후 크기가 너무 큽니다."
+    return (data, size), None
+
+
+def copy_png_to_clipboard(png_bytes):
+    """PNG를 클립보드에 이미지로 넣는다(Windows CF_DIB).
+    Pillow에는 클립보드 쓰기가 없어 BMP로 인코딩한 뒤 앞의 파일 헤더 14바이트를
+    떼어 DIB로 만들어 넣는다 — 이게 표준적인 방법이다."""
+    if not HAS_PIL or os.name != "nt":
+        return False
+    try:
+        with Image.open(io.BytesIO(png_bytes)) as im:
+            buf = io.BytesIO()
+            im.convert("RGB").save(buf, format="BMP")
+        dib = buf.getvalue()[14:]
+    except Exception:
+        return False
+    CF_DIB, GMEM_MOVEABLE = 8, 0x0002
+    u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+    # **반환형을 반드시 지정해야 한다(64비트 함정):** ctypes 기본 반환형은 32비트 int라
+    # GlobalAlloc/GlobalLock 이 돌려주는 64비트 핸들·포인터가 잘려 조용히 실패한다.
+    k32.GlobalAlloc.restype = ctypes.c_void_p
+    k32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    k32.GlobalLock.restype = ctypes.c_void_p
+    k32.GlobalLock.argtypes = [ctypes.c_void_p]
+    k32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    k32.GlobalFree.argtypes = [ctypes.c_void_p]
+    u32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    u32.SetClipboardData.restype = ctypes.c_void_p
+    u32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    try:
+        if not u32.OpenClipboard(None):
+            return False
+        try:
+            u32.EmptyClipboard()
+            h = k32.GlobalAlloc(GMEM_MOVEABLE, len(dib))
+            if not h:
+                return False
+            ptr = k32.GlobalLock(h)
+            if not ptr:
+                k32.GlobalFree(h)
+                return False
+            ctypes.memmove(ptr, dib, len(dib))
+            k32.GlobalUnlock(h)
+            if not u32.SetClipboardData(CF_DIB, h):
+                k32.GlobalFree(h)   # 실패했으면 메모리 소유권이 넘어가지 않았다
+                return False
+            return True
+        finally:
+            u32.CloseClipboard()
+    except Exception:
+        return False
 
 
 # === [3. 로컬 저장 — 설정 · 비밀 · 대화 기록] ===
@@ -401,6 +625,8 @@ class Store:
             "ip": "", "id": "", "remember_ip": True, "remember_id": True,
             "auto_login": False, "notify": True, "sort": SORTS[0],
             "subs": [], "room_geom": {},
+            "tls": True,          # 서버가 TLS를 안 쓰면 자동으로 평문으로 내려간다
+            "server_fp": {},      # "IP:포트" -> 고정한 인증서 지문
         }
         try:
             with open(CONFIG_PATH, encoding="utf-8") as fp:
@@ -518,6 +744,44 @@ class Store:
             pass
         except Exception as e:
             print(f"[경고] 기록 삭제 실패({room}): {e}")
+        # 이미지도 그 방의 기록이다 — 대화를 지우면 함께 지운다
+        d = self._img_dir(room)
+        if os.path.isdir(d):
+            try:
+                for f in os.listdir(d):
+                    os.remove(os.path.join(d, f))
+                os.rmdir(d)
+            except Exception as e:
+                print(f"[경고] 이미지 삭제 실패({room}): {e}")
+
+    # ---------- 이미지 파일 ----------
+    @staticmethod
+    def _img_dir(room):
+        return os.path.join(
+            HIST_DIR, "img_" + hashlib.sha1(room.encode("utf-8")).hexdigest()[:16])
+
+    def img_path(self, room, fid):
+        return os.path.join(self._img_dir(room), f"{fid}.png")
+
+    def save_image(self, room, fid, png):
+        """구독한 방만 디스크에 남긴다(대화 기록과 같은 규칙)."""
+        d = self._img_dir(room)
+        try:
+            os.makedirs(d, exist_ok=True)
+            p = self.img_path(room, fid)
+            with open(p, "wb") as fp:
+                fp.write(png)
+            return p
+        except Exception as e:
+            print(f"[경고] 이미지 저장 실패({room}): {e}")
+            return None
+
+    def load_image(self, room, fid):
+        try:
+            with open(self.img_path(room, fid), "rb") as fp:
+                return fp.read()
+        except Exception:
+            return None
 
 
 # === [4. 알림] ===
@@ -674,6 +938,7 @@ class App:
         # 입력한 방 비밀번호는 **메모리에만** 둔다. 구독한 방만 secrets에 영속되고,
         # 구독하지 않으면 방을 나가거나 앱을 끌 때 잊는다(설계 확정 사항).
         self.room_pw_mem = {}
+        self.incoming = {}       # 받는 중인 이미지: fid -> {room,name,size,buf,...}
         self.busy = False
         self.updating = False
         self.logged_once = False
@@ -807,7 +1072,8 @@ class App:
         self._set_busy(True)
         self._login_msg("접속 중...")
         self.client = ChatClient()
-        self.client.start(ip, port, uid, pw)
+        self.client.start(ip, port, uid, pw, want_tls=self.store.cfg["tls"],
+                          pinned=self.store.cfg["server_fp"].get(f"{ip}:{port}"))
 
     def do_register(self):
         if self.busy:
@@ -817,6 +1083,8 @@ class App:
             return self._login_msg("IP주소·ID·PW를 모두 입력하세요.", "#FF8888")
         self._set_busy(True)
         self._login_msg("가입 요청 중...")
+        self.client.want_tls = self.store.cfg["tls"]
+        self.client.pinned = self.store.cfg["server_fp"].get(f"{ip}:{port}")
         self.client.register(ip, port, uid, pw)
 
     def close_all_windows(self):
@@ -1100,6 +1368,8 @@ class App:
             return self._on_denied(d)
         if t == "msg":
             return self._on_msg(d)
+        if t in ("file_begin", "bin", "file_end", "file_abort"):
+            return self._on_file(t, d)
         if t == "member":
             w = self.windows.get(d.get("room"))
             if w:
@@ -1141,6 +1411,15 @@ class App:
                 dlg.fill(d.get("ids", []))
             return
         if t == "ok":
+            if d.get("of") == "file_end":
+                w = None
+                for room, win in self.windows.items():
+                    if d.get("fid") in getattr(win, "sending", {}):
+                        w = win
+                        break
+                if w:
+                    w.finish_sending(d.get("fid"))
+                return
             if d.get("of") == "room_pw":
                 w = self.windows.get(d.get("room"))
                 if w:
@@ -1158,6 +1437,26 @@ class App:
             else:
                 self._login_msg(d.get("msg", "가입에 실패했습니다."), "#FF8888")
             return
+        if ev == "cert_pinned":
+            # 첫 접속에서 받은 서버 인증서 지문을 기억한다(다음부터 이 값과 비교)
+            self.store.cfg["server_fp"][d["host"]] = d["fp"]
+            self.store.save()
+            print(f"[TLS] {d['host']} 인증서 지문을 기억했습니다: {d['fp'][:16]}…")
+            return
+        if ev == "cert_changed":
+            self._set_busy(False)
+            host, new = d["host"], d["new"]
+            msg = (f"서버 인증서가 바뀌었습니다.\n\n{host}\n"
+                   f"이전: {d['old'][:32]}…\n새것: {new[:32]}…\n\n"
+                   "서버를 재설치했다면 정상입니다. 그렇지 않다면 누군가 중간에서\n"
+                   "가로채는 중일 수 있습니다. 새 인증서를 신뢰할까요?")
+            if messagebox.askokcancel("domichat — 인증서 경고", msg, parent=self.root,
+                                      icon="warning"):
+                self.store.cfg["server_fp"][host] = new
+                self.store.save()
+                self._login_msg("새 인증서를 신뢰했습니다. 다시 로그인합니다.")
+                return self.root.after(100, self.do_login)
+            return self._login_msg("인증서가 바뀌어 접속을 중단했습니다.", "#FF8888")
         if ev == "connect_fail":
             self._set_busy(False)
             return self._login_msg(d.get("msg", "접속 실패"), "#FF8888")
@@ -1261,6 +1560,75 @@ class App:
         elif not mine and room in self.store.subs() and self.var_notify.get():
             notify(self.root, f"{room} — {d.get('from')}", d.get("body", ""))
 
+    # ---------- 이미지 수신 ----------
+    def _on_file(self, t, d):
+        fid = d.get("fid")
+        if t == "file_begin":
+            room = d.get("room")
+            if len(d.get("name") or "") == 0 or not fid:
+                return
+            self.incoming[fid] = {"room": room, "name": d.get("name"),
+                                  "size": d.get("size") or 0, "from": d.get("from"),
+                                  "ts": d.get("ts"), "mid": d.get("mid"),
+                                  "sha256": d.get("sha256"), "buf": bytearray()}
+            w = self.windows.get(room)
+            if w:
+                w.begin_incoming(fid, self.incoming[fid])
+            return
+
+        rec = self.incoming.get(fid)
+        if not rec:
+            return                       # 내가 보낸 것 또는 이미 끝난 전송
+        room = rec["room"]
+        w = self.windows.get(room)
+
+        if t == "bin":
+            rec["buf"] += d.get("data", b"")
+            if w:
+                w.update_incoming(fid, len(rec["buf"]), rec["size"])
+            return
+        if t == "file_abort":
+            self.incoming.pop(fid, None)
+            if w:
+                w.fail_incoming(fid, "전송이 중단되었습니다.")
+            return
+
+        # file_end
+        self.incoming.pop(fid, None)
+        png = bytes(rec["buf"])
+        ok = (not rec["size"] or len(png) == rec["size"])
+        if ok and rec.get("sha256"):
+            ok = hashlib.sha256(png).hexdigest() == rec["sha256"]
+        if not ok:
+            if w:
+                w.fail_incoming(fid, "이미지가 깨져서 도착했습니다.")
+            return
+        if room in self.store.subs():
+            self.store.save_image(room, fid, png)
+            self.store.append_history(room, {
+                "mid": rec["mid"], "ts": rec["ts"], "from": rec["from"],
+                "kind": "img", "fid": fid, "name": rec["name"]})
+        if w:
+            w.finish_incoming(fid, png)
+        elif room in self.store.subs() and self.var_notify.get():
+            notify(self.root, f"{room} — {rec['from']}", f"이미지: {rec['name']}")
+
+    def send_image(self, room, png, size, name):
+        """PNG를 청크로 쪼개 보낸다. 큐에 넣기만 하므로 GUI가 멈추지 않는다."""
+        fid = uuid.uuid4().hex
+        self.client.send({"t": "file_begin", "room": room, "fid": fid, "name": name,
+                          "size": len(png), "sha256": hashlib.sha256(png).hexdigest(),
+                          "w": size[0], "h": size[1]})
+        for i in range(0, len(png), IMG_CHUNK):
+            self.client.send_chunk(fid, i // IMG_CHUNK, png[i:i + IMG_CHUNK])
+        self.client.send({"t": "file_end", "room": room, "fid": fid})
+        if room in self.store.subs():
+            self.store.save_image(room, fid, png)
+            self.store.append_history(room, {
+                "mid": None, "ts": time.time(), "from": self.uid,
+                "kind": "img", "fid": fid, "name": name})
+        return fid
+
     def _on_room_deleted(self, room):
         self.rooms.pop(room, None)
         w = self.windows.get(room)
@@ -1299,9 +1667,11 @@ class RoomWindow:
         self.app = app
         self.room = room
         self.info = app.rooms.get(room, {})
-        self.bubbles = []            # (라벨, 최대폭비율) — 창 폭이 바뀌면 줄바꿈 갱신
+        self.bubbles = []            # 텍스트 말풍선 라벨 — 창 폭이 바뀌면 줄바꿈 갱신
         self.pending = {}            # cid -> 체크표시 라벨
         self.cid_seq = 0
+        self.images = {}             # fid -> {holder, label, photo, png} (참조 유지 필수)
+        self.sending = {}            # fid -> 진행 라벨(내가 보내는 중)
 
         self.win = tk.Toplevel(app.root)
         self.win.title(f"{room} — domichat")
@@ -1342,6 +1712,8 @@ class RoomWindow:
         self.txt.bind("<Return>", self._on_return)
         self.txt.bind("<Shift-Return>", lambda _e: None)   # 줄바꿈은 기본 동작
         self.txt.bind("<KeyRelease>", self._grow)
+        self.txt.bind("<Control-v>", self._on_paste)       # 클립보드 이미지면 바로 전송
+        self.txt.bind("<Control-V>", self._on_paste)
         dark_btn(bottom, "보내기", self.send).pack(side="right")
         self.txt.focus_set()
 
@@ -1418,7 +1790,8 @@ class RoomWindow:
                 m.add_command(label="블랙리스트",
                               command=lambda: BlockDialog(self.app, self.room))
                 m.add_command(label="채팅방 삭제", command=self.delete_room)
-        m.add_command(label="파일 업로드", state="disabled")   # 추후 구현
+        m.add_command(label="이미지 업로드", command=self.pick_image,
+                      state="normal" if HAS_PIL else "disabled")
         x = self.bt_gear.winfo_rootx()
         y = self.bt_gear.winfo_rooty() + self.bt_gear.winfo_height()
         m.post(x, y)
@@ -1433,8 +1806,10 @@ class RoomWindow:
                 w.destroy()
         self.bubbles.clear()
         self.pending.clear()
-        self.app.store.clear_history(self.room)
-        self.set_status("대화를 지웠습니다.")
+        self.images.clear()
+        self.sending.clear()
+        self.app.store.clear_history(self.room)   # 이미지 파일까지 함께 지워진다
+        self.set_status("대화와 이미지를 지웠습니다.")
 
     def delete_room(self):
         if not messagebox.askokcancel(
@@ -1468,7 +1843,191 @@ class RoomWindow:
         self.pending[cid] = mark
         self.app.client.send({"t": "msg", "room": self.room, "body": body, "cid": cid})
 
+    # ---------- 이미지 ----------
+    def _on_paste(self, _e=None):
+        """Ctrl+V — 클립보드에 이미지가 있으면 PNG로 바꿔 바로 보낸다.
+        이미지가 아니면 아무것도 하지 않아 평소 텍스트 붙여넣기가 그대로 동작한다."""
+        res, err = png_from_clipboard()
+        if res:
+            self._send_png(res[0], res[1], "clipboard.png")
+            return "break"
+        if err:
+            self.set_status(err)
+            return "break"
+        return None
+
+    def pick_image(self):
+        if not HAS_PIL:
+            return self.set_status("이미지 기능에는 Pillow가 필요합니다.")
+        path = filedialog.askopenfilename(title="보낼 이미지 선택", parent=self.win,
+                                          filetypes=IMG_EXTS)
+        if not path:
+            return
+        res, err = png_from_file(path)
+        if not res:
+            return self.set_status(err)
+        self._send_png(res[0], res[1], os.path.splitext(os.path.basename(path))[0]
+                       + ".png")
+
+    def _send_png(self, png, size, name):
+        fid = self.app.send_image(self.room, png, size, name)
+        mark = self._image_bubble(self.app.uid, png, time.time(), mine=True,
+                                 caption=f"{name}  ({len(png)//1024}KB)")
+        self.sending[fid] = mark
+        self.set_status(f"이미지 전송 중... ({len(png)//1024}KB)")
+
+    def finish_sending(self, fid):
+        mark = self.sending.pop(fid, None)
+        if mark is not None:
+            try:
+                mark.configure(text="✓")
+            except Exception:
+                pass
+        self.set_status("이미지를 보냈습니다.")
+
+    def begin_incoming(self, fid, rec):
+        row = tk.Frame(self.sf.body, bg=BG)
+        row.pack(fill="x", padx=6, pady=(3, 0))
+        holder = tk.Frame(row, bg=BG)
+        holder.pack(side="left")
+        tk.Label(holder, text=f"{rec['from']}  {time.strftime('%H:%M')}",
+                 font=FONT_SMALL, bg=BG, fg=FG_DIM, anchor="w").pack(fill="x")
+        lb = tk.Label(holder, text=f"이미지 받는 중... {rec['name']}", font=FONT,
+                      bg=BUB_OTHER, fg=BUB_TEXT, padx=10, pady=6)
+        lb.pack(anchor="w")
+        self.images[fid] = {"row": row, "holder": holder, "label": lb, "photo": None}
+        if self.sf.at_bottom():
+            self.win.after_idle(self.sf.to_bottom)
+
+    def update_incoming(self, fid, got, size):
+        it = self.images.get(fid)
+        if it and size:
+            pct = min(100, int(got * 100 / size))
+            try:
+                it["label"].configure(text=f"이미지 받는 중... {pct}%")
+            except Exception:
+                pass
+
+    def fail_incoming(self, fid, msg):
+        it = self.images.pop(fid, None)
+        if it:
+            try:
+                it["label"].configure(text=msg)
+            except Exception:
+                pass
+
+    def finish_incoming(self, fid, png):
+        it = self.images.get(fid)
+        if not it:
+            return
+        try:
+            it["label"].destroy()
+        except Exception:
+            pass
+        self._attach_image(it["holder"], fid, png, anchor="w")
+        if self.sf.at_bottom():
+            self.win.after_idle(self.sf.to_bottom)
+
+    def _photo(self, png):
+        """PNG 바이트 → 표시용 PhotoImage. Tk 8.6은 PNG를 읽지만 축소는 못 하므로
+        Pillow로 표시 크기까지 줄인 PNG를 새로 만들어 넘긴다(없으면 원본 그대로)."""
+        data = png
+        if HAS_PIL:
+            try:
+                with Image.open(io.BytesIO(png)) as im:
+                    if im.width > IMG_VIEW_W:
+                        r = IMG_VIEW_W / im.width
+                        im = im.resize((IMG_VIEW_W, max(1, int(im.height * r))),
+                                       Image.LANCZOS)
+                    buf = io.BytesIO()
+                    im.save(buf, format="PNG")
+                    data = buf.getvalue()
+            except Exception:
+                data = png
+        return tk.PhotoImage(data=base64.b64encode(data))
+
+    def _attach_image(self, holder, fid, png, anchor="w", caption=None):
+        try:
+            photo = self._photo(png)
+        except Exception as e:
+            tk.Label(holder, text=f"이미지를 표시할 수 없습니다({e})", font=FONT_SMALL,
+                     bg=BUB_OTHER, fg=BUB_TEXT, padx=10, pady=6).pack(anchor=anchor)
+            return
+        lb = tk.Label(holder, image=photo, bg=BUB_MINE if anchor == "e" else BUB_OTHER,
+                      bd=0, padx=4, pady=4, cursor="hand2")
+        lb.pack(anchor=anchor)
+        if caption:
+            tk.Label(holder, text=caption, font=FONT_SMALL, bg=BG, fg=FG_DIM,
+                     anchor=anchor).pack(fill="x")
+        # photo 참조를 붙들어야 한다 — 놓으면 tkinter가 지워 이미지가 빈칸이 된다
+        self.images[fid] = {"holder": holder, "label": lb, "photo": photo, "png": png}
+        lb.bind("<Button-3>", lambda e, f=fid: self._image_menu(e, f))
+        lb.bind("<Control-c>", lambda _e, f=fid: self.copy_image(f))
+        lb.bind("<Double-Button-1>", lambda _e, f=fid: self.save_image_as(f))
+
+    def _image_menu(self, event, fid):
+        m = tk.Menu(self.win, tearoff=0, bg=BG_SOFT, fg=FG, font=FONT,
+                    activebackground=ACCENT, activeforeground="#000000", bd=0)
+        m.add_command(label="클립보드로 복사 (Ctrl+C)",
+                      command=lambda: self.copy_image(fid))
+        m.add_command(label="다른 이름으로 저장", command=lambda: self.save_image_as(fid))
+        m.post(event.x_root, event.y_root)
+
+    def copy_image(self, fid):
+        it = self.images.get(fid)
+        if not it or not it.get("png"):
+            return
+        ok = copy_png_to_clipboard(it["png"])
+        self.set_status("이미지를 클립보드로 복사했습니다." if ok
+                        else "클립보드 복사에 실패했습니다.")
+
+    def save_image_as(self, fid):
+        it = self.images.get(fid)
+        if not it or not it.get("png"):
+            return
+        p = filedialog.asksaveasfilename(parent=self.win, defaultextension=".png",
+                                         initialfile=f"{fid[:8]}.png",
+                                         filetypes=[("PNG", "*.png")])
+        if not p:
+            return
+        try:
+            with open(p, "wb") as fp:
+                fp.write(it["png"])
+            self.set_status(f"저장했습니다: {p}")
+        except Exception as e:
+            self.set_status(f"저장 실패: {e}")
+
+    def _image_bubble(self, sender, png, ts, mine=False, caption=None):
+        stick = self.sf.at_bottom()
+        row = tk.Frame(self.sf.body, bg=BG)
+        row.pack(fill="x", padx=6, pady=(3, 0))
+        holder = tk.Frame(row, bg=BG)
+        holder.pack(side="right" if mine else "left")
+        when = time.strftime("%H:%M", time.localtime(ts or time.time()))
+        tk.Label(holder, text=when if mine else f"{sender}  {when}", font=FONT_SMALL,
+                 bg=BG, fg=FG_DIM, anchor="e" if mine else "w").pack(
+                     fill="x", anchor="e" if mine else "w")
+        line = tk.Frame(holder, bg=BG)
+        line.pack(anchor="e" if mine else "w")
+        mark = None
+        if mine:
+            mark = tk.Label(line, text="···", font=FONT_SMALL, bg=BG, fg=FG_DIM)
+            mark.pack(side="left", padx=(0, 4))
+        box = tk.Frame(line, bg=BG)
+        box.pack(side="left")
+        self._attach_image(box, uuid.uuid4().hex, png,
+                           anchor="e" if mine else "w", caption=caption)
+        if stick:
+            self.win.after_idle(self.sf.to_bottom)
+        return mark
+
     def add_message(self, d, mine=False, scroll=True):
+        if d.get("kind") == "img":          # 로컬 기록에서 되살리는 이미지
+            png = self.app.store.load_image(self.room, d.get("fid"))
+            if png:
+                self._image_bubble(d.get("from"), png, d.get("ts"), mine=mine,
+                                   caption=d.get("name"))
+            return
         cid = d.get("cid")
         if cid and cid in self.pending:        # 내가 보낸 것의 에코 = 전송 확인
             lb = self.pending.pop(cid)
