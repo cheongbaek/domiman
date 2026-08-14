@@ -16,6 +16,11 @@ domiman_config.json
 # UI 목업(예시 데이터에 실제 ntfy 채널명이 들어있어 비공개 유지)
 앱UI설명.xlsx
 
+# domichat 서버 런타임 산출물 (domiserver.py 옆에 생긴다)
+# domiserver.db 에는 계정 비밀번호 해시·채팅방 정보가 들어 있어 절대 커밋하지 않는다.
+domiserver.db
+domiserver.json
+
 # 로그
 fishing_log_*.txt
 *.log
