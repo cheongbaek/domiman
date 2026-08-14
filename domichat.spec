@@ -29,10 +29,17 @@ datas = [
 # domichat.py는 runpy로 동적 로드되어 정적 분석에 안 잡히므로 여기에 명시한다.
 # domichat.py는 표준 라이브러리만 쓰고(socket/sqlite3 없음, urllib으로 업데이트),
 # 알림만 winotify가 있으면 쓰고 없으면 자체 토스트로 대체한다.
+# domichat.py 의 **최상위 import 를 하나도 빠짐없이** 적는다.
+# 빠뜨리면 스크립트로는 되는데 exe에서만 시작조차 못 한다(실측: `import uuid` 하나로
+# 업데이트한 exe가 ModuleNotFoundError 로 죽었다). scripts/check_spec_imports.py 가
+# domichat.py 를 파싱해 이 목록과 대조하므로, import 를 추가하면 여기도 같이 고칠 것.
 hiddenimports = [
+    'base64', 'ctypes', 'hashlib', 'io', 'json', 'os', 'queue', 're', 'socket',
+    'ssl', 'struct', 'subprocess', 'sys', 'threading', 'time',
+    'urllib.request',
     'tkinter', 'tkinter.font', 'tkinter.messagebox', 'tkinter.filedialog',
-    'urllib.request', 'winotify',
-    'PIL', 'PIL.Image', 'PIL.ImageGrab',
+    # 선택적 의존(없으면 해당 기능만 꺼진다) — 번들에는 넣어둔다
+    'winotify', 'PIL', 'PIL.Image', 'PIL.ImageGrab',
 ] + pil_hidden
 
 a = Analysis(

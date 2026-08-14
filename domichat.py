@@ -30,8 +30,18 @@ import threading
 import time
 import tkinter as tk
 import urllib.request
-import uuid
-from tkinter import filedialog, messagebox
+from tkinter import messagebox
+
+# **exe 번들에 없을 수 있는 것은 최상위 import 하지 않는다(함정, 260815c에서 고침):**
+# domichat.py 는 exe에 데이터로만 들어가 runpy로 실행되므로 PyInstaller의 정적 분석
+# 대상이 아니다. 여기서 새로 import 한 모듈이 번들에 없으면 **스크립트로는 되는데
+# exe에서만 시작조차 못 한다.** 실제로 `import uuid` 하나 때문에 업데이트한 exe가
+# ModuleNotFoundError로 죽었다(uuid 는 os.urandom 으로 대체해 아예 없앴다).
+# filedialog·Pillow는 없으면 그 기능만 끄고 계속 돌아가게 한다.
+try:
+    from tkinter import filedialog
+except Exception:
+    filedialog = None
 
 # 이미지 기능(PNG 변환·클립보드 붙여넣기·인라인 표시)에만 Pillow가 필요하다.
 # 없으면 이미지 기능만 비활성되고 채팅은 그대로 동작한다.
@@ -67,6 +77,11 @@ IMG_MAX_SIDE = 2560                       # 이 이상 크면 줄여서 보낸�
 IMG_VIEW_W = 320                          # 말풍선 안 표시 폭
 IMG_EXTS = [("이미지", "*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff"),
             ("모든 파일", "*.*")]
+
+
+def new_fid():
+    """전송 식별자(32자리 hex). uuid 모듈을 쓰지 않는다 — 위 import 주석 참고."""
+    return os.urandom(16).hex()
 
 # 데이터 폴더. DOMICHAT_DIR 환경변수로 바꿀 수 있다(테스트·다중 프로필용).
 APP_DIR = os.environ.get("DOMICHAT_DIR") or os.path.join(
@@ -118,7 +133,7 @@ if os.name == "nt":       # 흐릿한 글자 방지. root 생성 전에 해둬�
 #
 # 리포는 domiman과 공유하고 **파일 이름으로 구분**한다(domichat_version.txt /
 # domichat.py) — 리포를 새로 만들지 않아도 되고 domiman 업데이트와 섞이지 않는다.
-APP_VERSION = "260815b"
+APP_VERSION = "260815c"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -155,11 +170,23 @@ def apply_update_and_restart(new_source):
     """새 소스로 이 파일을 원자적으로 교체하고 재시작한다(반환하지 않음).
     쓰다가 중단돼도 os.replace 직전까지는 원본이 그대로 남아 안전하다.
     frozen(exe)이면 런처 자신을 인자 없이 다시 띄워 방금 교체된 domichat.py를
-    읽게 하고, 스크립트 모드면 같은 인터프리터로 이 파일을 재실행한다."""
+    읽게 하고, 스크립트 모드면 같은 인터프리터로 이 파일을 재실행한다.
+
+    **교체 전 이전 버전을 `.bak`으로 남긴다(중요):** 새 버전이 시작조차 못 하면
+    (예: exe 번들에 없는 모듈을 import) 앱을 켤 수 없어 ⟳ 버튼으로 되돌릴 수도
+    없다. 런처가 실행 실패를 감지하면 이 백업으로 자동 복구한다
+    (domichat_launcher.py 참고)."""
     target = os.path.abspath(__file__)
     tmp = target + ".new"
     with open(tmp, "w", encoding="utf-8") as fp:
         fp.write(new_source)
+    try:
+        with open(target, "r", encoding="utf-8") as cur:
+            old = cur.read()
+        with open(target + ".bak", "w", encoding="utf-8") as fp:
+            fp.write(old)
+    except Exception as e:
+        print(f"[업데이트] 백업 실패(계속 진행): {e}")
     os.replace(tmp, target)
     if getattr(sys, "frozen", False):
         subprocess.Popen([sys.executable])
@@ -1615,7 +1642,7 @@ class App:
 
     def send_image(self, room, png, size, name):
         """PNG를 청크로 쪼개 보낸다. 큐에 넣기만 하므로 GUI가 멈추지 않는다."""
-        fid = uuid.uuid4().hex
+        fid = new_fid()
         self.client.send({"t": "file_begin", "room": room, "fid": fid, "name": name,
                           "size": len(png), "sha256": hashlib.sha256(png).hexdigest(),
                           "w": size[0], "h": size[1]})
@@ -1791,7 +1818,7 @@ class RoomWindow:
                               command=lambda: BlockDialog(self.app, self.room))
                 m.add_command(label="채팅방 삭제", command=self.delete_room)
         m.add_command(label="이미지 업로드", command=self.pick_image,
-                      state="normal" if HAS_PIL else "disabled")
+                      state="normal" if (HAS_PIL and filedialog) else "disabled")
         x = self.bt_gear.winfo_rootx()
         y = self.bt_gear.winfo_rooty() + self.bt_gear.winfo_height()
         m.post(x, y)
@@ -1859,6 +1886,9 @@ class RoomWindow:
     def pick_image(self):
         if not HAS_PIL:
             return self.set_status("이미지 기능에는 Pillow가 필요합니다.")
+        if filedialog is None:
+            return self.set_status("이 빌드에는 파일 선택 창이 없습니다"
+                                   " (Ctrl+V 로 클립보드 이미지는 보낼 수 있습니다).")
         path = filedialog.askopenfilename(title="보낼 이미지 선택", parent=self.win,
                                           filetypes=IMG_EXTS)
         if not path:
@@ -1985,6 +2015,9 @@ class RoomWindow:
         it = self.images.get(fid)
         if not it or not it.get("png"):
             return
+        if filedialog is None:
+            return self.set_status("이 빌드에는 저장 창이 없습니다"
+                                   " (우클릭 → 클립보드로 복사는 됩니다).")
         p = filedialog.asksaveasfilename(parent=self.win, defaultextension=".png",
                                          initialfile=f"{fid[:8]}.png",
                                          filetypes=[("PNG", "*.png")])
@@ -2015,7 +2048,7 @@ class RoomWindow:
             mark.pack(side="left", padx=(0, 4))
         box = tk.Frame(line, bg=BG)
         box.pack(side="left")
-        self._attach_image(box, uuid.uuid4().hex, png,
+        self._attach_image(box, new_fid(), png,
                            anchor="e" if mine else "w", caption=caption)
         if stick:
             self.win.after_idle(self.sf.to_bottom)

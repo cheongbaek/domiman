@@ -669,6 +669,30 @@ TR1                   [-]  [+]
   꺼내 처리**한다. 종료 시에는 예약된 `_pump`를 `after_cancel`해야 Tk가
   `invalid command name ..._pump`를 뱉지 않는다.
 
+### ⚠️ 새 `import` 를 추가하면 스펙도 같이 고쳐야 한다 (실제로 배포본을 죽인 함정)
+
+`domichat.py` 는 exe에 **데이터로만** 들어가 매 실행 `runpy` 로 읽히므로 **PyInstaller
+정적 분석 대상이 아니다.** 그래서 그 파일이 새로 `import` 한 모듈이 번들에 없으면
+**스크립트로는 멀쩡한데 exe에서만 시작조차 못 한다.**
+
+실제 사고(260815b): 이미지 기능을 넣으며 `import uuid` 를 추가했는데 스펙에 안 적어
+배포본이 업데이트 후 `ModuleNotFoundError: No module named 'uuid'` 로 죽었다.
+**앱이 안 켜지니 ⟳ 버튼으로 되돌릴 수도 없었다.** 실측으로 확인한 결과, 그 번들에
+없던 것은 `uuid` · `tkinter.filedialog` · `PIL` 셋이었다(`base64`·`io`·`hashlib`·
+`ssl` 등은 이미 들어 있었다).
+
+세 겹으로 막았다:
+1. **`uuid` 를 아예 안 쓴다** — `new_fid()` 가 `os.urandom(16).hex()` 로 같은 32자리
+   hex를 만든다. 선택적인 것(`filedialog`·`PIL`)은 `try/except` 로 감싸 없으면 그
+   기능만 끈다.
+2. **런처가 자동 복구한다** — 업데이트 시 이전 파일을 `domichat.py.bak` 으로 남기고,
+   런처는 실행이 예외로 끝나면 `.bak` 으로 되돌린 뒤 사유를 `domichat_error.log` 에
+   적고 이전 버전으로 다시 띄운다(`.bak` 이 없으면 안내 후 종료 — 무한 반복 없음).
+   ※ 이 보호는 **런처가 exe에 컴파일돼 있으므로 재빌드해야 적용된다.**
+3. **검사 스크립트** — `python scripts/check_spec_imports.py` 가 `domichat.py` 의
+   최상위 import 를 파싱해 `domichat.spec` 의 `hiddenimports` 와 대조한다. 빠진 게
+   있으면 종료코드 1. **import 를 추가하면 이걸 돌릴 것.**
+
 ### 빌드 (domiman과 완전히 분리)
 ```
 pyinstaller domichat.spec --noconfirm --clean      # → dist\domichat\
