@@ -133,7 +133,7 @@ if os.name == "nt":       # 흐릿한 글자 방지. root 생성 전에 해둬�
 #
 # 리포는 domiman과 공유하고 **파일 이름으로 구분**한다(domichat_version.txt /
 # domichat.py) — 리포를 새로 만들지 않아도 되고 domiman 업데이트와 섞이지 않는다.
-APP_VERSION = "260815c"
+APP_VERSION = "260815d"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -302,7 +302,9 @@ class ChatClient:
 
     # ---------- 저수준 ----------
     def _raw_send(self, sock, obj):
-        if isinstance(obj, bytes):          # 이미 프레임으로 만들어진 이미지 청크
+        if isinstance(obj, tuple):          # ("B", fid, 프레임바이트) = 이미지 청크
+            obj = obj[2]
+        if isinstance(obj, bytes):          # 이미 프레임으로 만들어진 것
             with self._send_lock:
                 sock.sendall(obj)
             return
@@ -452,6 +454,11 @@ class ChatClient:
                     pass
                 self.sock = None
 
+            # 세션이 끝났으면 보내다 만 이미지는 포기한다(재접속 고리 방지)
+            dropped = self._drop_pending_chunks()
+            if dropped:
+                self.q.put({"_ev": "file_aborted", "fids": dropped})
+
             if not self.want:
                 break
             self.first_try = False
@@ -476,16 +483,43 @@ class ChatClient:
             try:
                 self._raw_send(sock, obj)
             except Exception:
-                self.txq.put(obj)          # 못 보냈으면 되돌려 넣고 재연결을 기다린다
+                # 채팅 메시지는 되돌려 넣어 재연결 후 보내지만, **이미지 청크는 버린다**
+                # (이어 보낼 수 없고, 재접속 고리의 원인이 된다 — _drop_pending_chunks)
+                if not (isinstance(obj, tuple) and obj[0] == "B"):
+                    self.txq.put(obj)
                 return
 
     def send(self, obj):
         self.txq.put(obj)
 
     def send_chunk(self, fid_hex, seq, data):
-        """이미지 청크를 프레임으로 만들어 송신 큐에 넣는다(순서 보장)."""
+        """이미지 청크를 프레임으로 만들어 송신 큐에 넣는다(순서 보장).
+        **fid를 함께 실어 둔다** — 연결이 끊기면 이 청크들은 버려야 하기 때문이다
+        (아래 _drop_pending_chunks 참고)."""
         body = FILE_HEAD.pack(bytes.fromhex(fid_hex), seq) + data
-        self.txq.put(FRAME_HEAD.pack(len(body), ord("B")) + body)
+        self.txq.put(("B", fid_hex, FRAME_HEAD.pack(len(body), ord("B")) + body))
+
+    def _drop_pending_chunks(self):
+        """큐에 남은 이미지 청크를 전부 버리고 그 fid 목록을 돌려준다.
+
+        **끊긴 뒤 다시 보내면 안 된다(함정, 260815d에서 고침):** 전송 중 연결이
+        끊기면 서버 쪽 전송 상태(tx_files)가 사라져 이어 보내도 의미가 없고,
+        상대가 **이미지를 모르는 옛 서버**면 'B' 프레임을 받는 즉시 연결을 끊는다.
+        그런데 큐에 청크가 남아 있으면 재접속할 때마다 그걸 다시 보내 **1초 간격
+        재접속 고리**에 빠진다(실측: 12초에 18번). 그래서 세션이 끝나면 버린다."""
+        kept, fids = [], set()
+        while True:
+            try:
+                item = self.txq.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(item, tuple) and item[0] == "B":
+                fids.add(item[1])
+            else:
+                kept.append(item)
+        for item in kept:
+            self.txq.put(item)
+        return sorted(fids)
 
     def logout(self):
         self.want = False
@@ -521,7 +555,10 @@ def to_png(img):
         r = IMG_MAX_SIDE / max(w, h)
         img = img.resize((max(1, int(w * r)), max(1, int(h * r))), Image.LANCZOS)
     buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
+    # optimize=True 는 쓰지 않는다 — 실측으로 이득이 없었다(노이즈가 많은 이미지에서는
+    # 오히려 결과가 조금 더 컸다). 인코딩 자체는 빠르지만(1200x900 기준 0.1초) 큰
+    # 사진에서는 시간이 늘어날 수 있어, 변환은 어차피 작업 스레드에서 돌린다.
+    img.save(buf, format="PNG")
     return buf.getvalue(), img.size
 
 
@@ -966,6 +1003,7 @@ class App:
         # 구독하지 않으면 방을 나가거나 앱을 끌 때 잊는다(설계 확정 사항).
         self.room_pw_mem = {}
         self.incoming = {}       # 받는 중인 이미지: fid -> {room,name,size,buf,...}
+        self.server_ver = 1      # welcome 으로 갱신(2 이상이어야 이미지 전송 가능)
         self.busy = False
         self.updating = False
         self.logged_once = False
@@ -1356,6 +1394,15 @@ class App:
                 kind, *rest = self.ui_q.get_nowait()
                 if kind == "update_done":
                     self._update_done(*rest)
+                elif kind == "image_ready":
+                    room, res, err, name = rest
+                    w = self.windows.get(room)
+                    if not w:
+                        continue
+                    if res:
+                        w._send_png(res[0], res[1], name)
+                    else:
+                        w.set_status(err or "이미지를 읽지 못했습니다.")
         except queue.Empty:
             pass
         try:
@@ -1484,6 +1531,11 @@ class App:
                 self._login_msg("새 인증서를 신뢰했습니다. 다시 로그인합니다.")
                 return self.root.after(100, self.do_login)
             return self._login_msg("인증서가 바뀌어 접속을 중단했습니다.", "#FF8888")
+        if ev == "file_aborted":
+            for w in self.windows.values():
+                for fid in d.get("fids", []):
+                    w.fail_sending(fid)
+            return
         if ev == "connect_fail":
             self._set_busy(False)
             return self._login_msg(d.get("msg", "접속 실패"), "#FF8888")
@@ -1504,6 +1556,9 @@ class App:
 
     def _on_welcome(self, d):
         self.uid = d.get("id")
+        # 서버 프로토콜 버전(1=텍스트만, 2=이미지 지원). 옛 서버에 이미지를 보내면
+        # 그쪽이 연결을 끊어 재접속 고리에 빠지므로 **보내기 전에 막는다.**
+        self.server_ver = int(d.get("ver") or 1)
         self.rooms = {r["name"]: r for r in d.get("rooms", [])}
         cfg = self.store.cfg
         ip, port, uid, pw = self._fields()
@@ -1871,17 +1926,34 @@ class RoomWindow:
         self.app.client.send({"t": "msg", "room": self.room, "body": body, "cid": cid})
 
     # ---------- 이미지 ----------
+    def _convert_async(self, fn, name):
+        """이미지 변환은 **작업 스레드**에서 한다 — 큰 사진의 PNG 인코딩은 몇 초가
+        걸려 GUI 스레드에서 하면 창이 얼어붙는다. 결과는 큐로 받아 메인 스레드가
+        처리한다(tkinter는 메인 스레드 전용)."""
+        self.set_status("이미지 변환 중...")
+
+        def work():
+            try:
+                res, err = fn()
+            except Exception as e:
+                res, err = None, f"이미지 변환 실패: {e}"
+            self.app.ui_q.put(("image_ready", self.room, res, err, name))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _on_paste(self, _e=None):
         """Ctrl+V — 클립보드에 이미지가 있으면 PNG로 바꿔 바로 보낸다.
         이미지가 아니면 아무것도 하지 않아 평소 텍스트 붙여넣기가 그대로 동작한다."""
-        res, err = png_from_clipboard()
-        if res:
-            self._send_png(res[0], res[1], "clipboard.png")
-            return "break"
-        if err:
-            self.set_status(err)
-            return "break"
-        return None
+        if not HAS_PIL:
+            return None                    # 평소 텍스트 붙여넣기로
+        try:                               # 이미지인지 여부는 빨리 판별된다
+            got = ImageGrab.grabclipboard()
+        except Exception:
+            return None
+        if got is None:
+            return None
+        self._convert_async(png_from_clipboard, "clipboard.png")
+        return "break"
 
     def pick_image(self):
         if not HAS_PIL:
@@ -1893,13 +1965,14 @@ class RoomWindow:
                                           filetypes=IMG_EXTS)
         if not path:
             return
-        res, err = png_from_file(path)
-        if not res:
-            return self.set_status(err)
-        self._send_png(res[0], res[1], os.path.splitext(os.path.basename(path))[0]
-                       + ".png")
+        name = os.path.splitext(os.path.basename(path))[0] + ".png"
+        self._convert_async(lambda: png_from_file(path), name)
 
     def _send_png(self, png, size, name):
+        if self.app.server_ver < 2:
+            # 옛 서버는 이미지 청크를 받으면 연결을 끊는다 → 아예 보내지 않는다
+            return self.set_status(
+                "이 서버는 이미지 전송을 지원하지 않습니다(서버를 업데이트하세요).")
         fid = self.app.send_image(self.room, png, size, name)
         mark = self._image_bubble(self.app.uid, png, time.time(), mine=True,
                                  caption=f"{name}  ({len(png)//1024}KB)")
@@ -1914,6 +1987,17 @@ class RoomWindow:
             except Exception:
                 pass
         self.set_status("이미지를 보냈습니다.")
+
+    def fail_sending(self, fid):
+        """연결이 끊겨 전송이 취소됐을 때. 이어 보낼 수 없으므로 실패로 표시한다."""
+        mark = self.sending.pop(fid, None)
+        if mark is None:
+            return
+        try:
+            mark.configure(text="✕", fg="#FF8888")
+        except Exception:
+            pass
+        self.set_status("연결이 끊겨 이미지 전송이 취소되었습니다. 다시 보내주세요.")
 
     def begin_incoming(self, fid, rec):
         row = tk.Frame(self.sf.body, bg=BG)

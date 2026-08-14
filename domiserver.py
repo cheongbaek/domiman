@@ -41,8 +41,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "domiserver.json")
 DB_PATH = os.path.join(BASE_DIR, "domiserver.db")
 
-APP_VERSION = "260815e"
-PROTO_VER = 1
+APP_VERSION = "260815f"
+# 프로토콜 버전 — welcome 으로 알려준다. 클라이언트는 이 값으로 기능 유무를 판단한다.
+#   1 = 텍스트 채팅  /  2 = 이미지 첨부('B' 프레임) 지원
+# 옛 서버는 'B' 프레임을 '지원하지 않는 프레임'으로 보고 **연결을 끊으므로**,
+# 클라이언트가 버전을 보고 미리 막지 않으면 재접속 고리에 빠진다(실측).
+PROTO_VER = 2
 
 MAX_FRAME = 1024 * 1024          # 'T' 프레임 상한(1MB). 넘으면 규격 위반으로 끊는다
 FRAME_HEAD = struct.Struct(">IB")   # 길이 4바이트(빅엔디안) + 종류 1바이트
