@@ -153,6 +153,11 @@ CONFIG_PATH = os.path.join(LOG_DIR, "domiman_config.json")
 NTFY_SERVER = "https://ntfy.sh"
 DEFAULT_NTFY_TOPIC = "talesrunnerisgood"
 _ntfy_enabled = False
+NTFY_SEND_ATTEMPTS = 3       # 발신 재시도 총 횟수(일시적 실패·순간 한도 대비)
+NTFY_SEND_DEADLINE = 8.0     # 재시도 총 제한(초) — 요청자의 15초 응답 대기 안에 끝나야 한다
+NTFY_QUOTA_COOLDOWN = 900.0  # 일일 한도(42908) 감지 후 발신을 멈추는 시간(초)
+_ntfy_quota_reported = 0.0   # 한도 조회 로그 도배 방지용 타임스탬프
+_ntfy_quota_until = 0.0      # 이 시각까지 발신 보류(일일 한도 소진 상태)
 
 
 def load_config():
@@ -187,24 +192,102 @@ NTFY_TOPIC = _cfg.get("channel") if re.fullmatch(
 NTFY_URL = f"{NTFY_SERVER}/{NTFY_TOPIC}"
 
 
+def _ntfy_quota_text():
+    """이 PC(공인 IP)의 ntfy 발신 사용량을 한 줄로 돌려준다. 실패하면 빈 문자열.
+    ntfy.sh 무료 한도는 계정이 아니라 **IP 단위**(`"basis": "ip"`)라 같은
+    공유기를 쓰는 PC·휴대폰이 한 버킷을 공유한다. 429 진단용으로만 호출한다."""
+    try:
+        data = requests.get(f"{NTFY_SERVER}/v1/account", timeout=5).json()
+        st, lim = data.get("stats", {}), data.get("limits", {})
+        hours = int(lim.get("messages_expiry_duration", 43200)) // 3600
+        return (f"이 IP 발신량 {st.get('messages')}/{lim.get('messages')}건"
+                f" (최근 {hours}시간 기준, 남음 {st.get('messages_remaining')})")
+    except Exception:
+        return ""
+
+
 def ntfy_send(body, wait=False):
     """프로토콜 메시지 발신(Title=내 PC 이름). 기본 비동기(GUI 블로킹 방지).
-    ntfy 비활성화 상태면 무시."""
+    ntfy 비활성화 상태면 무시.
+
+    **HTTP 상태를 반드시 확인한다(함정, 260814a에서 고침):** `requests.post`는
+    429·5xx에도 예외를 던지지 않으므로 `status_code`를 안 보면 **서버가 버린
+    메시지를 '[ntfy 발신]' 성공으로 로그에 찍는다.** 이 때문에 특정 PC가 원격
+    S 질의를 받아 응답을 '발신했다'고 로그에 남기는데도 제어 PC는 15초 무응답
+    으로 로컬 복귀하는 현상을 오래 못 잡았다(채널을 직접 구독해 확인한 결과
+    그 PC의 메시지는 애초에 채널에 도달하지 않았다).
+
+    원인은 ntfy.sh 무료 발신 한도 — **IP당 12시간 250건**(구독=GET은 별도
+    한도)이라, 한도를 태운 PC는 **수신만 정상이고 발신 전부가 429로 죽는다.**
+    증상이 '한 PC만 응답을 못 한다'로 보여 문자열·이름 문제로 오인하기 쉽다.
+    (실측 260814a: TR1이 `{"code":42908,"error":"daily message quota reached"}`로
+    12시간 동안 단 한 건도 발행하지 못하는데, 같은 랜의 TR2는 정상이었다.
+    ntfy 방문자 버킷은 egress IP 단위라 같은 공유기라도 나가는 IP가 다르면
+    한도가 분리된다.)
+
+    그러니 상태를 확인해 사실대로 로그에 남기고(429면 남은 한도까지 같이),
+    일시적 실패는 짧게 재시도한다. **단 일일 한도(42908)는 재시도하지 않고
+    냉각한다** — 기다려도 회복되지 않는 실패에 요청을 더 던지면 같은 버킷의
+    요청 토큰만 태워 상황을 악화시킨다."""
     if not _ntfy_enabled:
-        return
+        return False
 
     def _run():
-        try:
-            requests.post(NTFY_URL, data=body.encode("utf-8"),
-                          headers={"Title": PC_NAME, "Priority": "3"}, timeout=10)
-            print(f"[ntfy 발신] {body}")
-        except Exception as e:
-            print(f"[ntfy 발신 실패] {body} ({e})")
+        global _ntfy_quota_reported, _ntfy_quota_until
+        if time.time() < _ntfy_quota_until:
+            left = int(_ntfy_quota_until - time.time()) // 60 + 1
+            print(f"[ntfy 발신 보류] {body} (일일 한도 소진, 약 {left}분 후 재시도)")
+            return False
+        deadline = time.time() + NTFY_SEND_DEADLINE
+        for attempt in range(1, NTFY_SEND_ATTEMPTS + 1):
+            status, quota_hit = None, False
+            try:
+                resp = requests.post(NTFY_URL, data=body.encode("utf-8"),
+                                     headers={"Title": PC_NAME, "Priority": "3"},
+                                     timeout=(5, 10))
+            except Exception as e:
+                reason, retry = f"({e})", True
+            else:
+                if resp.status_code < 300:
+                    if _ntfy_quota_until:
+                        print("[ntfy] 발신 한도가 회복되었습니다.")
+                        _ntfy_quota_until = 0.0
+                    print(f"[ntfy 발신] {body}")
+                    return True
+                status = resp.status_code
+                # 응답 본문에 사유가 들어온다(예: daily limit reached) — 그대로 남긴다
+                detail = resp.text.strip().replace(chr(10), " ")[:120]
+                reason = f"HTTP {status} {detail}"
+                # 42908 = 일일 메시지 한도 소진. 재시도가 무의미한 유일한 429.
+                quota_hit = status == 429 and ("42908" in detail
+                                               or "daily" in detail.lower())
+                retry = not quota_hit and (status == 429 or status >= 500)
+            if (not retry or attempt == NTFY_SEND_ATTEMPTS
+                    or time.time() >= deadline):
+                # 한도 조회는 **최종 실패 줄에** 붙인다(중간 시도에 붙이면
+                # 정작 남는 로그에서 빠진다). 60초 스로틀로 도배 방지.
+                if status == 429 and time.time() - _ntfy_quota_reported > 60:
+                    _ntfy_quota_reported = time.time()
+                    quota = _ntfy_quota_text()
+                    if quota:
+                        reason += f" / {quota}"
+                print(f"[ntfy 발신 실패] {body} {reason}")
+                if quota_hit:
+                    _ntfy_quota_until = time.time() + NTFY_QUOTA_COOLDOWN
+                    print(f"[ntfy 한도] 이 PC는 ntfy 일일 발신 한도(IP 기준)를"
+                          f" 소진해 **원격 응답·보고를 보낼 수 없습니다.**"
+                          f" {int(NTFY_QUOTA_COOLDOWN // 60)}분간 발신을 멈춥니다"
+                          f" (수신은 계속 정상).")
+                return False
+            # 429는 토큰 충전(5~10초당 1개)을 기다려야 의미가 있다
+            nap = 5.0 if status == 429 else 1.5 * attempt
+            time.sleep(max(0.0, min(nap, deadline - time.time())))
+        return False
 
     if wait:
-        _run()
-    else:
-        threading.Thread(target=_run, daemon=True).start()
+        return _run()
+    threading.Thread(target=_run, daemon=True).start()
+    return None
 
 
 def send_report(code):
@@ -311,7 +394,7 @@ def _ntfy_stream_loop():
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260813a"
+APP_VERSION = "260814a"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
