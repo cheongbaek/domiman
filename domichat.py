@@ -133,7 +133,7 @@ if os.name == "nt":       # 흐릿한 글자 방지. root 생성 전에 해둬�
 #
 # 리포는 domiman과 공유하고 **파일 이름으로 구분**한다(domichat_version.txt /
 # domichat.py) — 리포를 새로 만들지 않아도 되고 domiman 업데이트와 섞이지 않는다.
-APP_VERSION = "260815d"
+APP_VERSION = "260815e"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -1337,6 +1337,11 @@ class App:
     def toggle_sub(self, room, var):
         on = var.get()
         self.store.set_sub(room, on)
+        # 그 방의 창이 열려 있으면 창 안 체크박스도 같이 움직인다(반대 방향은
+        # RoomWindow.toggle_sub 가 refresh_list 로 처리한다)
+        w = self.windows.get(room)
+        if w:
+            w.sync_sub(on)
         if on:
             # 구독하려면 서버 팬아웃 대상이어야 하므로 입장부터 한다
             self.client.send({"t": "join", "room": room})
@@ -1838,6 +1843,16 @@ class RoomWindow:
         except Exception:
             pass
 
+    def sync_sub(self, on):
+        """리스트 화면에서 구독을 켜고 끌 때 창 안 체크박스를 맞춰준다
+        (여기서 toggle_sub 를 부르면 서버로 중복 요청이 나가므로 표시만 바꾼다)."""
+        try:
+            self.var_sub.set(bool(on))
+        except Exception:
+            pass
+        self.set_status("구독했습니다. 창을 닫아도 대화가 기록됩니다." if on
+                        else "구독을 해제했습니다.")
+
     def toggle_sub(self):
         on = self.var_sub.get()
         self.app.store.set_sub(self.room, on)
@@ -2087,6 +2102,24 @@ class RoomWindow:
         m.add_command(label="다른 이름으로 저장", command=lambda: self.save_image_as(fid))
         m.post(event.x_root, event.y_root)
 
+    def copy_text(self, text):
+        """메시지 글자를 클립보드로. tkinter 클립보드는 창이 사라지면 내용도
+        사라지므로, 창을 닫아도 남도록 update()로 소유권을 확정한다."""
+        try:
+            self.win.clipboard_clear()
+            self.win.clipboard_append(text)
+            self.win.update()
+        except Exception as e:
+            return self.set_status(f"복사 실패: {e}")
+        preview = text.replace("\n", " ")[:20]
+        self.set_status(f"복사했습니다: {preview}{'…' if len(text) > 20 else ''}")
+
+    def _text_menu(self, event, text):
+        m = tk.Menu(self.win, tearoff=0, bg=BG_SOFT, fg=FG, font=FONT,
+                    activebackground=ACCENT, activeforeground="#000000", bd=0)
+        m.add_command(label="복사 (더블클릭)", command=lambda: self.copy_text(text))
+        m.post(event.x_root, event.y_root)
+
     def copy_image(self, fid):
         it = self.images.get(fid)
         if not it or not it.get("png"):
@@ -2178,8 +2211,11 @@ class RoomWindow:
             mark.pack(side="left", padx=(0, 4))
         bub = tk.Label(line, text=body, font=FONT, bg=BUB_MINE if mine else BUB_OTHER,
                        fg=BUB_TEXT, justify="left", anchor="w", padx=10, pady=6,
-                       wraplength=self._wrap())
+                       wraplength=self._wrap(), cursor="hand2")
         bub.pack(side="left")
+        # 더블클릭하면 그 메시지를 클립보드로 복사(우클릭 메뉴로도 같은 동작)
+        bub.bind("<Double-Button-1>", lambda _e, t=body: self.copy_text(t))
+        bub.bind("<Button-3>", lambda e, t=body: self._text_menu(e, t))
         self.bubbles.append(bub)
         if scroll and stick:
             self.win.after_idle(self.sf.to_bottom)
