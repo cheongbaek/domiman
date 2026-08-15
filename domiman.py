@@ -534,7 +534,7 @@ def send_report(code):
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260815a"
+APP_VERSION = "260815b"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -1227,6 +1227,42 @@ def read_max_gain_time(retries=3, delay=0.2):
     return _read_gain_time(REGION_MAX_TIME, retries, delay)
 
 
+ROD_EXPIRY_CONFIRM_READS = 2     # '1초/1초'를 다시 읽어 확인하는 횟수
+ROD_EXPIRY_FROZEN_CYCLES = 10    # 낚시 중으로 보여도 이만큼 수량이 멈춰 있으면 교체 허용
+
+
+def _confirm_rod_expiry(frozen_cycles):
+    """'최소·최대 획득 시간이 둘 다 1초'가 **진짜 만료인지** 한 번 더 확인한다.
+
+    **왜 필요한가(실측, 260815b):** 최소·최대가 둘 다 **15초**인 정상 화면에서
+    둘 다 '1초'로 읽혀 낚싯대를 헛교체한 사례가 나왔다(사용자 제공
+    `20260815121853.jpg`). 그 스크린샷을 지금 좌표·배율로 다시 읽으면
+    **'15초'가 확신도 0.99~1.00으로 정확히** 나온다 — 즉 좌표나 전처리 문제가
+    아니라 **실시간 캡처에서 한 프레임이 튄 것**이다. 그래서 '최대도 1초'라는
+    교차 확인(260813a)만으로는 못 거른다. 한 번의 판독으로 낚싯대를 갈지 않는다:
+
+    1. 잠깐 뒤 **다시 읽어** 최소·최대가 계속 1초인지 본다. 한 프레임짜리
+       오인식은 여기서 걸러진다(진짜 만료면 계속 1초로 남아 있다).
+    2. 그래도 낚시가 **진행 중**('낚시 취소')으로 보이면 만료가 아니라고 본다.
+       단 그 판독마저 틀릴 수 있으므로, **살림망 수량이 오랫동안 멈춰 있으면**
+       (기본 10사이클 ≈ 30초) 진행 중 표시를 무시하고 교체한다 — 진짜 만료는
+       수량이 영원히 늘지 않으므로 여기서 반드시 빠져나온다.
+    """
+    for _ in range(ROD_EXPIRY_CONFIRM_READS):
+        time.sleep(0.4)
+        again_min, again_max = read_min_gain_time(), read_max_gain_time()
+        if again_min != 1 or again_max != 1:
+            print(f"[{time.strftime('%H:%M:%S')}] 다시 읽으니 획득 시간이 "
+                  f"{again_min}초/{again_max}초 — 한 프레임 오인식으로 보고 "
+                  f"낚싯대를 교체하지 않습니다.")
+            return False
+    if is_fishing_active() is True and frozen_cycles < ROD_EXPIRY_FROZEN_CYCLES:
+        print(f"[{time.strftime('%H:%M:%S')}] 획득 시간이 1초로 읽히지만 낚시가 "
+              f"진행 중이고 수량도 도는 중({frozen_cycles}회) — 교체하지 않습니다.")
+        return False
+    return True
+
+
 def _detect_no_bait_popup():
     """'미끼가 부족합니다' 팝업 감지 ('미끼가'/'부족' 부분매칭)."""
     txt = _ocr_region(REGION_NO_BAIT)
@@ -1240,13 +1276,35 @@ def _detect_disconnect():
 
 def is_fishing_active():
     """낚시 진행 여부. COORD_FISHING_BTN 글자가 '취소'면 진행 중(True),
-    '시작'이면 대기 중(False). 둘 다 판독 안 되면 None(호출측이 무시)."""
+    '시작'이면 대기 중(False). 둘 다 판독 안 되면 None(호출측이 무시).
+
+    판정은 `_fishing_state_from_text`가 한다(그쪽 주석 참고)."""
     txt = _ocr_region(REGION_FISHING_BTN)
-    if "취소" in txt:
+    state = _fishing_state_from_text(txt)
+    if state is None:
+        print(f"[낚시 상태 판독 실패] REGION_FISHING_BTN OCR 원문='{txt}'")
+    return state
+
+
+def _fishing_state_from_text(txt):
+    """버튼 글자 → True(진행 중) / False(대기 중) / None(모르겠음).
+
+    **완전일치로 보면 안 된다(실측):** 같은 버튼의 글자만 바뀌는 구조라 후보는
+    '낚시 취소'와 '낚시 시작' **둘뿐인데**, easyocr이 '낚시 시작'을 '낚시시직'
+    으로 읽는 일이 잦다('작'→'직'). 앞의 '낚시'를 떼고 **뒤 두 글자만** 두
+    후보와 대조해, 겹치는 글자가 더 많은 쪽을 고른다:
+      '시직' → 시작과 '시' 하나 겹침, 취소와는 0  → 대기 중
+      '쥐소' → 취소와 '소' 하나 겹침, 시작과는 0  → 진행 중
+    '시'는 '낚시'에도 들어가 그대로 세면 '시작' 쪽이 늘 유리해지므로 반드시
+    앞부분을 떼고 본다. 오인식 종류를 나열하는 것보다 새 오인식에도 강하다."""
+    t = (txt or "").replace(" ", "").strip("'\"`")
+    tail = t.split("낚시")[-1] if "낚시" in t else t
+    cancel = sum(1 for ch in "취소" if ch in tail)
+    start = sum(1 for ch in "시작" if ch in tail)
+    if cancel > start:
         return True
-    if "시작" in txt:
+    if start > cancel:
         return False
-    print(f"[낚시 상태 판독 실패] REGION_FISHING_BTN OCR 원문='{txt}'")
     return None
 
 
@@ -1582,11 +1640,11 @@ class FishingWorker(threading.Thread):
             # (실측 사례는 read_max_gain_time 참고). 만료면 최대 획득 시간도
             # 1초이므로 그걸로 교차 확인한다. 확인 안 되면 minsec을 버려
             # 폴링 간격까지 1초로 오염되는 것도 막는다(그러면 3초마다 폴링).
-            rod_expired = False
+            maybe_expired = False
             if minsec == 1:
                 maxsec = read_max_gain_time()
-                rod_expired = (maxsec == 1)
-                if not rod_expired:
+                maybe_expired = (maxsec == 1)
+                if not maybe_expired:
                     if not misread_warned:
                         detail = ("판독 실패" if maxsec is None else f"{maxsec}초")
                         print(f"[{time.strftime('%H:%M:%S')}] 최소 획득 시간이 "
@@ -1624,6 +1682,7 @@ class FishingWorker(threading.Thread):
                 # 260811a에서 뺀 것은 ②가 아니라 회수 조건 **전체**(cur+5>=mx)였다
                 # — 그건 467/470처럼 멀쩡한 낚싯대까지 갈아 끼웠다. cur>mx는 낚싯대
                 # 최대치가 실제로 모자란 상태만 가리키므로 그 오작동이 없다.
+                rod_expired = maybe_expired and _confirm_rod_expiry(same_count)
                 if self.rod_swap and (rod_expired or qty[0] > qty[1]):
                     run_rod_swap_routine()
                     self.stop_event.wait(0.5)
