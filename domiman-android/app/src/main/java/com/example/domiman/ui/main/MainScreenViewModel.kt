@@ -2,7 +2,7 @@ package com.example.domiman.ui.main
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.domiman.data.DispatchResult
+import com.example.domiman.data.DomimanEvent
 import com.example.domiman.data.DomimanRepository
 import com.example.domiman.data.DomimanStatus
 import kotlinx.coroutines.Job
@@ -12,10 +12,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
-/** Sheet2 A11 '[상태 메시지]' — domiman.py STATUS_TEXT와 동일한 문구를 여기선
- * 그대로 report_text/기본값으로만 다룬다(전체 표는 PC와 동일해 재복사하지 않음). */
+/** 상태 메시지 — domiman.py STATUS_TEXT와 동일한 문구를 여기선 report_text/
+ * 기본값으로만 다룬다(전체 표는 PC와 동일해 재복사하지 않음). */
 private const val DEFAULT_STATUS = "강태공이 낚시를 준비합니다."
-private const val LOG_MAX_LINES = 8 // Sheet2 G15 — 항상 펼쳐진 채 마지막 8줄만
+private const val NO_TARGET_STATUS = "제어할 PC를 먼저 선택하세요."
+private const val LOG_MAX_LINES = 8 // 항상 펼쳐진 채 마지막 8줄만
 private const val PENDING_TIMEOUT_MS = 15_000L // domiman.py _check_pending_timeout과 동일
 private const val TIMER_DEBOUNCE_MS = 1_500L // PC의 타이머 3초 디바운스에 대응(과발신 방지)
 
@@ -27,32 +28,41 @@ data class MainUiState(
   val rod: Boolean = true,
   val bait: Boolean = true,
   val running: Boolean = false,
-  val statusMessage: String = DEFAULT_STATUS,
+  val statusMessage: String = NO_TARGET_STATUS,
   val logLines: List<String> = emptyList(),
   val isPending: Boolean = false,
+  /** 제어 PC 방에 입장해 상태를 받아오는 중(선택 직후). */
+  val isConnectingTarget: Boolean = false,
 )
 
 class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel() {
   private val _uiState = MutableStateFlow(seedState())
   val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
 
+  /** 최상단 박스에 표시할 제어 PC(없으면 '제어 PC 선택하기'). */
+  val selectedPc: StateFlow<String?> = repository.selectedPc
+
+  /** 선택 다이얼로그에 뜨는 PC 후보 목록(추가·삭제 가능). */
+  val pcList: StateFlow<List<String>> = repository.pcList
+
+  /** domiserver 연결 상태(끊기면 상단에 표시). */
+  val connected: StateFlow<Boolean> = repository.connected
+
   private var pendingTimeoutJob: Job? = null
   private var timerDebounceJob: Job? = null
 
   init {
-    // 세션(서비스+스트림)은 로그인 시 이미 시작됐고 앱 스코프에서 산다. 여기선
-    // 화면이 떠 있는 동안 이벤트를 구독해 UI에 반영만 한다.
+    // 세션은 로그인 시 이미 시작됐고 앱 스코프에서 산다. 여기선 화면이 떠 있는
+    // 동안 이벤트를 구독해 UI에 반영만 한다.
     viewModelScope.launch { repository.events.collect(::handleEvent) }
   }
 
   /** 화면이 포그라운드로 돌아올 때(ON_RESUME) 호출 — 백그라운드에서 끊겼을 수
-   * 있는 스트림을 새로 붙이고 상태를 재동기화. 세션 자체가 소실됐고 되살리지도
-   * 못하면 onSessionLost()로 로그인 화면으로 보낸다. */
+   * 있는 세션을 되살리고 방 재입장/상태 재동기화를 시킨다. 세션 자체가 소실됐고
+   * 되살리지도 못하면 onSessionLost()로 로그인 화면으로 보낸다. */
   fun onResume(onSessionLost: () -> Unit) {
     viewModelScope.launch {
       if (repository.ensureSessionAlive()) {
-        // 재접속 성공(콜드스타트/프로세스 사망 후 포함) — 방금 받아둔 상태로 UI 갱신
-        // (안 그러면 seedState가 null→기본값 "감지 중"인 채로 남아있을 수 있음).
         repository.lastStatus?.let(::applyStatus)
       } else {
         onSessionLost()
@@ -60,8 +70,7 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
     }
   }
 
-  /** 로그인 때 받아둔 상태로 초기 UI를 채운다(없으면 기본값). 진입 직후
-   * "감지 중"/running=false가 잠깐 보이던 문제를 없앤다. */
+  /** 로그인 때 받아둔 상태로 초기 UI를 채운다(없으면 기본값). */
   private fun seedState(): MainUiState {
     val s = repository.lastStatus ?: return MainUiState()
     return MainUiState(
@@ -72,11 +81,64 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
       rod = s.rod ?: true,
       bait = s.bait ?: true,
       running = s.running,
+      statusMessage = DEFAULT_STATUS,
     )
   }
 
-  private fun handleEvent(event: DispatchResult) {
-    when (event.kind) {
+  // ---------- 제어 PC 선택 ----------
+  /**
+   * 최상단 박스에서 PC를 고르면 그 PC의 채팅방(domi_fishing_{PC})에 입장·구독하고
+   * S 질의로 상태를 받아온다. 꺼져 있는 PC여도 선택은 남는다(켜지면 다시 붙는다).
+   *
+   * **로그아웃 없이 제어 대상만 갈아탄다** — domichat 로그인 세션은 그대로 두고
+   * 이전 PC의 방에서만 나오고(unsub+leave) 새 방에 들어간다. 그래서 화면에 남아
+   * 있던 이전 PC의 타이머/해상도/실행중 값은 여기서 지워야 한다(안 그러면 새 PC의
+   * 상태가 도착하기 전까지 남의 값이 보인다).
+   */
+  fun onSelectPc(pc: String) {
+    _uiState.value =
+      _uiState.value.copy(
+        isConnectingTarget = true,
+        isPending = false,
+        running = false,
+        resolutionLabel = "감지 중",
+        statusMessage = "'$pc'에 연결하는 중...",
+      )
+    pendingTimeoutJob?.cancel()
+    timerDebounceJob?.cancel()
+    addLog("'$pc' 제어를 시작합니다...")
+    viewModelScope.launch {
+      val result = repository.selectPc(pc)
+      _uiState.value = _uiState.value.copy(isConnectingTarget = false)
+      val status = result.status
+      if (result.ok && status != null) {
+        applyStatus(status)
+        _uiState.value = _uiState.value.copy(statusMessage = DEFAULT_STATUS)
+        addLog("'$pc'에 연결되었습니다.")
+      } else {
+        _uiState.value = _uiState.value.copy(statusMessage = targetFailText(pc, result.reason))
+        addLog(targetFailText(pc, result.reason))
+      }
+    }
+  }
+
+  fun onAddPc(name: String): Boolean = repository.addPc(name)
+
+  fun onRemovePc(name: String) = repository.removePc(name)
+
+  private fun targetFailText(pc: String, reason: String?): String =
+    when (reason) {
+      "room_missing" -> "'$pc'가 아직 domichat에 접속한 적이 없습니다."
+      "bad_pw_room" -> "'$pc' 채팅방 비밀번호가 맞지 않습니다."
+      "blocked" -> "'$pc' 채팅방에서 강제 퇴장된 계정입니다."
+      "no_response" -> "'$pc'가 응답하지 않습니다. PC가 켜져 있는지 확인하세요."
+      "no_session" -> "서버에 로그인되어 있지 않습니다."
+      else -> "'$pc'에 연결하지 못했습니다."
+    }
+
+  // ---------- 이벤트 ----------
+  private fun handleEvent(event: DomimanEvent) {
+    when (event.ev) {
       "reply" -> {
         // 어떤 형태든 '응답'이 왔다 = 우리가 보낸 명령이 처리됐다는 뜻이므로
         // 대기를 푼다(보고 ',Z,F,*'는 unsolicited라 reply가 아니고 여기 안 옴).
@@ -95,7 +157,7 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
           }
           "Q" -> addLog("원격 프로그램이 종료되었습니다.")
         }
-        if (event.tank != null) {
+        if (event.tank != null && event.tank.size >= 2) {
           addLog("살림망 ${event.tank[0]}/${event.tank[1]}")
         } else if (event.tankFail) {
           addLog("수량 파싱 실패")
@@ -103,6 +165,20 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
         clearPending()
       }
       "report" -> event.reportText?.let(::addLog)
+      "target_joined" -> addLog("'${event.pc}' 채팅방에 입장했습니다.")
+      "target_denied" -> {
+        addLog(targetFailText(event.pc ?: "", event.reason))
+        clearPending()
+      }
+      "target_gone" -> {
+        addLog("'${event.pc}'의 접속이 종료되었습니다.")
+        _uiState.value =
+          _uiState.value.copy(running = false, statusMessage = "'${event.pc}'가 접속을 종료했습니다.")
+        clearPending()
+      }
+      "disconnected" -> addLog("서버 연결이 끊겼습니다. 다시 접속하는 중...")
+      "reconnected" -> addLog("서버에 다시 접속했습니다.")
+      "cert_changed", "login_fail" -> event.msg?.let(::addLog)
     }
   }
 
@@ -155,10 +231,9 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
     if (_uiState.value.isPending) _uiState.value = _uiState.value.copy(isPending = false)
   }
 
-  /** '시작/중지'(Sheet2 A9) — 현재 상태에 따라 반대 명령을 보낸다.
+  /** '시작/중지' — 현재 상태에 따라 반대 명령을 보낸다.
    * repository.send*는 suspend(Dispatchers.IO)이므로 반드시 코루틴 안에서
-   * 호출할 것 — 메인 스레드에서 직접 부르면 블로킹 네트워크 호출이 UI를
-   * 막는다(실기기에서 ntfy 발신이 버벅이던 원인이었음). */
+   * 호출할 것 — 메인 스레드에서 직접 부르면 블로킹 소켓 발신이 UI를 막는다. */
   fun onStartStop() {
     markPending()
     viewModelScope.launch {
@@ -176,8 +251,8 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
     viewModelScope.launch { repository.sendSetResolution("a") }
   }
 
-  /** 타이머 입력 — 키 입력마다 발신하면 ntfy 한도를 태우므로, 화면엔 즉시
-   * 반영하되 실제 T 발신은 1.5초 디바운스(PC의 3초 디바운스에 대응). */
+  /** 타이머 입력 — 키 입력마다 발신하지 않도록 화면엔 즉시 반영하되 실제 T
+   * 발신은 1.5초 디바운스(PC의 3초 디바운스에 대응). */
   fun onTimerInput(text: String) {
     _uiState.value = _uiState.value.copy(timerText = text)
     val minutes = text.toDoubleOrNull() ?: return
@@ -195,9 +270,8 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
     viewModelScope.launch { repository.sendSetFlags(logSave, rod, bait) }
   }
 
-  /** 예약 종료(Sheet2 A12) — minutes분 뒤 종료(0=해제). PC의 2단계(Y ack→창→Y,n)
-   * 대신 모바일은 앱 안에서 분을 입력받아 바로 Y,n을 보낸다(응답은 Y 에코로
-   * 확인). */
+  /** 예약 종료 — minutes분 뒤 종료(0=해제). PC의 2단계(Y ack→창→Y,n) 대신
+   * 모바일은 앱 안에서 분을 입력받아 바로 Y,n을 보낸다(응답은 Y 에코로 확인). */
   fun onSchedExitSet(minutes: Double) {
     markPending()
     viewModelScope.launch { repository.sendSchedExitSet(minutes) }
@@ -208,7 +282,7 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
     viewModelScope.launch { repository.sendCollectNow() }
   }
 
-  /** Sheet2 G13 — '업데이트' 대신 확정된 '실시간 수량확인' 버튼. */
+  /** '실시간 수량확인'(N). */
   fun onTankQuery() {
     markPending()
     viewModelScope.launch { repository.sendTankQuery() }
@@ -218,7 +292,9 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
     _uiState.value = _uiState.value.copy(logLines = emptyList())
   }
 
-  /** 뒤로가기 2번(Sheet2 G20)에서 호출 — 무장 해제 + 세션 종료. */
+  /** '로그아웃' — repository.logout()은 **즉시 반환**하고 소켓/서비스 정리는
+   * 앱 스코프에서 뒤따른다. 예전엔 여기서 파이썬 정리를 메인 스레드로 하다가
+   * 앱이 '응답 없음'이 되곤 했다. */
   fun onLogout() {
     repository.logout()
   }

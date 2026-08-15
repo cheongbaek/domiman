@@ -32,7 +32,9 @@ class DomimanWidgetProvider : AppWidgetProvider() {
     if (intent.action !in setOf(ACTION_REFRESH, ACTION_COLLECT, ACTION_TOGGLE)) return
     try {
       val repo = (context.applicationContext as? DomimanApplication)?.repository ?: return
-      if (!repo.isSessionConfigured()) return
+      // 로그인 전이거나 제어할 PC를 아직 고르지 않았으면 보낼 곳이 없다
+      // (그 상태의 위젯 버튼은 아래 buildViews에서 '앱 열기'로 묶여 있다).
+      if (!repo.isSessionConfigured() || !repo.hasSelectedPc()) return
       // 위젯 탭은 onReceive가 반환되면 프로세스가 곧 죽을 수 있다(백그라운드).
       // 재로그인(최대 15초)이 끝나기 전에 죽으면 갱신이 안 되므로, 먼저 포그라운드
       // 서비스를 띄워 프로세스를 붙잡아 둔다(위젯 탭은 잠깐의 FGS 시작 허용창을 줌).
@@ -77,15 +79,24 @@ class DomimanWidgetProvider : AppWidgetProvider() {
           manager.getAppWidgetIds(ComponentName(appCtx, DomimanWidgetProvider::class.java))
         if (ids.isEmpty()) return
         val views =
-          buildViews(appCtx, repo.isSessionConfigured(), repo.widgetQtyText(), repo.widgetRunning())
+          buildViews(
+            appCtx,
+            repo.isSessionConfigured() && repo.hasSelectedPc(),
+            if (repo.isSessionConfigured()) "PC선택" else "로그인",
+            repo.widgetQtyText(),
+            repo.widgetRunning(),
+          )
         ids.forEach { manager.updateAppWidget(it, views) }
       } catch (_: Exception) {
       }
     }
 
+    /** ready = 로그인돼 있고 제어할 PC까지 골라진 상태. 아니면 수량 칸에
+     * idleText('로그인' 또는 'PC선택')를 띄우고 어느 칸을 눌러도 앱을 연다. */
     private fun buildViews(
       context: Context,
-      loggedIn: Boolean,
+      ready: Boolean,
+      idleText: String,
       qtyText: String,
       running: Boolean,
     ): RemoteViews {
@@ -98,7 +109,7 @@ class DomimanWidgetProvider : AppWidgetProvider() {
         if (running) R.drawable.widget_ic_pause else R.drawable.widget_ic_play,
       )
 
-      if (loggedIn) {
+      if (ready) {
         views.setTextViewText(R.id.widget_qty, qtyText)
         views.setOnClickPendingIntent(R.id.widget_refresh, broadcast(context, ACTION_REFRESH, 1))
         views.setOnClickPendingIntent(R.id.widget_collect, broadcast(context, ACTION_COLLECT, 2))
@@ -106,8 +117,8 @@ class DomimanWidgetProvider : AppWidgetProvider() {
         // 수량 칸(4/470 등)을 누르면 앱으로 들어간다(요구사항).
         views.setOnClickPendingIntent(R.id.widget_qty, openApp(context))
       } else {
-        // 로그아웃/미로그인: 수량 칸에 '로그인' 표시, 어느 칸을 눌러도 앱(로그인)을 연다.
-        views.setTextViewText(R.id.widget_qty, "로그인")
+        // 미로그인/제어 PC 미선택: 안내 문구를 띄우고 어느 칸을 눌러도 앱을 연다.
+        views.setTextViewText(R.id.widget_qty, idleText)
         val open = openApp(context)
         views.setOnClickPendingIntent(R.id.widget_refresh, open)
         views.setOnClickPendingIntent(R.id.widget_qty, open)

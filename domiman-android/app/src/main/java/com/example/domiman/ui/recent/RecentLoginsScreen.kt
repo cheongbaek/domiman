@@ -12,6 +12,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -27,6 +28,11 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.domiman.data.DomimanRepository
 import com.example.domiman.data.SavedLoginJson
 
+/**
+ * 최근 로그인 목록. **자동 로그인을 체크하고 로그인했을 때만** 여기에 남는다
+ * (체크 없이 로그인한 자격은 로그아웃과 함께 사라진다). 한 행은 domichat ID와
+ * 그 아래 domiserver 주소이며, 비밀번호는 저장은 하되 화면에 보이지 않는다.
+ */
 @Composable
 fun RecentLoginsScreen(
   repository: DomimanRepository,
@@ -36,7 +42,9 @@ fun RecentLoginsScreen(
   modifier: Modifier = Modifier,
   viewModel: RecentLoginsScreenViewModel = viewModel { RecentLoginsScreenViewModel(repository) },
 ) {
-  val state by viewModel.uiStateCompat()
+  val state by viewModel.loginState.collectAsStateWithLifecycle()
+  val message by viewModel.message.collectAsStateWithLifecycle()
+  val busy by viewModel.busy.collectAsStateWithLifecycle()
 
   Column(modifier = modifier.fillMaxWidth()) {
     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -48,11 +56,25 @@ fun RecentLoginsScreen(
 
     HorizontalDivider()
 
+    if (busy) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+    message?.let {
+      Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(vertical = 8.dp))
+    }
+
+    if (state.recent.isEmpty()) {
+      Text(
+        "저장된 로그인이 없습니다. '자동 로그인'을 체크하고 로그인하면 여기에 남습니다.",
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(vertical = 16.dp),
+      )
+    }
+
     LazyColumn {
-      items(state.recent, key = { it.id + it.targetPc + it.channel }) { entry ->
+      items(state.recent, key = { it.ip + "|" + it.id }) { entry ->
         RecentLoginRow(
           entry = entry,
-          onTap = { viewModel.tapEntry(entry, onSuccess = onLoggedIn, onFailure = {}) },
+          onTap = { viewModel.tapEntry(entry, onSuccess = onLoggedIn) },
           onEdit = {
             viewModel.requestEdit(entry)
             onEditRequested()
@@ -64,10 +86,6 @@ fun RecentLoginsScreen(
     }
   }
 }
-
-// collectAsStateWithLifecycle을 State<LoginStoreJson>으로 그대로 노출(가독성용 헬퍼).
-@Composable
-private fun RecentLoginsScreenViewModel.uiStateCompat() = loginState.collectAsStateWithLifecycle()
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -88,7 +106,7 @@ private fun RecentLoginRow(
     Column(modifier = Modifier.fillMaxWidth()) {
       Text(entry.id, style = MaterialTheme.typography.bodyLarge)
       Text(
-        "${entry.targetPc}  ·  ${entry.channel}",
+        entry.ip,
         style = MaterialTheme.typography.bodyMedium,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
       )

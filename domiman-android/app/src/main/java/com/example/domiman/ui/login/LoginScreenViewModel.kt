@@ -10,19 +10,19 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 enum class LoginFormMode {
-  LOGIN, // Sheet1 A1:E18 기본 상태 — [로그인]/[…] 버튼, 자동로그인 체크박스 표시
-  EDIT, // Sheet1 G9 — [수정]/[취소] 버튼, 자동로그인 체크박스 숨김
+  LOGIN, // 기본 상태 — [로그인]/[…] 버튼, 자동로그인 체크박스 표시
+  EDIT, // 최근 로그인 '수정' — [수정]/[취소] 버튼, 자동로그인 체크박스 숨김
 }
 
 data class LoginUiState(
-  val id: String = "",
-  val targetPc: String = "",
-  val channel: String = "",
+  val ip: String = "", // domiserver IP (또는 IP:포트)
+  val id: String = "", // domichat ID
+  val pw: String = "", // domichat PW
   val autoLoginChecked: Boolean = false,
   val mode: LoginFormMode = LoginFormMode.LOGIN,
   val editingOriginal: SavedLoginJson? = null,
   val isSubmitting: Boolean = false,
-  val errorMessage: String? = null, // Sheet1 G5: 자동로그인/로그인 실패 안내
+  val errorMessage: String? = null,
 )
 
 class LoginScreenViewModel(private val repository: DomimanRepository) : ViewModel() {
@@ -38,9 +38,9 @@ class LoginScreenViewModel(private val repository: DomimanRepository) : ViewMode
         if (pending != null) {
           _uiState.value =
             LoginUiState(
+              ip = pending.ip,
               id = pending.id,
-              targetPc = pending.targetPc,
-              channel = pending.channel,
+              pw = pending.pw,
               mode = LoginFormMode.EDIT,
               editingOriginal = pending,
             )
@@ -50,16 +50,16 @@ class LoginScreenViewModel(private val repository: DomimanRepository) : ViewMode
     }
   }
 
+  fun onIpChange(v: String) {
+    _uiState.value = _uiState.value.copy(ip = v, errorMessage = null)
+  }
+
   fun onIdChange(v: String) {
     _uiState.value = _uiState.value.copy(id = v, errorMessage = null)
   }
 
-  fun onTargetPcChange(v: String) {
-    _uiState.value = _uiState.value.copy(targetPc = v, errorMessage = null)
-  }
-
-  fun onChannelChange(v: String) {
-    _uiState.value = _uiState.value.copy(channel = v, errorMessage = null)
+  fun onPwChange(v: String) {
+    _uiState.value = _uiState.value.copy(pw = v, errorMessage = null)
   }
 
   fun onAutoLoginToggle(v: Boolean) {
@@ -72,9 +72,10 @@ class LoginScreenViewModel(private val repository: DomimanRepository) : ViewMode
     repository.pendingAutoLoginArm = _uiState.value.autoLoginChecked
   }
 
-  private fun fieldsValid(s: LoginUiState) = s.id.isNotBlank() && s.targetPc.isNotBlank() && s.channel.isNotBlank()
+  private fun fieldsValid(s: LoginUiState) = s.ip.isNotBlank() && s.id.isNotBlank() && s.pw.isNotBlank()
 
-  /** '로그인' 버튼(Sheet1 B14). 실패하면 G5대로 폼을 비우고 재입력 안내. */
+  /** '로그인' 버튼. 실패하면 폼을 비우고 서버가 준 사유를 그대로 보여준다
+   * (없는 ID/비번 틀림 → '존재하지 않는 ID입니다.', 중복 접속 → '이미 접속 중' 등). */
   fun submitLogin(onSuccess: () -> Unit) {
     val s = _uiState.value
     if (!fieldsValid(s)) {
@@ -83,16 +84,22 @@ class LoginScreenViewModel(private val repository: DomimanRepository) : ViewMode
     }
     _uiState.value = s.copy(isSubmitting = true, errorMessage = null)
     viewModelScope.launch {
-      val status = repository.login(s.id, s.targetPc, s.channel, s.autoLoginChecked)
-      if (status != null) {
+      val result = repository.login(s.ip.trim(), s.id.trim(), s.pw, s.autoLoginChecked)
+      if (result.ok) {
+        _uiState.value = LoginUiState()
         onSuccess()
       } else {
-        _uiState.value = LoginUiState(errorMessage = "입력값을 초기화하고 다시 입력하세요.")
+        _uiState.value =
+          LoginUiState(
+            ip = s.ip, // 서버 주소는 남겨 둔다(대부분 맞는 값이고 다시 치기 번거롭다)
+            autoLoginChecked = s.autoLoginChecked,
+            errorMessage = result.msg ?: "로그인에 실패했습니다. 다시 입력하세요.",
+          )
       }
     }
   }
 
-  /** edit 모드 '수정' 버튼(Sheet1 G10) — 목록에 반영 후 최근 로그인 화면으로. */
+  /** edit 모드 '수정' 버튼 — 목록에 반영 후 최근 로그인 화면으로. */
   fun confirmEdit(onDone: () -> Unit) {
     val s = _uiState.value
     val original = s.editingOriginal ?: return
@@ -100,12 +107,12 @@ class LoginScreenViewModel(private val repository: DomimanRepository) : ViewMode
       _uiState.value = s.copy(errorMessage = "모두 입력해 주세요.")
       return
     }
-    repository.updateEntry(original, SavedLoginJson(s.id, s.targetPc, s.channel))
+    repository.updateEntry(original, SavedLoginJson(s.ip.trim(), s.id.trim(), s.pw))
     _uiState.value = LoginUiState()
     onDone()
   }
 
-  /** edit 모드 '취소' 버튼(Sheet1 G9). */
+  /** edit 모드 '취소' 버튼. */
   fun cancelEdit(onDone: () -> Unit) {
     _uiState.value = LoginUiState()
     onDone()

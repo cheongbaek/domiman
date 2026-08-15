@@ -2,82 +2,109 @@
 """
 domiman_m.py — DOMIMAN 모바일(안드로이드) 원격제어 앱 Kotlin 포팅 레퍼런스
 ====================================================================
-`앱UI설명.xlsx`(Sheet1=로그인 화면, Sheet2=메인 제어 화면, A-E열이 대략적
-레이아웃/G열이 상세 설명)를 기준으로 전면 재설계됨. domiman.py에서
-데스크톱 전용 코드(tkinter GUI, pyautogui/win32 클릭, WGC 캡처, OCR, 낚시
-자동화 루틴)를 전부 제외하고, ① ntfy 통신 프로토콜 ② 로그인/최근 로그인
-저장·자동로그인 규칙 ③ 화면 상태·전환 로직만 다룬다. "제어(dB) 역할"만
-맡는다 — 자기 앞으로 온 '명령'을 받아 실행하는 '피제어(d3)' 쪽 로직
-(domiman.py의 _handle_command)은 필요 없다.
+`앱UI설명.xlsx`(Sheet1=로그인 화면, Sheet2=메인 제어 화면)를 기준으로 만든
+모바일 전용 모듈. domiman.py에서 데스크톱 전용 코드(tkinter GUI, pyautogui/
+win32 클릭, WGC 캡처, OCR, 낚시 자동화 루틴)를 전부 제외하고, ① domichat
+통신 프로토콜 ② 로그인/최근 로그인 저장·자동로그인 규칙 ③ 화면 상태 규칙만
+다룬다. **"제어(dB) 역할"만** 맡는다 — 자기 앞으로 온 '명령'을 받아 실행하는
+'피제어(d3)' 쪽 로직(domiman.py의 _handle_command)은 필요 없다.
 
-실제 위젯 렌더링, 화면 전환 애니메이션, 안드로이드 뒤로가기 버튼 인터셉트,
-Toast, 알림, 다크모드 감지, 실제 영속 저장소(SharedPreferences/DataStore
-등)는 전부 Kotlin 쪽 책임이다 — 이 모듈은 "무엇을 언제 어떻게 바꿔야
-하는가"라는 규칙만 담은 참고 구현이며, Android 포팅 시 Chaquopy로 앱에
-내장해 Kotlin에서 호출하는 것을 염두에 두고 플랫폼 의존성 없이
-requests/json/re/time/threading/queue/dataclasses/enum/collections만 쓴다.
+■ 전송 계층: ntfy → domichat (260815a에서 PC판이 갈아탄 것을 모바일로 이식)
+  메시지 규격은 **글자 하나 다르지 않다**:
+      명령:  "(대상PC),(명령)[,인자...]"   예) seoul,S / seoul,T,30
+      응답:  "(요청자ID),Z,..."            예) mypho,Z,0,1080,a,f,t,t
+      보고:  ",Z,F,(코드)[,(서브)]"        예) ,Z,F,y,b (미끼 교체 성공)
+  바뀐 것은 전송 계층뿐이다:
+    - 방 이름 = domi_fishing_{피제어 PC의 domichat 로그인 ID}
+    - 방 유형 = 비밀번호 방, 고정 비번 `domi_fishing_9714`
+      (일반 domichat 사용자의 오진입만 막는 용도. 방장이 없어도 입장 가능해
+       승인 왕복이 없다)
+    - 방장 = 피제어 PC. **휴대폰은 방을 만들지 않는다**(제어 전용). 대상 PC가
+      한 번도 접속한 적이 없으면 방이 없어 error(room_missing)가 온다.
+    - 발신자 식별은 domichat 로그인 ID이며 서버가 `from`에 찍어주므로 위조 불가.
+      ntfy 시절 Title 자리를 그대로 대신한다.
+  규격의 단일 기준 문서는 `domichat.md`. 클라이언트 계층은 domichat.py/
+  domiman.py에서 **복제**했다(공용 모듈을 만들면 "자기 파일 하나만 교체"라는
+  각 앱의 업데이트 규약이 깨진다).
 
-■ 화면 구성 (앱UI설명.xlsx 기준)
-  Sheet1 A1:E18  로그인 화면  — ID/피제어PC/ntfy채널명 입력 + 자동로그인
-                                체크 + [로그인]/[…] 버튼. 뒤로가기=앱 종료.
-  Sheet1 A21:E39 최근 로그인  — […] 버튼으로 진입. 짧게 탭=즉시 로그인,
-                                길게 눌러 수정/삭제. '<'=로그인 화면으로.
-  Sheet2 A1:E19  메인 제어    — PC GUI와 거의 동일(해상도/타이머/체크박스/
-                                시작-중지/상태문구/예약종료/즉시회수/
-                                실시간수량확인/다크모드/로그). 이 부분의
-                                버튼들은 기존 DomimanClient.cmd_* 를 그대로
-                                호출하면 되므로 이 파일에서 별도로 감싸지
-                                않는다(중복 방지).
+■ 화면 구성 (앱UI설명.xlsx 기준 + domichat 이식으로 바뀐 부분)
+  로그인 화면   — domiserver IP / domichat ID / domichat PW 입력 +
+                  자동로그인 체크 + [로그인]/[…] 버튼.
+  최근 로그인   — […] 버튼으로 진입. 짧게 탭=즉시 로그인, 길게 눌러 수정/삭제.
+                  **자동 로그인을 체크하고 로그인했을 때만 목록에 남는다.**
+  메인 제어     — 최상단에 '제어 PC 선택하기' 박스(기본 미선택). 고르면 그
+                  PC의 방(domi_fishing_{PC})에 입장·구독하고 S 질의로 상태를
+                  받아온다. 그 아래는 PC GUI와 동일(해상도/타이머/체크박스/
+                  시작-중지/상태문구/예약종료/즉시회수/실시간수량확인/로그).
 
-■ '업데이트' 버튼 관련 결정: Android는 PC(os.replace 무음 교체)처럼 완전
-  자동 업데이트가 불가능하고 새 APK 설치 시 OS 확인 탭이 항상 필요하다.
-  사용자 확정: 이 구조는 채택하지 않음 — Sheet2 G13 자리는 항상
-  '실시간 수량확인' 버튼이며, G18의 풀투리프레시 제스처도 구현하지 않는다.
-  (수량 확인은 DomimanClient.cmd_tank_query()를 그 버튼에 연결하면 끝.)
+■ Kotlin(Chaquopy) 경계 규칙: PyObject dict 변환을 Kotlin에서 다루지 않도록
+  **오가는 값은 전부 JSON 문자열**이다(`*_json` 함수들). 새 반환값이 생기면
+  PyObject API를 파헤치지 말고 이 패턴을 따를 것.
 
-■ 수신 방식(중요): stream()이 권장 방식이다. poll()의 반복 GET은 무료 ntfy
-  한도(GET/POST가 같은 IP 버킷을 공유, 5~10초당 1개 충전)를 빠르게 소모해,
-  같은 Wi-Fi(같은 공인 IP)를 쓰는 PC/휴대폰의 발신이 429로 실패한다. stream()은
-  연결 하나를 열어두고 도착 메시지를 실시간으로 받아 요청 토큰을 '연결당 1회'만
-  쓴다(수신 지연도 사실상 0). poll()은 스트리밍이 어려운 환경의 폴백으로만 남긴다.
-  Kotlin에서는 OkHttp 스트리밍 응답(response.body().source() 줄 읽기) 또는 /sse
-  엔드포인트 + EventSource로 stream()과 동일하게 구현하고, dispatch()/parse_status()
-  /report_text()는 그대로 재사용한다.
+■ 스레드: DomimanSession이 자체 스레드(세션·송신·펌프)를 돌리고, Kotlin은
+  `poll_event_json(timeout)`으로 이벤트를 하나씩 꺼내간다. 콜백을 파이썬으로
+  넘기지 않는 이유는 로그아웃/종료 때 Kotlin 람다가 죽은 스코프를 붙잡아
+  블로킹되는 사고를 막기 위해서다(응답없음/ANR 대응).
 
-단독 실행하면 로그인 시도(자동로그인 실패 시 재시도) + 최근 로그인 저장까지
-포함한 스모크 테스트가 된다:
-    python domiman_m.py <내 ID> <대상PC 이름> <ntfy 채널 이름>
+단독 실행하면 로그인 → PC 선택 → 상태 질의까지의 스모크 테스트가 된다:
+    python domiman_m.py <서버IP> <domichat ID> <PW> [제어할 PC 이름]
 """
+import hashlib
 import json
-import re
 import queue
+import re
+import socket
+import ssl
+import struct
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 
-import requests
+# ---------- domichat 규격 상수 (domichat.md가 기준) ----------
+CHAT_PORT = 47821                       # domiserver 기본 포트
+ROOM_PREFIX = "domi_fishing_"
+ROOM_PW = "domi_fishing_9714"           # 고정(오진입 방지용)
+FRAME_HEAD = struct.Struct(">IB")       # [길이 4][종류 1]
+MAX_FRAME = 1024 * 1024
+CONNECT_TIMEOUT = 6.0
+READ_TIMEOUT = 60.0                     # 서버 ping 15초 → 60초 침묵이면 죽은 연결
+RECONNECT_BACKOFF = (1, 2, 5, 10, 30)
 
-NTFY_SERVER = "https://ntfy.sh"
 PENDING_TIMEOUT_SEC = 15.0   # domiman.py _check_pending_timeout과 동일
+LOGIN_TIMEOUT_SEC = 20.0     # 접속+로그인 왕복 대기 상한
+TARGET_TIMEOUT_SEC = 20.0    # 방 입장 + S 응답 대기 상한
 
-NAME_RE = re.compile(r"[A-Za-z0-9]+")
-CHANNEL_RE = re.compile(r"[A-Za-z0-9_\-]+")
+# domichat 계정 ID 규칙(domiserver.ID_RE와 동일). 제어할 PC 이름도 그 PC의
+# domichat 로그인 ID이므로 같은 규칙을 쓴다.
+ID_RE = re.compile(r"[A-Za-z0-9_\-]{1,20}")
 
 
 def is_valid_id(name):
-    """대상 PC ID 형식 검사 (domiman.py의 PC_NAME 규칙과 동일: 영문+숫자)."""
-    return bool(NAME_RE.fullmatch(name or ""))
+    """domichat ID / 제어 대상 PC 이름 형식 검사."""
+    return bool(ID_RE.fullmatch(name or ""))
 
 
-def is_valid_channel(channel):
-    """ntfy 채널 이름 형식 검사 (domiman.py의 NTFY_TOPIC 규칙과 동일)."""
-    return bool(CHANNEL_RE.fullmatch(channel or ""))
+def room_of(uid):
+    """피제어 PC 하나당 방 하나 — 이름 규칙이 고정이라 계산으로 찾는다."""
+    return f"{ROOM_PREFIX}{uid}"
+
+
+def split_server(text):
+    """'IP' 또는 'IP:포트' → (host, port). 포트가 없거나 이상하면 기본 포트."""
+    s = (text or "").strip()
+    if ":" in s:
+        host, _, port = s.rpartition(":")
+        try:
+            return host.strip(), int(port)
+        except ValueError:
+            return s, CHAT_PORT
+    return s, CHAT_PORT
 
 
 # 상태 문구 (domiman.py STATUS_TEXT 그대로 포팅 — 엑셀 J8:K18 원본).
-# Sheet2 A11 '[상태 메시지]' 자리에 띄울 텍스트.
+# 메인 화면 '[상태 메시지]' 자리에 띄울 텍스트.
 STATUS_TEXT = {
     "loading":    "강태공이 낚시터에 들어오고 있습니다.",
     "idle":       "강태공이 낚시를 준비합니다.",
@@ -116,7 +143,6 @@ REPORT_STATUS = {
 
 # 알림 설정 체크박스 <-> 보고 코드 매핑 (안드로이드 전용). 키 순서 = 앱 알림
 # 설정 화면의 체크박스 순서(마스터 '알림 켜기'는 코드가 없어 여기 없음).
-# report_code_for(key)로 ',Z,F,<code>'의 코드 문자열을 얻는다.
 NOTIFY_KEYS = {
     "routine_start": ("s",),       # 살림망 회수 시작
     "routine_success": ("g",),     # 살림망 회수 성공
@@ -143,46 +169,359 @@ def notify_key_for_report(rest):
 
 
 # ============================================================
-# [1. 프로토콜: ntfy 통신 (domiman.py 규격 그대로)]
+# [1. 전송 계층: domichat 소켓 · TLS (domichat.md 규격)]
 # ============================================================
-class DomimanClient:
-    """ntfy 채널 하나 + 대상 PC 하나에 대한 '이름 있는(my_id) 컨트롤러' 세션.
-    스레드 안전성은 호출부(Kotlin Foreground Service)가 책임진다 — 이 클래스는
-    자체 잠금을 걸지 않으며, 한 백그라운드 스레드에서 순차 호출되는 것을 가정한다."""
+class CertChanged(Exception):
+    """고정해둔 서버 인증서 지문이 바뀌었다 — 서버 재설치가 아니라면 중간자."""
 
-    def __init__(self, my_id, target_id, channel, server=NTFY_SERVER):
-        if not is_valid_id(my_id):
-            raise ValueError(f"잘못된 ID: {my_id!r} (영문+숫자만 가능)")
-        if not is_valid_id(target_id):
-            raise ValueError(f"잘못된 대상 PC 이름: {target_id!r} (영문+숫자만 가능)")
-        if not is_valid_channel(channel):
-            raise ValueError(f"잘못된 채널 이름: {channel!r}")
-        self.my_id = my_id
-        self.target_id = target_id
-        self.channel = channel
-        self.server = server
-        self.url = f"{server}/{channel}"
-        self._last_poll_time = 0
-        self.pending = None   # {"kind": str, "sent": epoch}
-        self._stream_resp = None   # 현재 열린 스트리밍 응답(stream_disconnect용)
+    def __init__(self, host, old, new):
+        super().__init__(f"{host}: {old[:16]}… → {new[:16]}…")
+        self.host, self.old, self.new = host, old, new
+
+
+def _tls_context():
+    """자체 서명 인증서를 쓰므로 체인·호스트명 검증은 끄고 **지문 고정(TOFU)**으로
+    신뢰한다. **TLS 1.2로 고정**한다 — 수신·송신 스레드가 한 소켓을 나눠 쓰는
+    구조라 1.3의 핸드셰이크 후 메시지(NewSessionTicket/KeyUpdate) 때문에 record
+    layer가 깨진다(domichat.md '§1 TLS' 참고)."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    no_reneg = getattr(ssl, "OP_NO_RENEGOTIATION", 0)
+    if no_reneg:
+        ctx.options |= no_reneg
+    return ctx
+
+
+def connect_secure(ip, port, pinned, timeout=CONNECT_TIMEOUT):
+    """(소켓, 지문|None). 서버가 TLS를 안 쓰면 평문으로 다시 붙는다(하위 호환).
+    PC판의 '자기 IP면 127.0.0.1로 폴백'은 휴대폰에선 의미가 없어(자기 자신에게
+    붙어버린다) 두지 않는다."""
+    raw = socket.create_connection((ip, port), timeout)
+    try:
+        sock = _tls_context().wrap_socket(raw)
+        fp = hashlib.sha256(sock.getpeercert(binary_form=True)).hexdigest()
+    except (ssl.SSLError, OSError):
+        try:
+            raw.close()
+        except Exception:
+            pass
+        return socket.create_connection((ip, port), timeout), None
+    if pinned and pinned != fp:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        raise CertChanged(f"{ip}:{port}", pinned, fp)
+    return sock, fp
+
+
+class ChatClient:
+    """domiserver 세션 하나(접속 유지 + 자동 재연결).
+    수신 프레임과 내부 사건을 전부 self.q로 넘긴다 — 상위(DomimanSession)가
+    한 스레드에서 순서대로 꺼내 처리한다."""
+
+    def __init__(self):
+        self.q = queue.Queue()
+        self.txq = queue.Queue()
+        self.sock = None
+        self.ip = self.uid = self.pw = None
+        self.port = CHAT_PORT
+        self.pinned = None
+        self.want = False
+        self.first_try = True
+        self.logged_in = threading.Event()
+        self._send_lock = threading.Lock()
+        # 재연결 대기를 time.sleep 대신 Event로 — 로그아웃이 최대 30초 잠든
+        # 스레드를 기다리지 않고 즉시 깨울 수 있어야 한다(응답없음 대응).
+        self._wake = threading.Event()
+
+    # ---------- 저수준 ----------
+    def _raw_send(self, sock, obj):
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        with self._send_lock:
+            sock.sendall(FRAME_HEAD.pack(len(data), ord("T")) + data)
+
+    @staticmethod
+    def _recv_exact(sock, n):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        return bytes(buf)
+
+    def _recv_obj(self, sock):
+        head = self._recv_exact(sock, FRAME_HEAD.size)
+        if head is None:
+            return None
+        ln, typ = FRAME_HEAD.unpack(head)
+        if ln > MAX_FRAME:
+            raise OSError("프레임 과대")
+        body = self._recv_exact(sock, ln) if ln else b""
+        if body is None:
+            return None
+        if chr(typ) != "T":
+            return {}                      # 이미지 등 — 원격 제어는 쓰지 않는다
+        return json.loads(body.decode("utf-8"))
+
+    # ---------- 세션 ----------
+    def start(self, ip, port, uid, pw, pinned=None):
+        self.ip, self.port, self.uid, self.pw = ip, port, uid, pw
+        self.pinned = pinned
+        self.want = True
+        self.first_try = True
+        self._wake.clear()
+        threading.Thread(target=self._session_loop, daemon=True,
+                         name="domichat-session").start()
+
+    def _sleep(self, secs):
+        """재연결 백오프 — logout()이 _wake를 세우면 즉시 깬다."""
+        self._wake.wait(secs)
+
+    def _session_loop(self):
+        idx = 0
+        while self.want:
+            try:
+                sock, fp = connect_secure(self.ip, self.port, self.pinned)
+                if fp and not self.pinned:
+                    self.pinned = fp
+                    self.q.put({"_ev": "cert_pinned", "fp": fp})
+            except CertChanged as e:
+                self.want = False
+                self.q.put({"_ev": "cert_changed", "old": e.old, "new": e.new})
+                return
+            except OSError as e:
+                if self.first_try:
+                    self.want = False
+                    self.q.put({"_ev": "connect_fail", "msg": str(e)})
+                    return
+                self.q.put({"_ev": "disconnected", "msg": str(e)})
+                self._sleep(RECONNECT_BACKOFF[min(idx, len(RECONNECT_BACKOFF) - 1)])
+                idx += 1
+                continue
+
+            # 접속 타임아웃이 소켓에 남으면 조용할 때마다 끊긴다(domichat.md의
+            # '최대 함정') → 읽기 타임아웃으로 교체하고 OS keepalive도 켠다.
+            sock.settimeout(READ_TIMEOUT)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except OSError:
+                pass
+            self.sock = sock
+            threading.Thread(target=self._tx_loop, args=(sock,), daemon=True,
+                             name="domichat-tx").start()
+            logged = False
+            try:
+                self._raw_send(sock, {"t": "login", "id": self.uid, "pw": self.pw})
+                while self.want:
+                    d = self._recv_obj(sock)
+                    if d is None:
+                        break
+                    t = d.get("t")
+                    if t == "ping":
+                        self._raw_send(sock, {"t": "pong"})
+                        continue
+                    if t == "welcome":
+                        self.logged_in.set()
+                        logged = True
+                    self.q.put(d)
+            except Exception:
+                pass
+            finally:
+                self.logged_in.clear()
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                self.sock = None
+
+            if not self.want:
+                break
+            self.first_try = False
+            if logged:
+                idx = 0            # 한 번이라도 붙었으면 백오프를 되돌린다
+            self.q.put({"_ev": "disconnected", "msg": "연결이 끊겼습니다"})
+            self._sleep(RECONNECT_BACKOFF[min(idx, len(RECONNECT_BACKOFF) - 1)])
+            idx += 1
+
+    def _tx_loop(self, sock):
+        while self.want and self.sock is sock:
+            if not self.logged_in.wait(0.2):
+                continue
+            try:
+                obj = self.txq.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                self._raw_send(sock, obj)
+            except Exception:
+                self.txq.put(obj)          # 재연결 후 다시 보낸다
+                return
+
+    def send(self, obj, wait=False):
+        """wait=True면 지금 소켓으로 바로 보낸다(순서가 중요한 것). 기본은 송신
+        큐 경유 — 연결이 끊긴 동안 쌓였다가 복구되면 순서대로 나간다."""
+        if wait:
+            sock = self.sock
+            if sock is None or not self.logged_in.is_set():
+                return False
+            try:
+                self._raw_send(sock, obj)
+                return True
+            except Exception:
+                return False
+        self.txq.put(obj)
+        return True
+
+    def logout(self):
+        """**절대 블로킹하지 않는다**(호출부가 UI 스레드일 수 있다). 예의상
+        logout 프레임을 짧은 타임아웃으로 한 번 시도하고, 잠금을 못 잡으면
+        건너뛰고 소켓을 shutdown+close 해 수신 스레드를 즉시 깨운다."""
+        self.want = False
+        self.logged_in.clear()
+        self._wake.set()                   # 백오프 대기 중인 세션 스레드를 깨움
+        sock, self.sock = self.sock, None
+        if sock is not None:
+            if self._send_lock.acquire(timeout=0.5):
+                try:
+                    sock.settimeout(1.0)
+                    data = json.dumps({"t": "logout"}).encode("utf-8")
+                    sock.sendall(FRAME_HEAD.pack(len(data), ord("T")) + data)
+                except Exception:
+                    pass
+                finally:
+                    self._send_lock.release()
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+        with self.txq.mutex:
+            self.txq.queue.clear()
+
+
+# ============================================================
+# [2. 프로토콜: 제어(dB) 세션 — 방 입장·구독·명령·수신 분배]
+# ============================================================
+class DomimanSession:
+    """domichat 로그인 하나 + '지금 제어 중인 PC' 하나를 들고 있는 세션.
+
+    Kotlin(포그라운드 서비스)이 쓰는 방식:
+        s = DomimanSession()
+        s.start(ip, uid, pw, pinned)        # 비동기 접속 시작
+        s.wait_login_json(20)               # {"ok":true,...} / {"ok":false,...}
+        s.select_target("seoul")            # 제어할 PC 선택(방 입장+구독+S 질의)
+        s.wait_target_json(20)              # {"ok":true,"status":{...}}
+        while ...: s.poll_event_json(0.5)   # 이벤트 하나씩(없으면 "null")
+        s.cmd_start() / s.cmd_stop() / ...
+        s.stop()                            # 로그아웃(즉시 반환)
+    """
+
+    def __init__(self):
+        self.chat = ChatClient()
+        self.q = queue.Queue()      # Kotlin이 가져갈 앱 이벤트 큐
+        self.my_id = ""             # domichat 로그인 ID(= 응답이 돌아올 이름)
+        self.target = ""            # 제어 중인 PC 이름(= 그 PC의 domichat ID)
+        self.pending = None         # {"kind": str, "sent": epoch}
+        self.server = ""            # "ip:port"(지문 저장 키)
+        self.joined_target = ""     # 실제로 입장까지 끝난 대상
+        self._stop = threading.Event()
+        self._pump = None
+        self._login_ev = threading.Event()
+        self._login_res = None
+        self._target_ev = threading.Event()
+        self._target_res = None
+
+    # ---------- 수명 ----------
+    def start(self, ip, uid, pw, pinned=None):
+        """접속 시작(비동기). ip는 'IP' 또는 'IP:포트'."""
+        host, port = split_server(ip)
+        self.server = f"{host}:{port}"
+        self.my_id = uid
+        self._login_ev.clear()
+        self._login_res = None
+        self._stop.clear()
+        self._pump = threading.Thread(target=self._pump_loop, daemon=True,
+                                      name="domiman-pump")
+        self._pump.start()
+        self.chat.start(host, port, uid, pw, pinned or None)
+
+    def stop(self):
+        """로그아웃 — 즉시 반환한다(스레드 join 없음). 남은 이벤트는 버린다."""
+        self._stop.set()
+        self.target = ""
+        self.joined_target = ""
+        self.pending = None
+        try:
+            self.chat.logout()
+        except Exception:
+            pass
+        self._finish_login(False, "로그아웃")
+        self._finish_target(False, "logout")
+
+    def is_connected(self):
+        return bool(self.chat.logged_in.is_set())
+
+    # ---------- 대상 PC 선택 ----------
+    def select_target(self, pc):
+        """제어할 PC를 고른다 — 이전 방에서 나오고 새 방에 입장·구독한다.
+        입장 결과는 wait_target_json()으로 받는다. pc가 빈 값이면 해제만."""
+        old = self.target
+        if old and old != pc:
+            self.chat.send({"t": "sub", "room": room_of(old), "on": False})
+            self.chat.send({"t": "leave", "room": room_of(old)})
+        self.target = pc or ""
+        self.joined_target = ""
+        self.pending = None
+        self._target_res = None
+        self._target_ev.clear()
+        if not self.target:
+            return
+        self.chat.send({"t": "join", "room": room_of(self.target), "pw": ROOM_PW})
+
+    def clear_target(self):
+        self.select_target("")
+
+    def resync(self):
+        """포그라운드 복귀(ON_RESUME)·서비스 재시작 때 호출. 방에 아직 못 들어가
+        있으면(대상 PC가 꺼져 있어 거절당했거나 재접속 직후) 다시 입장을 시도하고,
+        이미 들어가 있으면 S 질의로 상태만 맞춘다. 이 한 번의 재시도가 '대상 PC를
+        나중에 켰을 때' 앱을 다시 붙여주는 유일한 경로다."""
+        if not self.target:
+            return
+        if self.joined_target == self.target:
+            self.cmd_login()
+            return
+        self._target_res = None
+        self._target_ev.clear()
+        self.chat.send({"t": "join", "room": room_of(self.target), "pw": ROOM_PW})
 
     # ---------- 발신 ----------
-    def _send(self, body, timeout=10):
-        """domiman.py의 PC_NAME과 동일하게 내 이름(my_id)을 Title에 실어 보낸다."""
-        requests.post(self.url, data=body.encode("utf-8"),
-                      headers={"Title": self.my_id, "Priority": "3"}, timeout=timeout)
+    def _send_body(self, body):
+        if not self.target:
+            return False
+        return self.chat.send({"t": "msg", "room": room_of(self.target), "body": body})
 
     def send_command(self, cmdbody, kind):
-        """`{target},{cmdbody}` 발신 + pending 진입. kind는 응답 대응용 태그."""
-        self._send(f"{self.target_id},{cmdbody}")
-        self.pending = {"kind": kind, "sent": time.time()}
+        """`{대상},{명령}` 발신 + pending 진입. kind는 응답 대응용 태그."""
+        ok = self._send_body(f"{self.target},{cmdbody}")
+        if ok:
+            self.pending = {"kind": kind, "sent": time.time()}
+        return ok
 
     def resolve_pending(self):
         p, self.pending = self.pending, None
         return p
 
     def check_pending_timeout(self):
-        """15초 무응답이면 pending을 비우고 반환(호출부가 '실패/응답없음' 처리)."""
+        """15초 무응답이면 pending을 비우고 반환(호출부가 '응답없음' 처리)."""
         if self.pending is None:
             return None
         if time.time() - self.pending["sent"] <= PENDING_TIMEOUT_SEC:
@@ -191,7 +530,7 @@ class DomimanClient:
 
     # ---------- 명령 빌더 (domiman.py 프로토콜 규격 그대로) ----------
     def cmd_login(self):
-        """로그인 = 상태 질의(S). 15초 안에 응답 오면 성공(Sheet1 G6)."""
+        """상태 질의(S). 대상 PC 선택 직후와 포그라운드 복귀 시 상태 동기화용."""
         self.send_command("S", "connect")
 
     def cmd_start(self):
@@ -215,7 +554,7 @@ class DomimanClient:
         self.send_command("Q", "Q")
 
     def cmd_set_resolution(self, mode):
-        """mode: 'a'(자동감지) | '1080' | '1440'. Sheet2 E2/G2."""
+        """mode: 'a'(자동감지) | '1080' | '1440'."""
         self.send_command(f"V,{mode}", "V")
 
     def cmd_set_timer(self, minutes):
@@ -230,111 +569,145 @@ class DomimanClient:
         self.send_command("C," + ",".join(parts), "C")
 
     def cmd_tank_query(self):
-        """Sheet2 G13 '실시간 수량확인' 버튼(N). 응답: ',Z,N,<cur>,<mx>' 또는
-        ',Z,N,fail'. 피제어 PC는 마지막 파싱값이 있으면 즉시, 없으면 창을
-        띄우고 3초 뒤 1회 파싱해 응답하므로 최대 5초 안팎 걸릴 수 있다
-        (15초 타임아웃 내)."""
+        """'실시간 수량확인'(N). 응답: ',Z,N,<cur>,<mx>' 또는 ',Z,N,fail'.
+        피제어 PC는 마지막 파싱값이 있으면 즉시, 없으면 창을 띄우고 3초 뒤 1회
+        파싱해 응답하므로 최대 5초 안팎 걸릴 수 있다(15초 타임아웃 내)."""
         self.send_command("N", "N")
 
-    # ---------- 수신: 스트리밍(권장) ----------
-    def stream(self, on_message, should_stop, connect_timeout=10, read_timeout=90):
-        """지속 연결(스트리밍) 구독 — poll()의 반복 GET을 대체하는 권장 방식.
-        `{url}/json` 연결 하나를 열어두고 도착하는 메시지마다
-        on_message(title, body)를 호출한다. 요청 토큰을 '연결당 1회'만
-        소비하므로 같은 IP를 공유하는 PC/휴대폰이 무료 한도에 밀리지 않는다.
+    # ---------- 수신 펌프 ----------
+    def _emit(self, obj):
+        self.q.put(obj)
 
-        should_stop(): True면 연결을 끊고 반환(메시지 도착 사이사이 확인).
-        네트워크 오류/연결 종료 시 조용히 반환하므로, 호출부가 should_stop을
-        보며 재호출(재연결)한다. since는 쓰지 않는다 — 살아있는 연결은 메시지를
-        정확히 한 번만 전달하므로 재연결 시 과거 명령을 중복 수신할 위험이 없다.
-        (내가 보낸 것/대상 외 발신자 필터는 dispatch()가 담당하므로 여기선
-        원문 그대로 넘긴다 — poll()과 동일.)
+    def _finish_login(self, ok, msg=None, code=None):
+        if self._login_ev.is_set():
+            return
+        self._login_res = {"ok": ok, "id": self.my_id, "msg": msg, "code": code,
+                           "fp": self.chat.pinned, "server": self.server}
+        self._login_ev.set()
 
-        ※ read_timeout: 정상 연결은 ntfy keepalive(기본 45s)가 계속 도착해
-          유지된다. iter_lines는 블로킹이라 should_stop()은 다음 줄(메시지/
-          keepalive)이 와야 확인된다 → 프롬프트한 중단은 다른 스레드에서
-          stream_disconnect()로 연결을 강제 close해야 한다(domiman.py의
-          ntfy_stream_disconnect와 동일 패턴). Kotlin(Chaquopy)에서 백그라운드
-          진입/로그아웃 시 이걸 호출하면 블로킹 읽기가 즉시 풀려 스레드가
-          살아남지 않는다."""
-        resp = requests.get(f"{self.url}/json", stream=True,
-                            timeout=(connect_timeout, read_timeout))
-        self._stream_resp = resp
-        try:
-            if resp.status_code != 200:
-                return
-            for line in resp.iter_lines(decode_unicode=True):
-                if should_stop():
-                    break
-                if not line:
-                    continue                         # keepalive 사이 빈 줄
-                try:
-                    data = json.loads(line)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                if data.get("event") != "message":
-                    continue                         # open/keepalive 무시
-                on_message(data.get("title", ""), data.get("message", "").strip())
-        finally:
-            self._stream_resp = None
+    def _finish_target(self, ok, reason=None, status=None):
+        if self._target_ev.is_set():
+            return
+        self._target_res = {"ok": ok, "pc": self.target, "reason": reason,
+                            "status": status}
+        self._target_ev.set()
+
+    def _pump_loop(self):
+        """ChatClient가 넘긴 프레임/사건을 앱 이벤트로 번역한다(단일 스레드)."""
+        while not self._stop.is_set():
             try:
-                resp.close()
-            except Exception:
-                pass
-
-    def stream_disconnect(self):
-        """열린 스트리밍 연결을 다른 스레드에서 강제 종료 — 블로킹 iter_lines를
-        즉시 깨운다(domiman.py ntfy_stream_disconnect와 동일). 연결이 없으면
-        무동작. 재연결은 호출부(should_stop 루프)가 알아서 하거나 안 한다."""
-        r = self._stream_resp
-        if r is not None:
-            try:
-                r.close()
-            except Exception:
-                pass
-
-    # ---------- 수신: 반복 폴링(폴백) ----------
-    def poll(self, timeout=3):
-        """[폴백] ntfy 토픽의 새 메시지 전부를 시간순으로 반환: [(title, body), ...].
-        무료 한도를 빠르게 소모하므로 stream()을 쓸 수 없을 때만 사용한다.
-        내가 보낸 메시지도 Title=my_id로 그대로 돌아오지만, dispatch()가
-        title==target_id인 것만 받아들이므로(내 my_id로 온 것은 걸러짐)
-        따로 '내가 보낸 것 제외' 필터가 필요 없다."""
-        since = str(self._last_poll_time) if self._last_poll_time > 0 else "10s"
-        resp = requests.get(f"{self.url}/json?poll=1&since={since}", timeout=timeout)
-        if resp.status_code != 200:
-            return []
-        events = []
-        latest = self._last_poll_time
-        for line in resp.text.strip().split("\n"):
-            if not line:
+                d = self.chat.q.get(timeout=0.2)
+            except queue.Empty:
                 continue
             try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if data.get("event") != "message":
-                continue
-            t = data.get("time", 0)
-            if t > latest:
-                latest = t
-            if t > self._last_poll_time:
-                events.append((t, data.get("title", ""), data.get("message", "").strip()))
-        if latest > self._last_poll_time:
-            self._last_poll_time = latest
-        events.sort(key=lambda e: e[0])
-        return [(title, msg) for _, title, msg in events]
+                self._handle(d)
+            except Exception as e:      # 한 프레임의 오류로 펌프가 죽지 않게
+                self._emit({"ev": "error", "msg": f"수신 처리 실패: {e}"})
 
-    # ---------- 수신 분배 (domiman.py _dispatch_ntfy의 'dB 원격 모드' 분기만 포팅) ----------
-    def dispatch(self, title, body):
-        """메시지 하나를 분류해 반환. domiman.py _dispatch_ntfy의 dB 분기와
-        완전히 동일한 두 갈래(응답은 내 my_id로 echo, 보고는 항상 무명 broadcast):
+    def _handle(self, d):
+        ev = d.get("_ev")
+        if ev == "connect_fail":
+            self._finish_login(False, f"서버에 접속할 수 없습니다. ({d.get('msg')})",
+                               "connect_fail")
+            return self._emit({"ev": "login_fail", "msg": self._login_res["msg"]})
+        if ev == "cert_changed":
+            msg = ("서버 인증서가 바뀌었습니다. 서버를 재설치한 것이 아니라면 "
+                   "누군가 가로채는 중일 수 있습니다.")
+            self._finish_login(False, msg, "cert_changed")
+            return self._emit({"ev": "cert_changed", "msg": msg,
+                               "old": d.get("old"), "new": d.get("new")})
+        if ev == "cert_pinned":
+            return self._emit({"ev": "cert_pinned", "fp": d.get("fp"),
+                               "server": self.server})
+        if ev == "disconnected":
+            self.joined_target = ""
+            return self._emit({"ev": "disconnected", "msg": d.get("msg")})
+        if ev:
+            return
+
+        t = d.get("t")
+        if t == "welcome":
+            return self._on_welcome(d)
+        if t == "msg":
+            frm = d.get("from")
+            if frm == self.my_id:
+                return                 # 서버는 발신자에게도 돌려준다 — 내 것은 무시
+            return self._on_msg(frm, (d.get("body") or "").strip())
+        if t == "joined":
+            room = d.get("room")
+            if self.target and room == room_of(self.target):
+                self.joined_target = self.target
+                self.chat.send({"t": "sub", "room": room, "on": True})
+                self._emit({"ev": "target_joined", "pc": self.target})
+                self.cmd_login()       # 예전처럼 S 질의로 상태를 맞춘다
+            return
+        if t == "denied":
+            room, reason = d.get("room"), d.get("reason")
+            if self.target and room == room_of(self.target):
+                self._finish_target(False, reason)
+                self._emit({"ev": "target_denied", "pc": self.target,
+                            "reason": reason, "msg": d.get("msg")})
+            return
+        if t == "member":
+            # 방장(피제어 PC)이 방에서 빠지면 제어를 끝낸다
+            if (self.target and not d.get("in") and d.get("id") == self.target
+                    and d.get("room") == room_of(self.target)):
+                self.joined_target = ""
+                self._finish_target(False, "owner_gone")
+                self._emit({"ev": "target_gone", "pc": self.target})
+            return
+        if t == "room_deleted":
+            if self.target and d.get("room") == room_of(self.target):
+                self.joined_target = ""
+                self._finish_target(False, "room_deleted")
+                self._emit({"ev": "target_gone", "pc": self.target})
+            return
+        if t == "error":
+            return self._on_error(d)
+
+    def _on_welcome(self, d):
+        self.my_id = d.get("id") or self.my_id
+        first = not self._login_ev.is_set()
+        self._finish_login(True)
+        self._emit({"ev": "login_ok" if first else "reconnected", "id": self.my_id,
+                    "server": self.server})
+        # 재접속이면 제어하던 방에 다시 들어간다(구독은 서버가 기억하지 않는다).
+        if self.target:
+            self.chat.send({"t": "join", "room": room_of(self.target), "pw": ROOM_PW})
+
+    def _on_error(self, d):
+        code, msg = d.get("code"), d.get("msg", "")
+        if code in ("bad_login", "already_online", "disabled", "bad_id", "bad_pw"):
+            self._finish_login(False, msg or "로그인에 실패했습니다.", code)
+            self.chat.logout()
+            return self._emit({"ev": "login_fail", "msg": msg, "code": code})
+        if code == "room_missing" and self.target:
+            # 그 PC가 domichat에 한 번도 접속한 적이 없어 방 자체가 없다.
+            self._finish_target(False, "room_missing")
+            return self._emit({"ev": "target_denied", "pc": self.target,
+                               "reason": "room_missing", "msg": msg})
+        self._emit({"ev": "error", "msg": msg, "code": code})
+
+    def _on_msg(self, frm, body):
+        kind, rest = self.dispatch(frm, body)
+        if kind is None:
+            return
+        out = dispatch_result(self, kind, rest)
+        if kind == "reply":
+            self.resolve_pending()
+            # 대상 선택 직후의 첫 상태 응답이 '입장 성공' 확정이다.
+            if out.get("status") is not None:
+                self._finish_target(True, None, out["status"])
+        self._emit(out)
+
+    # ---------- 수신 분배 (domiman.py _dispatch_ntfy의 'dB 원격 모드' 분기) ----------
+    def dispatch(self, frm, body):
+        """메시지 하나를 분류해 반환. ntfy 시절 Title 자리에 domichat `from`이
+        들어온 것 말고는 규칙이 같다:
           ("reply", [필드...])   -- 내 질의/명령에 대한 응답 ({my_id},Z,...)
           ("report", [필드...])  -- 대상 PC의 상황 보고 (,Z,F,... 브로드캐스트)
-          (None, None)           -- 무시 대상(대상 PC 것이 아니거나 규격 밖)
-        실제 반영(버튼 상태 변경/다이얼로그/알림 표시)은 호출부 책임 — 이 함수는
-        파싱·분류만 한다."""
-        if title != self.target_id:
+          (None, None)           -- 무시 대상(대상 PC 것이 아니거나 규격 밖)"""
+        if not self.target or frm != self.target:
             return None, None
         parts = [p.strip() for p in body.split(",")]
         if len(parts) < 2:
@@ -345,12 +718,46 @@ class DomimanClient:
             return "report", parts[3:]
         return None, None
 
+    # ---------- Kotlin 경계(JSON 문자열) ----------
+    def poll_event_json(self, timeout=0.5):
+        """앱 이벤트 하나를 꺼내 JSON으로 반환. 없으면 "null".
+        Kotlin은 Dispatchers.IO 코루틴에서 이 함수를 반복 호출한다."""
+        try:
+            return json.dumps(self.q.get(timeout=timeout), ensure_ascii=False)
+        except queue.Empty:
+            return "null"
+
+    def wait_login_json(self, timeout=LOGIN_TIMEOUT_SEC):
+        """접속+로그인 결과를 기다린다. 시간 초과면 ok=false."""
+        if self._login_ev.wait(timeout):
+            return json.dumps(self._login_res, ensure_ascii=False)
+        return json.dumps({"ok": False, "code": "timeout",
+                           "msg": "서버가 응답하지 않습니다."}, ensure_ascii=False)
+
+    def wait_target_json(self, timeout=TARGET_TIMEOUT_SEC):
+        """대상 PC 입장 + 첫 상태(S 응답)까지 기다린다.
+        - 입장 실패(비번/블랙/방 없음) → ok=false + reason
+        - 입장은 됐는데 PC가 응답 없음 → ok=false + reason='no_response'
+          (방은 남아있지만 그 PC가 꺼져 있는 흔한 경우)"""
+        if self._target_ev.wait(timeout):
+            return json.dumps(self._target_res, ensure_ascii=False)
+        joined = bool(self.joined_target)
+        return json.dumps({"ok": False, "pc": self.target,
+                           "reason": "no_response" if joined else "timeout",
+                           "status": None}, ensure_ascii=False)
+
+    def status_json(self):
+        """현재 세션 요약(위젯·복구 판단용)."""
+        return json.dumps({"connected": self.is_connected(), "id": self.my_id,
+                           "server": self.server, "target": self.target,
+                           "joined": bool(self.joined_target)}, ensure_ascii=False)
+
+    # ---------- 파서 (ntfy 시절과 동일 — 메시지 규격이 안 바뀌었다) ----------
     @staticmethod
     def parse_status(rest):
         """S/V/T/C 응답 뒤 필드 파싱: 타이머,해상도,a|m,로그,실행중[,낚싯대,미끼].
-        '실행중' 필드(domiman.py 260725d에서 추가, CLAUDE.md ntfy 프로토콜 절
-        참고)는 감시모드 여부와 무관하게 항상 5번째 고정 위치 — 낚싯대/미끼처럼
-        있다 없다 하면 자리가 밀려 파싱이 꼬이기 때문."""
+        '실행중' 필드(domiman.py 260725d에서 추가)는 감시모드 여부와 무관하게
+        항상 5번째 고정 위치 — 낚싯대/미끼처럼 있다 없다 하면 자리가 밀린다."""
         if len(rest) < 5:
             return None
         status = {
@@ -386,76 +793,28 @@ class DomimanClient:
         return None
 
 
-def attempt_login(client, timeout=PENDING_TIMEOUT_SEC):
-    """로그인(자동/수동 공통) 시도: cmd_login() 발신 후 timeout초 안에 상태
-    응답이 오면 parse_status() 결과를, 응답이 없으면 None을 반환한다.
-    (Sheet1 G6 '로그인' 버튼, G5 자동로그인 실패 시 처리에 공통으로 쓰인다.)
-
-    실제 안드로이드 앱에서는 Foreground Service가 앱 실행 내내 이미
-    stream()을 돌리고 있을 것이므로 그 큐를 그대로 재사용하면 되고, 이
-    함수처럼 매번 새로 스트림 스레드를 여닫을 필요는 없다 — 이 함수는
-    '보내고 15초 기다린다'는 규칙 자체를 보여주는 참고 구현이자, 서비스가
-    아직 없는 상태(예: 콜드 스타트 자동로그인)에서 쓸 수 있는 독립 버전이다."""
-    inbox = queue.Queue()
-    stop_event = threading.Event()
-
-    def _reader():
-        try:
-            client.stream(lambda t, b: inbox.put((t, b)), stop_event.is_set)
-        except Exception:
-            pass
-
-    threading.Thread(target=_reader, daemon=True).start()
-    time.sleep(0.3)   # 스트림 연결이 열릴 시간
-    client.cmd_login()
-
-    deadline = time.time() + timeout
-    status = None
-    while time.time() < deadline:
-        try:
-            title, body = inbox.get(timeout=0.5)
-        except queue.Empty:
-            continue
-        kind, rest = client.dispatch(title, body)
-        if kind == "reply":
-            client.resolve_pending()
-            status = client.parse_status(rest)
-            break
-    stop_event.set()
-    return status
-
-
-def attempt_login_json(client, timeout=PENDING_TIMEOUT_SEC):
-    """attempt_login()의 Kotlin/Chaquopy 친화 버전 — PyObject dict 대신 JSON
-    문자열로 반환한다(Map<PyObject,PyObject> 변환을 Kotlin 쪽에서 다루지 않아도
-    되게). 성공 시 상태 dict의 JSON, 실패 시 문자열 "null"."""
-    return json.dumps(attempt_login(client, timeout))
-
-
-def dispatch_json(client, title, body):
-    """dispatch()의 Kotlin/Chaquopy 친화 버전. 반환 JSON 스키마:
-      {"kind": "reply"|"report"|null,
-       "status": {...}|null,           # kind=="reply"이고 상태 응답(S/V/T/C)일 때
-       "tank": [cur,mx]|null,           # kind=="reply"이고 N(수량) 응답일 때
+def dispatch_result(session, kind, rest):
+    """수신 메시지 하나를 Kotlin이 쓰는 이벤트 dict로 만든다. 스키마:
+      {"ev": "reply"|"report",
+       "status": {...}|null,            # 상태 응답(S/V/T/C)일 때
+       "tank": [cur,mx]|null,           # N(수량) 응답일 때
        "tank_fail": bool,               # 위와 같되 파싱 실패(",Z,N,fail")
-       "echo": "G"|"P"|"W"|"Q"|"Y"|null, # kind=="reply"이고 상태 없는 명령 에코일 때
-       "sched_minutes": str|null,       # echo=="Y"에 분 인자가 붙은 경우(예약확정)
-       "report_text": str|null,         # kind=="report"일 때 로그에 띄울 문장
+       "echo": "G"|"P"|"W"|"Q"|"Y"|null, # 상태 없는 명령 에코일 때
+       "sched_minutes": str|null,       # echo=="Y"에 분 인자가 붙은 경우
+       "report_text": str|null,         # ev=="report"일 때 로그에 띄울 문장
        "report_status_key": str|null,   # 위와 같이 온 상태문구 키(STATUS_TEXT)
        "report_notify_key": str|null}   # 위와 같이 온 알림 설정 키(NOTIFY_KEYS)
-    kind에 따라 관련 없는 필드는 그냥 없거나 null이다.
 
     ※ G/P/W/Q/Y 응답은 domiman.py가 상태 필드 없이 명령 글자만 되돌려주는
     '에코'다(예: 시작 성공→',Z,G'). 상태 응답(S/V/T/C)은 첫 필드가 타이머
     숫자라 이 글자들과 겹치지 않으므로 rest[0]로 안전하게 구분된다. 과거엔
     이 분기가 없어 G/P 응답이 parse_status→None으로 버려져, 모바일에서
     '시작/중지'를 눌러도 running/pending이 갱신되지 않던 버그가 있었다."""
-    kind, rest = client.dispatch(title, body)
-    out = {"kind": kind}
+    out = {"ev": kind}
     if kind == "reply":
         first = rest[0] if rest else ""
         if first == "N":
-            tank = DomimanClient.parse_tank_reply(rest)
+            tank = DomimanSession.parse_tank_reply(rest)
             out["tank"] = list(tank) if tank else None
             out["tank_fail"] = tank is None
         elif first in ("G", "P", "W", "Q", "Y"):
@@ -463,64 +822,78 @@ def dispatch_json(client, title, body):
             if first == "Y" and len(rest) >= 2:
                 out["sched_minutes"] = rest[1]
         else:
-            out["status"] = DomimanClient.parse_status(rest)
+            out["status"] = DomimanSession.parse_status(rest)
     elif kind == "report":
-        text, status_key = DomimanClient.report_text(rest, client.target_id)
+        text, status_key = DomimanSession.report_text(rest, session.target)
         out["report_text"] = text
         out["report_status_key"] = status_key
-        out["report_notify_key"] = notify_key_for_report(rest)  # 알림 체크박스 판정용
-    return json.dumps(out)
+        out["report_notify_key"] = notify_key_for_report(rest)
+    return out
+
+
+def dispatch_json(session, frm, body):
+    """dispatch_result()의 단발 버전(테스트·재사용용). 규격 밖이면 {"ev":null}."""
+    kind, rest = session.dispatch(frm, body)
+    if kind is None:
+        return json.dumps({"ev": None})
+    return json.dumps(dispatch_result(session, kind, rest), ensure_ascii=False)
 
 
 # ============================================================
-# [2. 로그인 정보 저장 (Sheet1 전체 — 최근 로그인 목록 + 자동로그인 무장상태)]
+# [3. 로그인 정보 저장 (최근 로그인 목록 + 자동로그인 무장상태)]
 # ============================================================
 @dataclass
 class SavedLogin:
-    """'최근 로그인' 한 행 (Sheet1 A24:C25 열: ID/피제어PC/ntfy채널명)."""
-    my_id: str
-    target_pc: str
-    channel: str
+    """'최근 로그인' 한 행. domichat 이식으로 (ID, 피제어PC, 채널) →
+    **(서버 IP, domichat ID, PW)** 로 바뀌었다 — 제어할 PC는 로그인이 아니라
+    메인 화면 상단에서 고르기 때문."""
+    ip: str
+    uid: str
+    pw: str
 
     def key(self):
-        return (self.my_id, self.target_pc, self.channel)
+        """같은 서버의 같은 계정이면 한 행(비밀번호만 갱신)."""
+        return (self.ip, self.uid)
 
     def to_dict(self):
-        return {"id": self.my_id, "target_pc": self.target_pc, "channel": self.channel}
+        return {"ip": self.ip, "id": self.uid, "pw": self.pw}
 
     @staticmethod
     def from_dict(d):
-        return SavedLogin(d["id"], d["target_pc"], d["channel"])
+        return SavedLogin(d.get("ip", ""), d.get("id", ""), d.get("pw", ""))
 
 
 class LoginStore:
-    """'최근 로그인' 목록 + 자동로그인 '무장(armed)' 상태(Sheet1 전체 규칙).
-    실제 영속화(SharedPreferences/DataStore 등)는 Kotlin 쪽 책임이며, **캐시/
-    데이터 삭제 시 함께 지워지는 저장소**를 쓸 것(Sheet1 G7 — 계정 백업처럼
-    앱 데이터보다 오래 남는 저장소는 금지). 이 클래스는 데이터/규칙만 담당한다.
+    """'최근 로그인' 목록 + 자동로그인 '무장(armed)' 상태 + 서버 인증서 지문.
+    실제 영속화(SharedPreferences)는 Kotlin 쪽 책임이며, **캐시/데이터 삭제 시
+    함께 지워지는 저장소**를 쓸 것. 이 클래스는 데이터/규칙만 담당한다.
 
     사용자 확정 정책:
-      - 같은 (id, 피제어PC, 채널) 조합으로 다시 로그인하면 기존 행을 갱신하고
-        맨 위(최신)로 옮긴다 — 중복 행을 만들지 않는다.
-      - 목록 개수 상한 없음(무제한 보관)."""
+      - **자동 로그인을 체크하고 로그인했을 때만** 목록에 남는다. 체크 없이
+        로그인하면 그 세션에서만 쓰이고 로그아웃하면 기억하지 않는다.
+      - 같은 (서버IP, ID)로 다시 로그인하면 기존 행을 갱신하고 맨 위로 옮긴다.
+      - 목록 개수 상한 없음(무제한 보관).
+      - 인증서 지문(fingerprints)은 "IP:포트" → SHA-256 지문. 첫 접속에 기억해
+        고정하고(TOFU), 이후 바뀌면 접속을 끊는다."""
 
-    def __init__(self, recent=None, auto_login_enabled=False):
+    def __init__(self, recent=None, auto_login_enabled=False, fingerprints=None):
         self.recent = list(recent) if recent else []   # recent[0] = 최신
         self.auto_login_enabled = auto_login_enabled
+        self.fingerprints = dict(fingerprints) if fingerprints else {}
 
     def add_or_bump(self, entry):
-        """로그인 성공 시 호출(Sheet1 G8 — 자동로그인 체크 유무와 무관하게
-        모든 로그인을 기록). 동일 항목이 있으면 갱신 후 맨 앞으로."""
+        """로그인 성공 + 자동로그인 체크됨일 때만 호출. 동일 항목이 있으면
+        갱신 후 맨 앞으로."""
         self.recent = [e for e in self.recent if e.key() != entry.key()]
         self.recent.insert(0, entry)
 
     def remove(self, entry):
-        """길게 눌러 '삭제'(Sheet1 G10)."""
+        """길게 눌러 '삭제'."""
         self.recent = [e for e in self.recent if e.key() != entry.key()]
 
     def update(self, old_entry, new_entry):
-        """길게 눌러 '수정' 확정(Sheet1 G10). 기존 자리를 새 값으로 교체만
-        하고 맨 앞으로 옮기지는 않는다 — 재로그인이 아니라 단순 정보 수정."""
+        """길게 눌러 '수정' 확정. 기존 자리를 새 값으로 교체만 하고 맨 앞으로
+        옮기지는 않는다 — 재로그인이 아니라 단순 정보 수정."""
         for i, e in enumerate(self.recent):
             if e.key() == old_entry.key():
                 self.recent[i] = new_entry
@@ -531,20 +904,29 @@ class LoginStore:
         """가장 최근 로그인(자동로그인 대상). 없으면 None."""
         return self.recent[0] if self.recent else None
 
+    def fingerprint_of(self, server):
+        return self.fingerprints.get(server or "")
+
+    def pin(self, server, fp):
+        if server and fp:
+            self.fingerprints[server] = fp
+
     def to_dict(self):
         return {"recent": [e.to_dict() for e in self.recent],
-                "auto_login_enabled": self.auto_login_enabled}
+                "auto_login_enabled": self.auto_login_enabled,
+                "fingerprints": self.fingerprints}
 
     @staticmethod
     def from_dict(d):
         return LoginStore(
             recent=[SavedLogin.from_dict(x) for x in d.get("recent", [])],
-            auto_login_enabled=bool(d.get("auto_login_enabled", False)))
+            auto_login_enabled=bool(d.get("auto_login_enabled", False)),
+            fingerprints=d.get("fingerprints") or {})
 
     def to_json(self):
         """SharedPreferences처럼 문자열 하나만 다루는 저장소에 그대로 넣을 수
         있는 형태(Kotlin에서 dict/list 변환을 직접 다루지 않아도 되게)."""
-        return json.dumps(self.to_dict())
+        return json.dumps(self.to_dict(), ensure_ascii=False)
 
     @staticmethod
     def from_json(s):
@@ -553,143 +935,42 @@ class LoginStore:
             return LoginStore()
         try:
             return LoginStore.from_dict(json.loads(s))
-        except (json.JSONDecodeError, TypeError, KeyError):
+        except (json.JSONDecodeError, TypeError, KeyError, AttributeError):
             return LoginStore()
 
 
+# 제어 대상 PC 이름 기본 목록(메인 화면 상단 '제어 PC 선택하기' 리스트).
+# 사용자가 추가·삭제할 수 있고, 실제 영속화는 Kotlin(SharedPreferences)이 한다.
+DEFAULT_PC_LIST = ["seoul", "chungju", "galaxy"]
+
+
 # ============================================================
-# [3. 화면 상태 모델 (Kotlin ViewModel 상태 필드 대응 참고용)]
+# [4. 화면 상태 모델 (Kotlin ViewModel 상태 필드 대응 참고용)]
 # ============================================================
 class Screen(Enum):
-    LOGIN = "login"              # Sheet1 A1:E18
-    RECENT_LOGINS = "recent"     # Sheet1 A21:E39
-    MAIN = "main"                # Sheet2 A1:E19
+    LOGIN = "login"
+    RECENT_LOGINS = "recent"
+    MAIN = "main"
 
 
 @dataclass
 class LoginFormState:
-    """Sheet1 A1:E18 입력 폼 상태. mode='edit'이면(Sheet1 G9) 자동로그인
-    체크박스가 숨겨지고 버튼이 로그인/…→수정/취소로 바뀐다."""
-    my_id: str = ""
-    target_pc: str = ""
-    channel: str = ""
+    """로그인 입력 폼 상태. mode='edit'이면 자동로그인 체크박스가 숨겨지고
+    버튼이 [로그인]/[…] → [수정]/[취소]로 바뀐다."""
+    ip: str = ""
+    uid: str = ""
+    pw: str = ""
     auto_login_checked: bool = False
     mode: str = "login"            # 'login' | 'edit'
-    editing: SavedLogin = field(default=None)   # mode='edit'일 때 수정 대상 원본
+    editing: SavedLogin = field(default=None)
 
 
 # ============================================================
-# [4. 화면 전환/이벤트 규칙 (Kotlin ViewModel 로직 대응 참고용)]
-# ============================================================
-class LoginFlow:
-    """Sheet1(로그인+최근 로그인) 전체의 화면전환·데이터 규칙. 통신은
-    attempt_login()/DomimanClient가, 저장은 LoginStore가 맡고 이 클래스는
-    그 둘을 화면 이벤트에 연결하는 규칙만 표현한다.
-
-    Sheet2(메인 제어 화면)의 버튼들은 기존 DomimanClient.cmd_* 를 그대로
-    호출하면 되므로 여기서 다시 감싸지 않는다 — 새로 규칙이 필요한 것은
-    로그인/로그아웃/최근목록 흐름뿐이다."""
-
-    def __init__(self, store):
-        self.store = store
-        self.screen = Screen.LOGIN
-        self.form = LoginFormState()
-
-    def try_auto_login_on_launch(self, make_client, timeout=PENDING_TIMEOUT_SEC):
-        """앱 시작 시 1회 호출(Sheet1 G4/G6). 무장 상태 + 최근 로그인이 있으면
-        시도한다. 반환: 성공 시 (client, status), 실패/미무장이면 None
-        (실패 시 G5대로 폼을 비워 로그인 화면에 남는다)."""
-        if not self.store.auto_login_enabled or self.store.last() is None:
-            return None
-        entry = self.store.last()
-        client = make_client(entry.my_id, entry.target_pc, entry.channel)
-        status = attempt_login(client, timeout)
-        if status is None:
-            self.form = LoginFormState()          # G5: 입력값 초기화 + 재입력 메시지
-            return None
-        self.screen = Screen.MAIN
-        return client, status
-
-    def submit_login(self, make_client, my_id, target_pc, channel,
-                      auto_login_checked, timeout=PENDING_TIMEOUT_SEC):
-        """'로그인' 버튼(Sheet1 B14). 성공하면 최근 로그인 갱신 + 무장상태
-        반영 후 Sheet2로 전환(G6). 실패하면 None(화면 전환 없음)."""
-        client = make_client(my_id, target_pc, channel)
-        status = attempt_login(client, timeout)
-        if status is None:
-            return None
-        self.store.add_or_bump(SavedLogin(my_id, target_pc, channel))
-        self.store.auto_login_enabled = auto_login_checked
-        self.screen = Screen.MAIN
-        return client, status
-
-    def open_recent_logins(self):
-        """'…' 버튼(Sheet1 D14/G8) — 최근 로그인 화면으로."""
-        self.screen = Screen.RECENT_LOGINS
-
-    def tap_recent_login(self, make_client, entry, timeout=PENDING_TIMEOUT_SEC):
-        """최근 로그인 행을 짧게 탭(Sheet1 G8/G9) — 그 정보로 즉시 로그인
-        시도. 무장 상태는 건드리지 않는다(단순 재접속이지 로그인 설정 변경이
-        아니므로). 성공하면 그 항목을 맨 위로 갱신."""
-        client = make_client(entry.my_id, entry.target_pc, entry.channel)
-        status = attempt_login(client, timeout)
-        if status is None:
-            return None
-        self.store.add_or_bump(entry)
-        self.screen = Screen.MAIN
-        return client, status
-
-    def start_edit(self, entry):
-        """최근 로그인 행을 길게 눌러 '수정' 선택(Sheet1 G9) — 로그인 화면을
-        edit 모드로 전환, 입력란에 기존 값을 채운다."""
-        self.form = LoginFormState(my_id=entry.my_id, target_pc=entry.target_pc,
-                                   channel=entry.channel, mode="edit", editing=entry)
-        self.screen = Screen.LOGIN
-
-    def confirm_edit(self, new_id, new_target_pc, new_channel):
-        """edit 모드의 '수정' 버튼(Sheet1 G10) — 목록의 해당 항목 값만 교체
-        (맨 위로 옮기지 않음). 완료 후 최근 로그인 화면으로 복귀."""
-        old = self.form.editing
-        self.store.update(old, SavedLogin(new_id, new_target_pc, new_channel))
-        self.form = LoginFormState()
-        self.screen = Screen.RECENT_LOGINS
-
-    def cancel_edit(self):
-        """edit 모드의 '취소' 버튼(Sheet1 G9)."""
-        self.form = LoginFormState()
-        self.screen = Screen.RECENT_LOGINS
-
-    def delete_entry(self, entry):
-        """길게 눌러 '삭제' 선택(Sheet1 G9/G10)."""
-        self.store.remove(entry)
-
-    def back_from_recent(self):
-        """'<' 버튼(Sheet1 A22/G11) — 로그인 화면으로."""
-        self.screen = Screen.LOGIN
-
-    def logout(self):
-        """Sheet2에서 뒤로가기 2번(G20) — 자동로그인 '무장'만 해제하고,
-        최근 로그인 목록과 마지막 로그인 값은 그대로 둔다(G21). 로그인
-        화면 폼에는 마지막 로그인 정보가 다시 채워지되(값은 남지만 무장은
-        꺼진 상태), 자동로그인 체크박스는 꺼진 채로 보여준다."""
-        self.store.auto_login_enabled = False
-        self.screen = Screen.LOGIN
-        last = self.store.last()
-        if last:
-            self.form = LoginFormState(my_id=last.my_id, target_pc=last.target_pc,
-                                       channel=last.channel, auto_login_checked=False)
-        else:
-            self.form = LoginFormState()
-
-
-# ============================================================
-# [5. Sheet2 로그 창 (항상 표시, 마지막 8줄만 유지 — Sheet2 A15/G15)]
+# [5. 로그 창 (항상 표시, 마지막 8줄만 유지)]
 # ============================================================
 class MobileLogBuffer:
-    """PC와 달리 접기 기능이 없고 항상 펼쳐진 상태로 마지막 maxlen줄만
-    유지한다. 'x' 버튼(Sheet2 E15)을 누르면 clear(). 채워 넣을 내용은
-    dispatch()의 reply/report 결과, report_text()의 반환 문장, 명령 발신
-    에코 등 — domiman.py GUI 로그창에 print()되는 것과 같은 내용이다."""
+    """PC와 달리 접기 기능이 없고 항상 펼쳐진 상태로 마지막 maxlen줄만 유지한다.
+    'x' 버튼을 누르면 clear()."""
 
     def __init__(self, maxlen=8):
         self._lines = deque(maxlen=maxlen)
@@ -707,31 +988,37 @@ class MobileLogBuffer:
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) != 4:
-        print("사용법: python domiman_m.py <내 ID> <대상PC 이름> <ntfy 채널 이름>")
+    if len(sys.argv) not in (4, 5):
+        print("사용법: python domiman_m.py <서버IP[:포트]> <domichat ID> <PW> [제어할 PC]")
         raise SystemExit(1)
 
-    my_id, target_pc, channel = sys.argv[1], sys.argv[2], sys.argv[3]
+    ip, uid, pw = sys.argv[1], sys.argv[2], sys.argv[3]
+    pc = sys.argv[4] if len(sys.argv) == 5 else ""
 
     store = LoginStore()
-    flow = LoginFlow(store)
-    make_client = lambda i, p, c: DomimanClient(i, p, c)   # noqa: E731
+    sess = DomimanSession()
+    print(f"[테스트] {ip} 에 '{uid}'로 접속합니다...")
+    host, port = split_server(ip)
+    sess.start(ip, uid, pw, store.fingerprint_of(f"{host}:{port}"))
+    res = json.loads(sess.wait_login_json())
+    print(f"[로그인] {res}")
+    if not res.get("ok"):
+        raise SystemExit(1)
 
-    print(f"[테스트] '{my_id}' -> '{target_pc}' 로그인 시도 (채널: {channel})...")
-    result = flow.submit_login(make_client, my_id, target_pc, channel,
-                               auto_login_checked=True)
+    store.pin(res.get("server"), res.get("fp"))
+    store.add_or_bump(SavedLogin(ip, uid, pw))
+    store.auto_login_enabled = True
+    print(f"[최근 로그인] {store.to_json()}")
 
-    if result is None:
-        print("실패하였습니다. 다시 시도해주세요")
-    else:
-        client, status = result
-        print(f"[성공] 상태: {status}")
-        print(f"[최근 로그인] {[e.to_dict() for e in store.recent]}")
-        print(f"[자동로그인 무장] {store.auto_login_enabled}")
-
-        # 로그아웃 -> 재실행(자동로그인 시도) 시나리오까지 확인
-        flow.logout()
-        print(f"[로그아웃 후] 화면={flow.screen}, 무장={store.auto_login_enabled}, "
-              f"폼={flow.form}")
-        retry = flow.try_auto_login_on_launch(make_client)
-        print(f"[로그아웃 직후 자동로그인 재시도] {'시도 안 함(무장 꺼짐, 정상)' if retry is None else '시도됨(버그)'}")
+    if pc:
+        print(f"[테스트] '{pc}' 제어를 시작합니다...")
+        sess.select_target(pc)
+        tres = json.loads(sess.wait_target_json())
+        print(f"[대상] {tres}")
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            ev = sess.poll_event_json(0.5)
+            if ev != "null":
+                print(f"[이벤트] {ev}")
+    sess.stop()
+    print("[테스트] 로그아웃했습니다.")

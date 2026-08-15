@@ -50,15 +50,15 @@ kotlin {
 
 chaquopy {
     defaultConfig {
-        version = "3.13"
-        // 이 컴퓨터의 py 런처 -V:3.13 슬롯이 (스토어 스텁)이라 자동 탐지가
-        // 실패한다(CLAUDE.md에 이미 기록된 함정과 같은 종류) — python.org
-        // 정식 설치 경로를 명시적으로 지정.
-        buildPython("C:/Users/windo/AppData/Local/Programs/Python/Python313/python.exe")
-        pip {
-            // domiman_m.py가 쓰는 유일한 3rd-party 의존성 (requests)
-            install("requests")
-        }
+        version = "3.12"
+        // buildPython 자동 탐지는 이 PC의 py 런처 슬롯이 Microsoft Store 스텁일
+        // 때 실패한다(반복된 함정) — python.org 정식 설치 경로를 명시적으로 지정.
+        // ⚠️ 다른 PC에서 빌드하려면 이 경로를 그 PC의 python.org 인터프리터로
+        //    바꿔야 하며, version 값과 major.minor가 같아야 한다.
+        buildPython("C:/Users/windo/AppData/Local/Programs/Python/Python312/python.exe")
+        // pip 의존성 없음: domichat 이식 후 domiman_m.py는 표준 라이브러리
+        // (socket/ssl/struct/hashlib/json/threading/queue)만 쓴다. ntfy 시절의
+        // requests는 더 이상 필요 없어 걷어냈다(빌드도 그만큼 빨라진다).
     }
     sourceSets {
         getByName("main") {

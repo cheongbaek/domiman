@@ -10,8 +10,8 @@ import androidx.core.app.ServiceCompat
 import com.example.domiman.data.DomimanNotifications
 
 /**
- * 포그라운드 서비스 — ntfy 스트림 자체를 들고 있지는 않고(스트림은 앱 싱글턴
- * DomimanRepository.appScope에서 돌아 프로세스 수명과 함께 간다), 이 서비스가
+ * 포그라운드 서비스 — domichat 연결 자체를 들고 있지는 않고(세션은 앱 싱글턴
+ * DomimanRepository와 파이썬 세션 스레드에서 돌아 프로세스 수명과 함께 간다), 이 서비스가
  * 상시 알림과 함께 떠 있어 **OS가 백그라운드에서 프로세스를 죽이지 못하게** 한다.
  * 그 결과 앱이 백그라운드로 가도 스트림이 살아 이벤트 알림이 계속 오고, 다시
  * 앱에 들어와도 세션이 그대로라 "껐다 켜야 정상" 문제가 사라진다.

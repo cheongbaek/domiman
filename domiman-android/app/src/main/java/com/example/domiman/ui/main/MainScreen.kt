@@ -1,6 +1,9 @@
 package com.example.domiman.ui.main
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,6 +16,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -25,6 +29,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
@@ -44,30 +49,65 @@ fun MainScreen(
   viewModel: MainScreenViewModel = viewModel { MainScreenViewModel(repository) },
 ) {
   val state by viewModel.uiState.collectAsStateWithLifecycle()
+  val selectedPc by viewModel.selectedPc.collectAsStateWithLifecycle()
+  val pcList by viewModel.pcList.collectAsStateWithLifecycle()
+  val connected by viewModel.connected.collectAsStateWithLifecycle()
+
   var backPressCount by remember { mutableStateOf(0) }
   var showResolutionDialog by remember { mutableStateOf(false) }
   var showLogoutHint by remember { mutableStateOf(false) }
   var showSchedDialog by remember { mutableStateOf(false) }
+  var showPcDialog by remember { mutableStateOf(false) }
 
-  // 포그라운드 복귀 시 스트림 재접속 + 상태 재동기화(백그라운드에서 끊겼을 수
-  // 있음). 세션을 되살리지 못하면 로그인 화면으로.
+  // 제어할 PC를 고르기 전에는 아무 명령도 보낼 곳이 없다 → 컨트롤을 잠근다.
+  val hasTarget = selectedPc != null
+  val controlsEnabled = hasTarget && !state.isPending && !state.isConnectingTarget
+
+  // 포그라운드 복귀 시 세션 되살리기 + 방 재입장/상태 재동기화.
   LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
     viewModel.onResume(onSessionLost = onLoggedOut)
   }
 
-  // Sheet2 G20: 뒤로가기 1번=안내 토스트 성격의 메시지, 2번=로그아웃.
-  // (BackHandler는 Activity 레벨 연동이 필요해 화면 내 버튼으로 동일 동작을 노출)
   Column(
     modifier = modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
     verticalArrangement = Arrangement.spacedBy(10.dp),
   ) {
+    // ── 최상단: 제어할 PC 선택 박스 (기본은 미선택) ──────────────────────────
+    Row(
+      modifier =
+        Modifier.fillMaxWidth()
+          .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(10.dp))
+          .border(BorderStroke(1.dp, MaterialTheme.colorScheme.outline), RoundedCornerShape(10.dp))
+          .clickable { showPcDialog = true }
+          .padding(horizontal = 14.dp, vertical = 14.dp),
+      verticalAlignment = Alignment.CenterVertically,
+    ) {
+      Text(
+        text = selectedPc ?: "제어 PC 선택하기",
+        style = MaterialTheme.typography.titleMedium,
+        fontWeight = if (hasTarget) FontWeight.Bold else FontWeight.Normal,
+        color =
+          if (hasTarget) MaterialTheme.colorScheme.onSurface
+          else MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.weight(1f),
+      )
+      Text("▾", style = MaterialTheme.typography.titleMedium)
+    }
+    if (!connected) {
+      Text(
+        "서버와 연결이 끊어졌습니다. 다시 접속하는 중...",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.error,
+      )
+    }
+
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
       Text("해상도", modifier = Modifier.weight(1f))
       Text(state.resolutionLabel, style = MaterialTheme.typography.bodyMedium)
     }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-      OutlinedButton(onClick = { showResolutionDialog = true }, enabled = !state.isPending) { Text("직접 설정") }
-      OutlinedButton(onClick = viewModel::onResolutionAuto, enabled = !state.isPending) { Text("자동 감지") }
+      OutlinedButton(onClick = { showResolutionDialog = true }, enabled = controlsEnabled) { Text("직접 설정") }
+      OutlinedButton(onClick = viewModel::onResolutionAuto, enabled = controlsEnabled) { Text("자동 감지") }
     }
 
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -79,6 +119,7 @@ fun MainScreen(
         onValueChange = { new ->
           if (new.matches(Regex("""\d*\.?\d*"""))) viewModel.onTimerInput(new)
         },
+        enabled = hasTarget,
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
         singleLine = true,
         modifier = Modifier.weight(1f),
@@ -91,7 +132,7 @@ fun MainScreen(
       Checkbox(
         checked = state.rod,
         onCheckedChange = { viewModel.onFlagsToggled(state.logSave, it, state.bait) },
-        enabled = !state.isPending,
+        enabled = controlsEnabled,
       )
       Text("낚싯대 자동교체")
     }
@@ -99,7 +140,7 @@ fun MainScreen(
       Checkbox(
         checked = state.bait,
         onCheckedChange = { viewModel.onFlagsToggled(state.logSave, state.rod, it) },
-        enabled = !state.isPending,
+        enabled = controlsEnabled,
       )
       Text("미끼 자동교체")
     }
@@ -110,7 +151,7 @@ fun MainScreen(
 
     Button(
       onClick = viewModel::onStartStop,
-      enabled = !state.isPending,
+      enabled = controlsEnabled,
       modifier = Modifier.fillMaxWidth(),
     ) {
       Text(if (state.running) "중지" else "시작")
@@ -120,19 +161,21 @@ fun MainScreen(
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
       OutlinedButton(
         onClick = { showSchedDialog = true },
-        enabled = !state.isPending,
+        enabled = controlsEnabled,
         modifier = Modifier.weight(1f),
       ) { Text("예약 종료") }
       OutlinedButton(
         onClick = viewModel::onCollectNow,
-        enabled = !state.isPending,
+        enabled = controlsEnabled,
         modifier = Modifier.weight(1f),
       ) { Text("즉시 회수") }
     }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-      // Sheet2 G13: Android는 GitHub 자동 업데이트가 불가해 이 자리는 항상
-      // '실시간 수량확인'으로 확정(풀투리프레시 제스처는 구현하지 않음).
-      OutlinedButton(onClick = viewModel::onTankQuery, modifier = Modifier.weight(1f)) { Text("실시간 수량확인") }
+      OutlinedButton(
+        onClick = viewModel::onTankQuery,
+        enabled = hasTarget,
+        modifier = Modifier.weight(1f),
+      ) { Text("실시간 수량확인") }
       OutlinedButton(onClick = onToggleDark, modifier = Modifier.weight(1f)) {
         Text(if (isDark) "화이트모드" else "다크모드")
       }
@@ -154,9 +197,7 @@ fun MainScreen(
       state.logLines.forEach { line -> Text(line, style = MaterialTheme.typography.bodySmall) }
     }
 
-    // 하단: 로그아웃 + 알림 설정(앱UI설명 — 로그아웃 옆 같은 모양 버튼).
-    // 뒤로가기 2번=로그아웃 규칙을 임시로 화면 내 버튼으로도 노출
-    // (시스템 뒤로가기 인터셉트는 Activity의 OnBackPressedCallback 연동 필요 — 향후 작업).
+    // 하단: 로그아웃 + 알림 설정.
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
       TextButton(
         onClick = {
@@ -175,6 +216,20 @@ fun MainScreen(
     }
   }
 
+  if (showPcDialog) {
+    PcSelectDialog(
+      pcList = pcList,
+      selected = selectedPc,
+      onDismiss = { showPcDialog = false },
+      onSelect = { pc ->
+        showPcDialog = false
+        viewModel.onSelectPc(pc)
+      },
+      onAdd = viewModel::onAddPc,
+      onDelete = viewModel::onRemovePc,
+    )
+  }
+
   if (showLogoutHint) {
     AlertDialog(
       onDismissRequest = {
@@ -185,6 +240,8 @@ fun MainScreen(
         TextButton(
           onClick = {
             showLogoutHint = false
+            // 화면을 먼저 넘기고, 소켓·서비스 정리는 저장소가 뒤에서 끝낸다
+            // (메인 스레드에서 정리하다 '응답 없음'이 되던 문제 대응).
             viewModel.onLogout()
             onLoggedOut()
           },
@@ -245,4 +302,79 @@ fun MainScreen(
       dismissButton = { TextButton(onClick = { showSchedDialog = false }) { Text("취소") } },
     )
   }
+}
+
+/**
+ * 제어 PC 선택 다이얼로그. 목록은 PC 이름(= 그 PC의 domichat 로그인 ID)만 담으며
+ * 사용자가 추가·삭제할 수 있다. 기본값은 seoul / chungju / galaxy.
+ * 고르면 `domi_fishing_{이름}` 채팅방을 구독해 상태를 받기 시작한다.
+ */
+@Composable
+private fun PcSelectDialog(
+  pcList: List<String>,
+  selected: String?,
+  onDismiss: () -> Unit,
+  onSelect: (String) -> Unit,
+  onAdd: (String) -> Boolean,
+  onDelete: (String) -> Unit,
+) {
+  var newName by remember { mutableStateOf("") }
+  var addError by remember { mutableStateOf<String?>(null) }
+
+  AlertDialog(
+    onDismissRequest = onDismiss,
+    title = { Text("제어 PC 선택") },
+    text = {
+      Column(
+        modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+      ) {
+        if (pcList.isEmpty()) {
+          Text("등록된 PC가 없습니다. 아래에서 추가하세요.", style = MaterialTheme.typography.bodySmall)
+        }
+        pcList.forEach { pc ->
+          Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            TextButton(onClick = { onSelect(pc) }, modifier = Modifier.weight(1f)) {
+              Text(
+                text = if (pc == selected) "$pc  ✓" else pc,
+                modifier = Modifier.fillMaxWidth(),
+                fontWeight = if (pc == selected) FontWeight.Bold else FontWeight.Normal,
+              )
+            }
+            TextButton(onClick = { onDelete(pc) }) { Text("삭제") }
+          }
+          HorizontalDivider()
+        }
+
+        Row(
+          verticalAlignment = Alignment.CenterVertically,
+          horizontalArrangement = Arrangement.spacedBy(6.dp),
+          modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+        ) {
+          OutlinedTextField(
+            value = newName,
+            onValueChange = {
+              newName = it
+              addError = null
+            },
+            label = { Text("PC 이름") },
+            singleLine = true,
+            modifier = Modifier.weight(1f),
+          )
+          TextButton(
+            onClick = {
+              if (onAdd(newName)) {
+                newName = ""
+                addError = null
+              } else {
+                addError = "이미 있거나 쓸 수 없는 이름입니다."
+              }
+            },
+          ) { Text("추가") }
+        }
+        addError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+      }
+    },
+    confirmButton = { TextButton(onClick = onDismiss) { Text("닫기") } },
+  )
 }

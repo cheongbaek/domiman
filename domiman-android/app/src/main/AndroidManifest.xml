@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- ntfy.sh HTTP 통신(스트리밍 구독 + 발신)에 필요 -->
+    <!-- domiserver TCP(47821) 접속 — domichat 프로토콜 수/발신에 필요 -->
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- 백그라운드 알림 게시(Android 13+) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -32,7 +32,7 @@
             </intent-filter>
         </activity>
 
-        <!-- 백그라운드 ntfy 수신·알림 유지용 포그라운드 서비스.
+        <!-- 백그라운드 domichat 수신·알림 유지용 포그라운드 서비스.
              specialUse|dataSync: 34+는 시간제한 없는 specialUse, 그 미만은 dataSync. -->
         <service
             android:name=".DomimanService"
@@ -40,7 +40,7 @@
             android:foregroundServiceType="specialUse|dataSync">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="ntfy_remote_control" />
+                android:value="domichat_remote_control" />
         </service>
 
         <!-- 홈 위젯(4x1). 커스텀 액션 PendingIntent는 명시적(자기 UID)이라
