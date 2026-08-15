@@ -534,7 +534,7 @@ def send_report(code):
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260815c"
+APP_VERSION = "260815d"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -729,7 +729,7 @@ class GameCapture:
             with self._lock:
                 if self._latest is not None:
                     return True
-            time.sleep(0.1)
+            abort_sleep(0.1)
         return False
 
     def get_frame_1080(self):
@@ -856,10 +856,68 @@ def to_screen(coords):
     return int(ox + fx / 1920.0 * cw), int(oy + fy / 1080.0 * ch)
 
 
+# --- 즉시 중지 (중지 요청이 오면 진행 중인 루틴을 그 자리에서 버린다) ---
+class RoutineAborted(BaseException):
+    """중지 요청으로 루틴을 도중에 버렸다는 신호.
+
+    루틴을 부르는 쪽(워커 스레드·즉시 회수 스레드 등)에서 잡아 조용히 끝낸다.
+    **Exception이 아니라 BaseException을 상속하는 이유(중요):** 루틴 곳곳에
+    OCR·win32 호출을 감싼 `except Exception`이 있어서, 평범한 예외로 만들면
+    그 블록들이 중단 신호를 삼켜 버린다(그 자리에서 '계속 진행'이 된다).
+    KeyboardInterrupt와 같은 이유로 계열을 달리한다."""
+
+
+_abort_event = threading.Event()
+
+
+def request_abort():
+    """진행 중인 루틴을 즉시 중단시킨다(중지 버튼·원격 P·종료가 호출)."""
+    _abort_event.set()
+
+
+def clear_abort():
+    """새로 시작하기 전에 중단 요청을 푼다. 안 풀면 새 루틴이 바로 끊긴다."""
+    _abort_event.clear()
+
+
+def check_abort():
+    """루틴 중간중간의 확인 지점. 중지 요청이 있으면 그 자리에서 빠져나간다."""
+    if _abort_event.is_set():
+        raise RoutineAborted()
+
+
+def abort_sleep(sec):
+    """루틴 안에서 쓰는 time.sleep 대체. 중지 요청이 오면 **기다리지 않고**
+    즉시 RoutineAborted로 빠져나온다. 클릭·키 입력·OCR 재시도의 대기가 전부
+    이 함수를 거치므로, 중지 지연은 길어야 OCR 한 번(1초 미만)이다.
+
+    ※ 채팅 재연결 백오프처럼 낚시와 무관한 대기에는 쓰지 않는다."""
+    if _abort_event.wait(sec):
+        raise RoutineAborted()
+
+
+def reset_to_base_state():
+    """'시작'을 누를 때 화면을 기본 상태로 되돌린다.
+
+    중지는 이제 루틴 도중(퀴즈 창·리스트 창이 열린 채)에도 걸리므로, 다시
+    시작할 때 그 잔재를 이어받으면 안 된다. 종류를 알 수 없는 창들을 ESC 3번으로
+    무조건 정리하는 것은 교체 루틴 진입·_resume_fishing과 같은 패턴이다.
+    낚시 취소/시작 버튼은 **누르지 않는다** — 상태를 모르는 채 그 좌표를 누르면
+    오히려 낚시가 새로 시작돼 버린다(run_fishing_routine의 함정과 같음)."""
+    print("[시작] 이전 화면을 정리하고 기본 상태에서 시작합니다.")
+    if not bring_game_to_front(GAME_KEYWORD):
+        print("[경고] 게임 창을 찾지 못해 화면 정리를 건너뜁니다.")
+        return
+    press_esc(delay=0.5)
+    press_esc(delay=0.5)
+    press_esc(delay=0.5)
+
+
 def click_real(coords, delay=0.5):
     """coords는 항상 FHD 좌표. to_screen이 실제 화면 좌표로 변환.
     클릭 후 대기(delay)는 **전 호출부 0.5초로 통일**되어 있다 — 호출부에서
     delay를 따로 넘기지 말고 이 기본값을 쓸 것(값 대장 참고)."""
+    check_abort()
     x, y = to_screen(coords)
     ctypes.windll.user32.SetCursorPos(x, y)
     time.sleep(0.1)
@@ -867,17 +925,19 @@ def click_real(coords, delay=0.5):
     time.sleep(0.1)
     ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
     print(f"[Click] FHD({int(coords[0])},{int(coords[1])}) -> SCR({x},{y})")
-    time.sleep(delay)
+    # 누름/뗌 사이(0.1초)는 중단하지 않는다 — 버튼을 누른 채로 남을 수 있다.
+    abort_sleep(delay)
 
 
 def press_key(vk, delay=0.5, label=""):
     """키를 게임에 전송(클릭과 동일한 ctypes 채널) 후 delay초 대기."""
+    check_abort()
     ctypes.windll.user32.keybd_event(vk, 0, 0, 0)
-    time.sleep(0.05)
+    time.sleep(0.05)        # 누름/뗌 사이 — 여기서 끊으면 키가 눌린 채 남는다
     ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
     if label:
         print(f"[Key] {label}")
-    time.sleep(delay)
+    abort_sleep(delay)
 
 
 def press_esc(delay=1.0):
@@ -889,7 +949,7 @@ def _force_foreground(hwnd, timeout=2.0):
     try:
         if win32gui.IsIconic(hwnd):
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            time.sleep(0.3)
+            abort_sleep(0.3)     # BaseException이라 아래 except Exception이 못 삼킨다
     except Exception:
         pass
     try:
@@ -947,7 +1007,7 @@ def _force_foreground(hwnd, timeout=2.0):
                 return True
         except Exception:
             pass
-        time.sleep(0.1)
+        abort_sleep(0.1)
     return False
 
 
@@ -986,9 +1046,9 @@ def bring_game_to_front(keyword=GAME_KEYWORD):
 
     for _ in range(3):
         if _force_foreground(target_hwnd):
-            time.sleep(0.5)
+            abort_sleep(0.5)
             return True
-        time.sleep(0.4)
+        abort_sleep(0.4)
     print("[경고] 포커스 전환 실패 → 창 전환 없이 루틴 계속")
     return True
 
@@ -1074,7 +1134,7 @@ def verify_fishing_success():
         try:
             img_rgb = grab_region_rgb(REGION_VERIFY_TEXT)
             if img_rgb is None:
-                time.sleep(0.3)
+                abort_sleep(0.3)
                 continue
             results = reader.readtext(img_rgb, detail=0)
             detected_text = " ".join(results)
@@ -1084,7 +1144,7 @@ def verify_fishing_success():
         except Exception:
             print(f" -> [OCR 에러] {time.strftime('%Y-%m-%d %H:%M:%S')}")
             traceback.print_exc()
-        time.sleep(0.3)
+        abort_sleep(0.3)
     return False
 
 
@@ -1245,7 +1305,7 @@ def read_tank_quantity(retries=4, delay=0.3):
                     if _last_tank_max is not None and mx == _last_tank_max:
                         return cur, mx
         if i < retries - 1:
-            time.sleep(delay)
+            abort_sleep(delay)
 
     if not votes:
         _dump_ocr_crop("tank_fail", REGION_TANK_QTY, _last_tank_ocr)
@@ -1262,7 +1322,7 @@ def read_tank_quantity(retries=4, delay=0.3):
         _dump_ocr_crop("tank_maxchange", REGION_TANK_QTY, _last_tank_ocr)
         print(f"    [수량 재확인] 최대치가 {_last_tank_max} → {best[1]} 로 바뀐 것처럼 "
               f"읽혔습니다(OCR='{_last_tank_ocr}'). 한 번 더 확인합니다.")
-        time.sleep(delay)
+        abort_sleep(delay)
         txt = _ocr_region(REGION_TANK_QTY, numeric=True)
         m = re.search(r'(\d+)\D+(\d+)', txt or "")
         if not m or int(m.group(2)) != best[1]:
@@ -1303,7 +1363,7 @@ def _read_gain_time(region, retries=3, delay=0.2):
                 if 0 < sec <= 600:
                     votes.append(sec)
         if i < retries - 1:
-            time.sleep(delay)
+            abort_sleep(delay)
     if not votes:
         return None
     return max(set(votes), key=votes.count)
@@ -1358,7 +1418,7 @@ def _confirm_rod_expiry(frozen_cycles):
        수량이 영원히 늘지 않으므로 여기서 반드시 빠져나온다.
     """
     for _ in range(ROD_EXPIRY_CONFIRM_READS):
-        time.sleep(0.4)
+        abort_sleep(0.4)
         again_min, again_max = read_min_gain_time(), read_max_gain_time()
         if again_min != 1 or again_max != 1:
             print(f"[{time.strftime('%H:%M:%S')}] 다시 읽으니 획득 시간이 "
@@ -1440,7 +1500,7 @@ def _find_cards_by_pattern(pattern):
             return sorted(found)
         if results:
             return []
-        time.sleep(0.5)
+        abort_sleep(0.5)
     return []
 
 
@@ -1530,7 +1590,7 @@ def _restart_or_collect_after_rod_swap():
     판정은 `_tank_needs_collect`로 감시 루프와 같은 기준을 쓴다.
 
     반환값: 회수 루틴을 실행했으면 True, 그냥 낚시를 재개했으면 False."""
-    time.sleep(0.5)          # 교체한 낚싯대 기준으로 수량 표시가 갱신될 시간
+    abort_sleep(0.5)         # 교체한 낚싯대 기준으로 수량 표시가 갱신될 시간
                              # (갱신 자체는 즉시. 화면 지연·순간 오류 대비분)
     qty = read_tank_quantity()
     if qty is None:
@@ -1655,7 +1715,7 @@ def run_fishing_routine(skip_cancel=False):
             print(f"\n[시도 {attempt}/{max_retries}] 퀴즈 풀이 프로세스 시작")
             click_real(COORD_MYROOM_BTN)
             solve_quiz_step(REGION_Q_LEFT, answer_slots, "왼쪽")
-            time.sleep(0.5)
+            abort_sleep(0.5)
             solve_quiz_step(REGION_Q_RIGHT, answer_slots, "오른쪽")
 
             print("3. 완료 확인 (OCR 판독)")
@@ -1709,20 +1769,30 @@ class FishingWorker(threading.Thread):
         self.stop_event = threading.Event()
 
     def stop(self):
+        """중지 요청. 대기 중이면 즉시 깨우고, 루틴이 돌고 있으면 **그 루틴도
+        도중에 버린다**(request_abort). 루틴이 끝나기를 기다리지 않는다."""
         self.stop_event.set()
+        request_abort()
 
     def run(self):
         try:
+            # 이전 실행이 루틴 도중에 끊겼을 수 있으므로 화면부터 정리하고
+            # 기본 상태에서 출발한다(퀴즈 창·리스트 창이 남아 있으면 그 위에서
+            # 이어 하는 꼴이 된다).
+            reset_to_base_state()
             if self.mode == 'watch':
                 self._watch_loop()
             else:
                 self._timer_loop()
+        except RoutineAborted:
+            print("[중지] 진행 중이던 루틴을 즉시 중단했습니다.")
         except Exception:
             print("[오류] 자동화 루프에서 예외 발생")
             traceback.print_exc()
         finally:
             if game_capture is not None and game_capture.is_running:
                 game_capture.stop()
+            clear_abort()          # 다음 시작이 곧바로 끊기지 않도록 원복
             self.on_end()
 
     # --- 살림망 감시 모드 (낚시.py watch_tank_mode 이식) ---
@@ -2440,16 +2510,22 @@ class DomimanApp:
             on_result(None)             # OCR/해상도 미준비 → 파싱 불가
             return
 
+        reported = []                   # on_result를 두 번 부르지 않기 위한 표시
+
+        def _report(qty):
+            reported.append(True)
+            on_result(qty)
+
         def _bg():
             global _last_tank
             try:
                 bring_game_to_front(GAME_KEYWORD)
                 _ensure_watch_capture()
-                time.sleep(3.0)         # 창이 떠 숫자가 렌더될 시간
+                abort_sleep(3.0)        # 창이 떠 숫자가 렌더될 시간
                 qty = read_tank_quantity()
                 if qty is not None:
                     _last_tank = qty
-                on_result(qty)          # 결과 먼저 알림(원격 N 응답을 빠르게)
+                _report(qty)            # 결과 먼저 알림(원격 N 응답을 빠르게)
                 # 낚시 상태 확인 후 '낚시 시작'(대기 중)이면 눌러서 재개.
                 # 단 회수해야 할 수량(특히 최대치 초과)이면 눌러도 낚시가 안
                 # 걸리므로 헛클릭 대신 알리기만 한다 — 감시 워커가 돌고 있으면
@@ -2460,9 +2536,15 @@ class DomimanApp:
                 elif is_fishing_active() is False:
                     print("[낚시 상태 확인] '낚시 시작' 상태 — 자동으로 재개합니다.")
                     _resume_fishing()
+            except RoutineAborted:
+                # 확인 도중 '중지'를 누른 경우 — 아직 답을 못 보냈으면 실패로 답한다
+                print("[중지] 실시간 수량 확인을 중단했습니다.")
+                if not reported:
+                    _report(None)
             except Exception:
                 traceback.print_exc()
-                on_result(None)
+                if not reported:
+                    _report(None)
             finally:
                 # 내가 이번에 켠 캡처는 정리(워커가 돌면 워커 소유이므로 건드리지 않음)
                 if (not self._running() and game_capture is not None
@@ -3344,8 +3426,12 @@ class DomimanApp:
         self.set_status("collect3")
 
         def _run():
-            time.sleep(3.0)
-            run_fishing_routine()
+            try:
+                abort_sleep(3.0)
+                run_fishing_routine()
+            except RoutineAborted:
+                # 회수 도중 '중지'를 누른 경우 — 조용히 접는다
+                print("[중지] 즉시 회수를 중단했습니다.")
             # 중지 상태에서 눌렀다면 루틴 종료 후 준비 상태로 복귀
             if not self._running():
                 self._post_status("idle")
@@ -3376,6 +3462,9 @@ class DomimanApp:
         global chat_enabled
         chat_enabled = self.var_chat.get()
 
+        # 직전 실행의 중단 요청이 남아 있으면 새 루틴이 시작하자마자 끊긴다.
+        # (워커가 끝나며 스스로 풀지만, 어떤 경로로 들어오든 안전하도록 한 번 더)
+        clear_abort()
         self.worker = FishingWorker(
             mode=mode, interval_min=interval_min,
             rod_swap=self.var_rod.get(), bait_swap=self.var_bait.get(),
@@ -3388,7 +3477,7 @@ class DomimanApp:
         return True
 
     def _stop_fishing(self):
-        print("\n[시스템] 중지 요청 — 진행 중인 동작을 마치는 대로 멈춥니다.")
+        print("\n[시스템] 중지 요청 — 진행 중인 동작을 버리고 즉시 멈춥니다.")
         self.bt_start.configure(text="중지 중...", state="disabled")
         self.worker.stop()
 
