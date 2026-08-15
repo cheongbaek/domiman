@@ -534,7 +534,7 @@ def send_report(code):
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260815b"
+APP_VERSION = "260815c"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -738,6 +738,13 @@ class GameCapture:
         if raw is None:
             return None
         return cv2.resize(raw, (1920, 1080), interpolation=cv2.INTER_AREA)
+
+    def get_frame_raw(self):
+        """축소하지 않은 원본 프레임(BGR). **작은 글자를 OCR할 때 쓴다** —
+        1080p로 줄인 뒤 자르면 그만큼 정보를 버리고 시작하는 셈이라, 숫자처럼
+        작은 글자는 원본에서 잘라 확대하는 편이 훨씬 잘 읽힌다."""
+        with self._lock:
+            return self._latest
 
 
 game_capture = None
@@ -1110,21 +1117,88 @@ def _stop_watch_capture():
 
 
 def _watch_grab_region(region):
+    """FHD(1920x1080) 기준 영역을 잘라 RGB로 돌려준다.
+
+    **원본 프레임에서 자른다(중요):** 예전에는 1080p로 축소한 프레임을 잘랐는데,
+    QHD 화면이면 2560→1920으로 뭉갠 뒤 130x36짜리 숫자를 읽는 셈이라 정보를
+    버리고 시작한다. 좌표만 원본 배율로 환산해 자르면 화면이 더 클수록 오히려
+    더 선명한 글자를 얻는다(FHD면 배율 1이라 예전과 같다)."""
     x, y, w, h = region
     if game_capture is not None and game_capture.is_running:
-        frame = game_capture.get_frame_1080()
-        if frame is not None:
-            crop = frame[y:y + h, x:x + w]
+        frame = game_capture.get_frame_raw()
+        if frame is not None and frame.size:
+            fh, fw = frame.shape[:2]
+            sx, sy = fw / 1920.0, fh / 1080.0
+            crop = frame[int(round(y * sy)):int(round((y + h) * sy)),
+                         int(round(x * sx)):int(round((x + w) * sx))]
             if crop.size:
                 return cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
     return grab_region_rgb(region)
 
 
-def _ocr_region(region):
+OCR_NUM_SCALE = 3            # 숫자 영역 확대 배율(아래 실측 근거)
+
+
+def _prep_number_ocr(img):
+    """살림망 수량·획득 시간처럼 **작은 숫자**를 읽기 전 전처리: 3배 확대 + 흑백.
+
+    실측(20260815121853.jpg의 세 영역을 1.0/0.8/0.6/0.5배로 흐리게 만들어
+    10가지 전처리를 비교, 총 12케이스):
+        x3+흑백 7 · x3+이진화 7 · 지금(그대로) 6 · x2 6 · 샤픈+x3 6 ·
+        x3+CLAHE 6 · x3 5 · x4 4
+    가장 나은 축에 속하면서 부작용이 없는 것으로 x3+흑백을 골랐다(이진화는
+    배경이 밝은 화면에서 글자가 통째로 날아갈 위험이 있다).
+
+    **숫자 화이트리스트(allowlist)는 쓰지 않는다 — 측정에서 오히려 나빴다**
+    (같은 표본에서 9케이스 중 3→2로 감소: '414/480'을 '473480'으로 만드는 등
+    슬래시를 잃고 숫자로 밀어붙이는 부작용). 논리적으로 좋아 보여도 실측이
+    아니라고 하면 넣지 않는다."""
+    if img is None or not img.size:
+        return img
+    big = cv2.resize(img, None, fx=OCR_NUM_SCALE, fy=OCR_NUM_SCALE,
+                     interpolation=cv2.INTER_CUBIC)
+    return cv2.cvtColor(cv2.cvtColor(big, cv2.COLOR_RGB2GRAY), cv2.COLOR_GRAY2RGB)
+
+
+def _ocr_region(region, numeric=False):
+    """영역 OCR. numeric=True면 숫자 전용 전처리를 거친다(위 함수 참고).
+    한글을 읽는 곳은 기존 동작 그대로 둔다 — 그쪽은 부분매칭이라 이미 관대하고,
+    전처리를 바꿨을 때의 영향을 측정하지 않았기 때문이다."""
     img = _watch_grab_region(region)
     if img is None:
         return ""
+    if numeric:
+        img = _prep_number_ocr(img)
     return " ".join(reader.readtext(img, detail=0)).replace(" ", "")
+
+
+# --- 판독 실패 진단용 크롭 저장 ---
+OCR_DUMP_DIR = os.path.join(LOG_DIR, "ocr_dump")
+OCR_DUMP_MAX = 40            # 폴더가 무한정 커지지 않게 상한
+_ocr_dump_count = 0
+
+
+def _dump_ocr_crop(tag, region, text):
+    """읽기에 실패했거나 수상한 값이 나온 **그 순간의 크롭**을 파일로 남긴다.
+    화면을 볼 수 없는 상태에서 원인을 가리는 유일한 방법이다 — 영역이 어긋난
+    것인지, 프레임이 튄 것인지, 정말 글자가 뭉개진 것인지는 그림을 봐야 안다."""
+    global _ocr_dump_count
+    if _ocr_dump_count >= OCR_DUMP_MAX:
+        return
+    try:
+        img = _watch_grab_region(region)
+        if img is None or not img.size:
+            return
+        os.makedirs(OCR_DUMP_DIR, exist_ok=True)
+        name = f"{tag}_{time.strftime('%H%M%S')}_{_ocr_dump_count:02d}.png"
+        path = os.path.join(OCR_DUMP_DIR, name)
+        ok, buf = cv2.imencode(".png", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        if ok:
+            buf.tofile(path)     # 한글 경로 대응(cv2.imwrite는 못 쓴다)
+            _ocr_dump_count += 1
+            print(f"    [진단] 판독 실패 크롭 저장: {path} (OCR='{text}')")
+    except Exception:
+        pass
 
 
 # 마지막으로 파싱한 살림망 수량. (cur, mx)면 성공, None이면 직전 실패/미파싱.
@@ -1133,6 +1207,7 @@ def _ocr_region(region):
 # 참조하는 곳이 없다.
 _last_tank = None
 _last_tank_ocr = ""   # 마지막으로 읽은 수량 OCR 원문(판독 실패 원인 추적용)
+_last_tank_max = None # 마지막으로 받아들인 살림망 최대치(바뀌면 한 번 더 확인)
 
 
 def read_tank_quantity(retries=4, delay=0.3):
@@ -1155,19 +1230,45 @@ def read_tank_quantity(retries=4, delay=0.3):
     맡긴다. `mx > 0`만 남기는데, 이건 오인식 휴리스틱이 아니라 구조적으로
     무의미한 값을 막는 것(max가 0이면 `cur >= mx-5`가 항상 참이라 회수가
     무한 반복된다)."""
-    global _last_tank_ocr
+    global _last_tank_ocr, _last_tank_max
+    votes = []
     for i in range(retries):
-        txt = _ocr_region(REGION_TANK_QTY)
+        txt = _ocr_region(REGION_TANK_QTY, numeric=True)
         if txt:
             _last_tank_ocr = txt
             m = re.search(r'(\d+)\D+(\d+)', txt)
             if m:
                 cur, mx = int(m.group(1)), int(m.group(2))
                 if mx > 0:
-                    return cur, mx
+                    votes.append((cur, mx))
+                    # 최대치가 직전과 같으면 그대로 신뢰(가장 흔한 정상 경로)
+                    if _last_tank_max is not None and mx == _last_tank_max:
+                        return cur, mx
         if i < retries - 1:
             time.sleep(delay)
-    return None
+
+    if not votes:
+        _dump_ocr_crop("tank_fail", REGION_TANK_QTY, _last_tank_ocr)
+        return None
+
+    # **최대치가 바뀌어 보이면 한 번 더 확인하고 받는다(260815c):**
+    # 낚싯대를 갈면 최대치가 실제로 바뀌므로 값을 버리면 안 되지만, '417/480'이
+    # '40/4'로 읽히는 식의 한 프레임 오인식도 최대치가 바뀐 것처럼 보인다.
+    # 그래서 **버리지 않고 같은 값이 두 번 나오는지**만 본다 — 진짜 교체는
+    # 계속 같은 값이 나오므로 통과하고, 한 번 튄 값은 걸러진다.
+    best = max(set(votes), key=votes.count)
+    if _last_tank_max is not None and best[1] != _last_tank_max \
+            and votes.count(best) < 2:
+        _dump_ocr_crop("tank_maxchange", REGION_TANK_QTY, _last_tank_ocr)
+        print(f"    [수량 재확인] 최대치가 {_last_tank_max} → {best[1]} 로 바뀐 것처럼 "
+              f"읽혔습니다(OCR='{_last_tank_ocr}'). 한 번 더 확인합니다.")
+        time.sleep(delay)
+        txt = _ocr_region(REGION_TANK_QTY, numeric=True)
+        m = re.search(r'(\d+)\D+(\d+)', txt or "")
+        if not m or int(m.group(2)) != best[1]:
+            return None            # 다음 사이클에 다시 읽는다
+    _last_tank_max = best[1]
+    return best
 
 
 def _tank_needs_collect(qty):
@@ -1186,18 +1287,26 @@ def _tank_needs_collect(qty):
 
 
 def _read_gain_time(region, retries=3, delay=0.2):
-    """획득 시간 영역('n초')에서 초를 읽는다. 실패면 None."""
+    """획득 시간 영역('n초')에서 초를 읽는다. 실패면 None.
+
+    **먼저 읽힌 값을 그냥 쓰지 않고 여러 프레임의 다수결로 고른다(260815c):**
+    '15초'가 한 프레임에서 '1초'로 튀는 사례가 있었는데, 첫 성공을 그대로
+    쓰면 그 한 번에 낚싯대를 갈아 끼우게 된다. 같은 비용(재시도 횟수)으로
+    가장 많이 나온 값을 고르는 편이 낫다."""
+    votes = []
     for i in range(retries):
-        txt = _ocr_region(region)
+        txt = _ocr_region(region, numeric=True)
         if txt:
             m = re.search(r'(\d+)', txt)
             if m:
                 sec = int(m.group(1))
                 if 0 < sec <= 600:
-                    return sec
+                    votes.append(sec)
         if i < retries - 1:
             time.sleep(delay)
-    return None
+    if not votes:
+        return None
+    return max(set(votes), key=votes.count)
 
 
 def read_min_gain_time(retries=3, delay=0.2):
