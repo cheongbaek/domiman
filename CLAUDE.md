@@ -37,6 +37,21 @@ os._exit는 그 정리를 건너뛴다. 저장은 os._exit 전에 동기로 끝�
   `domiman.spec`의 `hiddenimports`에 명시해야 묻어들여진다. 새 최상위
   `import`를 domiman.py에 추가하면 스펙의 hiddenimports도 같이 챙길 것
   (안 그러면 스크립트 모드에선 되는데 exe에서만 `ModuleNotFoundError`).
+- **⟳ 업데이트는 `domiman.py`만 갈아치우므로, 새 의존성은 "이미 설치된 exe에
+  들어 있는 것"에서만 고를 수 있다(설계 제약).** 번들에 없는 패키지를 쓰면 그
+  버전은 재설치할 때까지 **시작조차 못 한다.** 그래서 새 import를 넣기 전에
+  **설치된 exe를 직접 열어 확인한다**(재사용 방법):
+  ```
+  venv314\Scripts\python.exe   # PyInstaller가 있는 빌드용 인터프리터로
+  # CArchiveReader(exe)로 'PYZ.pyz'를 뽑고 ZlibArchiveReader(...).toc 를 본다
+  ```
+  260821a에 이렇게 실측한 결과(설치본 `C:\Program Files\domiman\domiman.exe`,
+  모듈 5492개): `base64` **있음** · `tkinter.filedialog` **있음** ·
+  `matplotlib` **없음**. → 스크린샷 기능이 matplotlib을 못 쓰고 tkinter+cv2로
+  간 근거가 이것이다. 스펙에는 그래도 `base64`·`tkinter.filedialog`를 적어
+  뒀다(다음 재빌드에서 확실히 남게).
+  ※ 순수 stdlib 일부(`struct` 등)는 PYZ가 아니라 `_internal\base_library.zip`
+  에 들어가므로 PYZ 목록에 없다고 빠진 것이 아니다.
 - 프리징 여부와 무관하게 `os.path.abspath(__file__)`은 실제 `domiman.py`
   경로로 정확히 해석됨(runpy가 `__file__`을 그 경로로 설정) — exe에서도
   `getattr(sys, 'frozen', False)`가 그대로 True로 유지되므로(부트로더가
@@ -535,6 +550,15 @@ finally의 `game_capture.stop()`이 상태확인 스레드와 TOCTOU로 충돌�
 체크박스는 원격에서 어차피 늘 봉인되므로 죽은 칸을 두는 대신 자리를 내준다.
 버튼은 응답 대기 중이거나 사진을 기다리는 중이면 봉인(`_apply_ui_locks`).
 
+**창 폭이 튀는 것을 막아야 한다(실측 함정):** '스크린샷' 버튼이 'domichat 메시지'
+체크박스보다 좁아서, 그냥 바꿔 끼우면 원격 진입/복귀 때마다 **창 너비가 20px씩
+줄었다 늘었다 한다**(`resizable(False, False)`라 내용이 폭을 정한다). 그래서
+`_build_widgets`에서 `f.columnconfigure(0, minsize=cb_chat.winfo_reqwidth() + 12)`
+로 그 칸의 최소 폭을 **체크박스 기준으로 못 박았다.** 픽셀을 상수로 적지 않고
+`winfo_reqwidth()`로 재는 이유는 폰트·DPI가 달라도 따라가게 하려는 것.
+두 버튼('스크린샷'·'실시간 수량확인')은 `sticky="w"`로 각자 제 폭을 쓴다 —
+`"ew"`로 늘리면 칸 전체를 채워 아래 버튼과 폭이 어긋난다.
+
 **흐름:**
 1. 제어 → `{대상},I` 발송(`pending` 15초 = 다른 명령과 동일).
 2. 피제어 → 즉시 `,Z,I` ack. 이어서 배경 스레드가 **실시간 수량확인과 똑같은
@@ -585,7 +609,19 @@ ntfy 기반이라 domichat 전환 자체가 미포팅). PC끼리만 동작한다
 클라이언트를 붙여 실제 게임 화면 PNG **2.23MB = 청크 35개**를 왕복시켜, 받은
 바이트가 원본과 **완전히 같음**을 확인했다(sha256 불일치는 거르고, 제어 대상이
 아닌 발신자의 이미지는 무시). 전송 시작·정지 타임아웃, 축소/1:1 표시, 저장 폴백도
-같이 확인했다.
+같이 확인했다. 레이아웃은 두 모드를 실제로 띄워 캡처해 눈으로 확인(창 폭 동일).
+
+**프로토콜을 또 고칠 때 쓸 e2e 방법(재사용):** `domiserver.py`를 **다른 폴더로
+복사해** 거기서 돌리면 `BASE_DIR`이 그 폴더가 되어 `domiserver.json`/`.db`도 그
+폴더 것을 쓴다 — **실서버 DB를 건드리지 않는다.** 그 폴더에
+`{"tls": false, "port": 47899}`를 두면 인증서(openssl) 없이 뜨고, domiman의
+`connect_secure`가 평문으로 알아서 폴백한다. 가입은 콘솔 승인제라 막히므로
+`db_init()` 후 `users` 테이블에 `hash_pw()`로 직접 넣는다. 서버를 띄울 때는
+`main()`이 아니라 `accept_loop`만 스레드로 돌린다(`repl()`이 stdin을 읽어 막힌다).
+**`PYTHONIOENCODING=utf-8`을 꼭 준다** — 서버 로그의 `—`를 cp949 콘솔에 찍다가
+`UnicodeEncodeError`로 죽는다(실제로 겪음). 클라이언트 쪽은 `DomimanApp`을 통째로
+띄우지 않고 `_on_file`·`_begin_shot_wait` 같은 메서드만 껍데기 객체에 붙여 쓰면
+GUI 없이 수신 경로를 그대로 검증할 수 있다.
 
 ---
 
@@ -1137,6 +1173,7 @@ foreground=투명). 구버전용 밀도별 `mipmap-*/ic_launcher(.round).png`도
 | `SHOT_PNG_LEVEL = 3` | `capture_game_png` | cv2 PNG 압축 레벨. 실측(1920x1080 게임 화면) lv1 2.31MB/98ms · **lv3 2.18MB/166ms** · lv6 2.01MB/512ms · lv9 1.94MB/3756ms → 크기 이득이 꺾이기 전 지점 |
 | 캡처 **1920x1080 고정** | 같은 곳 | QHD 원본을 보내지 않는다 — 매크로가 보는 그림과 같아 진단이 되고, 전송량이 해상도에 따라 들쭉날쭉해지지 않는다 |
 | `abort_sleep(3.0)` | `_screenshot_and_send` | 창을 불러 화면이 렌더될 시간. **실시간 수량확인과 같은 값**(같은 절차이므로 맞춘 것) |
+| `columnconfigure(0, minsize=cb_chat.winfo_reqwidth()+12)` | `_build_widgets` | 체크박스↔'스크린샷' 버튼 교체 때 창 폭이 20px 튀는 것을 막는다. **픽셀 상수로 바꾸지 말 것** — 폰트·DPI가 달라지면 어긋난다(`+12`는 그 칸 padx) |
 | `NTFY_SEND_DEADLINE = 8.0` | `ntfy_send` 재시도 예산 | 요청자(제어 PC·휴대폰)의 **응답 대기 15초 안에** 반드시 끝나야 한다. 늘리면 상대가 먼저 타임아웃돼 재시도가 무의미 |
 | `NTFY_SEND_ATTEMPTS = 3` | 같은 곳 | 네트워크 블립·5xx·순간 한도(42901)용. 429는 토큰 충전(5~10초당 1개)을 기다려야 의미가 있어 대기 5.0초, 그 외는 `1.5*시도` |
 | `NTFY_QUOTA_COOLDOWN = 900` | 일일 한도(42908) 감지 후 | 기다려도 회복 안 되는 실패라 **재시도 금지**. 계속 던지면 같은 버킷의 요청 토큰만 태운다. 15분마다 한 번씩만 다시 떠본다 |
