@@ -14,6 +14,7 @@ domiman.py — 테일즈러너 낚시 자동화 GUI (낚시.py의 GUI 재구성�
 - exe 패키징(콘솔 창 없이 GUI만):
     pyinstaller --noconsole --onedir --add-data "ocr_model;ocr_model" domiman.py
 """
+import base64
 import ctypes
 import hashlib
 import time
@@ -173,10 +174,25 @@ CHAT_PORT = 47821                       # domiserver 기본 포트
 ROOM_PREFIX = "domi_fishing_"
 ROOM_PW = "domi_fishing_9714"           # 고정(오진입 방지용)
 FRAME_HEAD = struct.Struct(">IB")       # [길이 4][종류 1] — domichat.md 참고
+FILE_HEAD = struct.Struct(">16sI")      # 'B'(이미지 청크) 머리: fid 16B + seq 4B
 MAX_FRAME = 1024 * 1024
+IMG_CHUNK = 64 * 1024                   # 청크 크기(서버 상한과 같음)
+IMG_MAX_BYTES = 32 * 1024 * 1024        # 이미지 최대 크기(서버 기본값과 같음)
 CONNECT_TIMEOUT = 6.0
 READ_TIMEOUT = 60.0                     # 서버 ping 15초 → 60초 침묵이면 죽은 연결
 RECONNECT_BACKOFF = (1, 2, 5, 10, 30)
+
+# --- 스크린샷(원격 'I' 명령) ---
+# 대기 시간은 세 단계다. 요청 응답(ack)은 다른 명령과 똑같이 15초(pending)를 쓰고,
+# 그 뒤 **전송 시작(file_begin)까지 15초**, 시작된 뒤에는 청크가 흐르는 동안 계속
+# 기다리다 **10초간 멈추면** 포기한다. 고정 시간 하나로 두면 안 되는 이유: 사진은
+# 2MB 남짓이라 느린 회선에서 15초를 넘길 수 있는데(다 받아놓고 잘리는 게 최악),
+# 진행이 있으면 기다리고 멈추면 접는 방식은 두 경우를 다 만족한다.
+SHOT_START_TIMEOUT = 15.0
+SHOT_STALL_TIMEOUT = 10.0
+SHOT_PNG_LEVEL = 3          # cv2 PNG 압축 레벨. 실측(1920x1080 게임 화면):
+                            # lv1 2.31MB/98ms · lv3 2.18MB/166ms · lv6 2.01MB/512ms
+                            # · lv9 1.94MB/3756ms → 크기 이득이 꺾이기 전 지점.
 
 chat_enabled = False                    # 'domichat 메시지' 체크박스와 연동
 MY_ID = ""                              # 로그인 ID(예전 PC 이름 자리)
@@ -346,10 +362,17 @@ class ChatClient:
         self.want = False
         self.first_try = True
         self.logged_in = threading.Event()
+        self.server_ver = 1       # welcome의 ver (1=텍스트만, 2=이미지 지원)
         self._send_lock = threading.Lock()
 
     # ---------- 저수준 ----------
     def _raw_send(self, sock, obj):
+        if isinstance(obj, tuple):          # ("B", fid, 프레임바이트) = 이미지 청크
+            obj = obj[2]
+        if isinstance(obj, bytes):          # 이미 프레임으로 만들어진 것
+            with self._send_lock:
+                sock.sendall(obj)
+            return
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         with self._send_lock:
             sock.sendall(FRAME_HEAD.pack(len(data), ord("T")) + data)
@@ -374,8 +397,15 @@ class ChatClient:
         body = self._recv_exact(sock, ln) if ln else b""
         if body is None:
             return None
-        if chr(typ) != "T":
-            return {}                      # 이미지 등 — 매크로는 쓰지 않는다
+        kind = chr(typ)
+        if kind == "B":                    # 이미지 청크 — 내부 이벤트 dict로 넘긴다
+            if len(body) < FILE_HEAD.size:
+                return {}
+            raw_fid, seq = FILE_HEAD.unpack(body[:FILE_HEAD.size])
+            return {"t": "bin", "fid": raw_fid.hex(), "seq": seq,
+                    "data": body[FILE_HEAD.size:]}
+        if kind != "T":
+            return {}
         return json.loads(body.decode("utf-8"))
 
     # ---------- 세션 ----------
@@ -428,6 +458,10 @@ class ChatClient:
                         self._raw_send(sock, {"t": "pong"})
                         continue
                     if t == "welcome":
+                        try:
+                            self.server_ver = int(d.get("ver") or 1)
+                        except (TypeError, ValueError):
+                            self.server_ver = 1
                         self.logged_in.set()
                         logged = True
                     self.q.put(d)
@@ -440,6 +474,9 @@ class ChatClient:
                 except Exception:
                     pass
                 self.sock = None
+
+            # 세션이 끝났으면 보내다 만 이미지 청크는 버린다(재접속 고리 방지)
+            self._drop_pending_chunks()
 
             if not self.want:
                 break
@@ -461,7 +498,10 @@ class ChatClient:
             try:
                 self._raw_send(sock, obj)
             except Exception:
-                self.txq.put(obj)          # 재연결 후 다시 보낸다
+                # 메시지는 되돌려 넣어 재연결 후 보내지만 **이미지 청크는 버린다**
+                # (이어 보낼 수 없고, 재접속 고리의 원인이 된다 — 아래 참고)
+                if not (isinstance(obj, tuple) and obj[0] == "B"):
+                    self.txq.put(obj)
                 return
 
     def send(self, obj, wait=False):
@@ -477,6 +517,30 @@ class ChatClient:
                 return False
         self.txq.put(obj)
         return True
+
+    def send_chunk(self, fid_hex, seq, data):
+        """이미지 청크를 프레임으로 만들어 송신 큐에 넣는다(순서 보장).
+        **fid를 함께 실어 둔다** — 연결이 끊기면 이 청크들은 버려야 한다."""
+        body = FILE_HEAD.pack(bytes.fromhex(fid_hex), seq) + data
+        self.txq.put(("B", fid_hex, FRAME_HEAD.pack(len(body), ord("B")) + body))
+
+    def _drop_pending_chunks(self):
+        """큐에 남은 이미지 청크를 전부 버린다.
+
+        **끊긴 뒤 다시 보내면 안 된다(domichat.md의 실제 사고):** 전송 중 연결이
+        끊기면 서버 쪽 전송 상태가 사라져 이어 보내도 의미가 없고, 상대가 이미지를
+        모르는 옛 서버면 'B' 프레임을 받는 즉시 연결을 끊는다. 큐에 청크가 남아
+        있으면 재접속할 때마다 그걸 다시 보내 **1초 간격 재접속 고리**에 빠진다."""
+        kept = []
+        while True:
+            try:
+                item = self.txq.get_nowait()
+            except queue.Empty:
+                break
+            if not (isinstance(item, tuple) and item[0] == "B"):
+                kept.append(item)
+        for item in kept:
+            self.txq.put(item)
 
     def logout(self):
         self.want = False
@@ -512,6 +576,36 @@ def chat_send(body, room=None, wait=False):
     return ok
 
 
+def chat_send_image(png, size, name, room=None):
+    """PNG 한 장을 방에 올린다(domichat 이미지 규격 그대로:
+    file_begin → 'B' 청크 × N → file_end). room을 안 주면 **내 방**(상태 보고용)으로
+    보낸다. 성공하면 fid, 못 보내면 None.
+
+    **서버 프로토콜 버전을 먼저 본다(함정):** 이미지를 모르는 옛 서버(ver 1)는 'B'
+    프레임을 받는 즉시 연결을 끊고, 그러면 큐에 남은 청크가 재접속마다 다시 나가
+    1초 간격 재접속 고리에 빠진다(domichat.md의 실제 사고)."""
+    if not chat_enabled or not CHAT.logged_in.is_set():
+        return None
+    if CHAT.server_ver < 2:
+        print("[발신 실패] 이 서버는 이미지 전송을 지원하지 않습니다(서버 업데이트 필요).")
+        return None
+    if not png or len(png) > IMG_MAX_BYTES:
+        print(f"[발신 실패] 이미지 크기가 규격을 벗어났습니다({len(png or b'')}바이트).")
+        return None
+    target = room or MY_ROOM
+    if not target:
+        return None
+    fid = os.urandom(16).hex()
+    CHAT.send({"t": "file_begin", "room": target, "fid": fid, "name": name,
+               "size": len(png), "sha256": hashlib.sha256(png).hexdigest(),
+               "w": size[0], "h": size[1]})
+    for i in range(0, len(png), IMG_CHUNK):
+        CHAT.send_chunk(fid, i // IMG_CHUNK, png[i:i + IMG_CHUNK])
+    CHAT.send({"t": "file_end", "room": target, "fid": fid})
+    print(f"[발신] 이미지 {name} ({len(png) // 1024}KB)")
+    return fid
+
+
 def send_report(code):
     """상황 보고 ',Z,F,(코드)' 발신 — 낚시 루틴(워커 스레드)에서 동기 호출.
     코드: s(루틴 시작) g(회수 성공) f(회수 실패)
@@ -534,7 +628,7 @@ def send_report(code):
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260815d"
+APP_VERSION = "260821a"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -644,6 +738,8 @@ STATUS_TEXT = {
     "nowindow":   "강태공이 낚싯대를 잃어버렸습니다.",
     "disconnect": "강태공이 물에 빠졌습니다.",
     "noresp":     "강태공이 의식을 잃었습니다.",
+    # 엑셀에 없는 추가분 — 원격 스크린샷을 기다리는 동안 표시(제어 PC 전용)
+    "shot":       "강태공이 사진을 찍고 있습니다.",
 }
 
 # 원격 보고(,Z,F,*) -> 로그 문구/상태 변환표. {name}=제어 중인 PC 이름.
@@ -1194,6 +1290,38 @@ def _watch_grab_region(region):
             if crop.size:
                 return cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
     return grab_region_rgb(region)
+
+
+def capture_game_png():
+    """게임 화면 전체를 1920x1080 PNG 바이트로. ((png, (w,h)), None) 또는 (None, 사유).
+
+    감시 모드 읽기와 **같은 경로(WGC)** 를 쓴다 — 다른 창이 게임을 가려도, 포커스가
+    없어도 찍히기 때문이다. WGC가 없으면 1080p에서만 pyautogui로 폴백한다(게임이
+    화면 (0,0)에 있다는 전제가 필요).
+
+    **1920x1080으로 고정하는 이유:** 화면이 QHD여도 매크로가 실제로 보는 그림과
+    같아 좌표 어긋남을 눈으로 진단할 수 있고, 해상도에 따라 전송량이 들쭉날쭉해지지
+    않는다(원본 QHD를 그대로 보내면 PNG가 2배 가까이 커진다)."""
+    frame = None
+    if _ensure_watch_capture() and game_capture is not None:
+        frame = game_capture.get_frame_1080()
+    if frame is None:
+        if CURRENT_RESOLUTION != "1080p":
+            return None, "게임 화면을 캡처하지 못했습니다(WGC 캡처 불가)."
+        try:
+            shot = pyautogui.screenshot(region=(0, 0, 1920, 1080))
+            frame = cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2BGR)
+        except Exception as e:
+            return None, f"화면 캡처에 실패했습니다({e})."
+    try:
+        ok, buf = cv2.imencode(".png", frame,
+                               [int(cv2.IMWRITE_PNG_COMPRESSION), SHOT_PNG_LEVEL])
+    except Exception as e:
+        return None, f"PNG 변환에 실패했습니다({e})."
+    if not ok:
+        return None, "PNG 변환에 실패했습니다."
+    h, w = frame.shape[:2]
+    return (buf.tobytes(), (w, h)), None
 
 
 OCR_NUM_SCALE = 3            # 숫자 영역 확대 배율(아래 실측 근거)
@@ -1938,6 +2066,161 @@ THEME = {
 }
 
 
+class ScreenshotWindow:
+    """받은 스크린샷을 보여주는 별도 창(표시 + 확대/축소 + 저장 + 클립보드).
+
+    **matplotlib을 쓰지 않는다(중요):** domiman.spec의 excludes에 들어 있고, ⟳
+    업데이트는 domiman.py 한 파일만 갈아치우므로 **exe 사용자는 새 의존성을 받을 수
+    없다**(재설치 전까지 ModuleNotFoundError). 이미 번들에 있는 tkinter와 cv2만으로
+    같은 일을 한다 — 표시는 Canvas + PhotoImage(PNG), 배율·저장·클립보드는 cv2.
+    """
+
+    def __init__(self, app, png, name):
+        self.app = app
+        self.png = png                     # 원본 PNG 바이트(저장은 항상 이것)
+        self.name = name if name.lower().endswith(".png") else name + ".png"
+        self.fit = True                    # True=창에 맞춤, False=1:1
+        self.photo = None                  # PhotoImage 참조 유지(GC로 사라지면 빈 창)
+        self.bgr = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
+        if self.bgr is None:
+            print("[오류] 스크린샷을 읽지 못했습니다(PNG 손상).")
+            return
+
+        t = THEME["dark" if app.dark else "light"]
+        self.top = top = tk.Toplevel(app.root)
+        top.title(f"스크린샷 — {self.name}")
+        top.configure(bg=t["bg"])
+        try:
+            top.iconbitmap(ICON_PATH)
+        except Exception:
+            pass
+
+        bar = tk.Frame(top, bg=t["bg"])
+        bar.pack(fill="x", padx=8, pady=(8, 4))
+        self.bt_zoom = tk.Button(bar, text="1:1 보기", font=FONT, bg=BTN_GRAY,
+                                 command=self.toggle_zoom)
+        self.bt_zoom.pack(side="left")
+        tk.Button(bar, text="저장", font=FONT, bg=BTN_GRAY,
+                  command=self.save).pack(side="left", padx=(6, 0))
+        tk.Button(bar, text="클립보드 복사", font=FONT, bg=BTN_GRAY,
+                  command=self.copy_clipboard).pack(side="left", padx=(6, 0))
+        tk.Button(bar, text="닫기", font=FONT, bg=BTN_GRAY,
+                  command=top.destroy).pack(side="right")
+
+        wrap = tk.Frame(top, bg=t["bg"])
+        wrap.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.canvas = tk.Canvas(wrap, bg=t["log_bg"], highlightthickness=0)
+        sy = tk.Scrollbar(wrap, orient="vertical", command=self.canvas.yview)
+        sx = tk.Scrollbar(wrap, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        sy.grid(row=0, column=1, sticky="ns")
+        sx.grid(row=1, column=0, sticky="ew")
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+        self._render()
+
+    # ---------- 표시 ----------
+    def _view_limit(self):
+        """창이 화면을 넘지 않도록 하는 표시 한도(가로, 세로)."""
+        sw = max(640, int(self.top.winfo_screenwidth() * 0.85))
+        sh = max(480, int(self.top.winfo_screenheight() * 0.85) - 90)  # 버튼 줄 여유
+        return sw, sh
+
+    def _render(self):
+        h, w = self.bgr.shape[:2]
+        maxw, maxh = self._view_limit()
+        r = min(1.0, maxw / w, maxh / h) if self.fit else 1.0
+        vw, vh = max(1, int(w * r)), max(1, int(h * r))
+        img = (self.bgr if r >= 1.0
+               else cv2.resize(self.bgr, (vw, vh), interpolation=cv2.INTER_AREA))
+        # 표시용은 다시 인코딩한다(축소본이라 압축 레벨 1로 충분히 작고 빠르다)
+        ok, buf = cv2.imencode(".png", img, [int(cv2.IMWRITE_PNG_COMPRESSION), 1])
+        if not ok:
+            print("[오류] 스크린샷을 표시하지 못했습니다.")
+            return
+        self.photo = tk.PhotoImage(
+            data=base64.b64encode(buf.tobytes()).decode("ascii"))
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
+        self.canvas.configure(scrollregion=(0, 0, vw, vh),
+                              width=min(vw, maxw), height=min(vh, maxh))
+        self.bt_zoom.configure(text="1:1 보기" if self.fit else "창에 맞춤")
+
+    def toggle_zoom(self):
+        self.fit = not self.fit
+        self._render()
+
+    # ---------- 꺼내기 ----------
+    def save(self):
+        """원본 PNG를 파일로. 대화상자를 못 열면 로그 폴더에 그대로 떨군다
+        (exe 번들에 tkinter.filedialog가 없을 수도 있어 지연 임포트 + 폴백)."""
+        path = None
+        try:
+            from tkinter import filedialog
+            path = filedialog.asksaveasfilename(
+                parent=self.top, title="스크린샷 저장", initialdir=LOG_DIR,
+                initialfile=self.name, defaultextension=".png",
+                filetypes=[("PNG 이미지", "*.png")])
+            if not path:
+                return                     # 사용자가 취소
+        except Exception:
+            path = os.path.join(LOG_DIR, self.name)
+        try:
+            with open(path, "wb") as fp:
+                fp.write(self.png)
+            print(f"[스크린샷] 저장했습니다: {path}")
+        except Exception as e:
+            print(f"[오류] 스크린샷 저장 실패: {e}")
+
+    def copy_clipboard(self):
+        """클립보드에 이미지로 넣는다(Windows CF_DIB). BMP로 인코딩한 뒤 앞의 파일
+        헤더 14바이트를 떼어 DIB로 만든다 — domichat과 같은 방식이며, 여기서는
+        Pillow 대신 cv2로 인코딩한다.
+
+        **GlobalAlloc/GlobalLock의 restype을 반드시 지정해야 한다(64비트 함정):**
+        ctypes 기본 반환형이 32비트 int라 핸들·포인터가 잘려 조용히 실패한다."""
+        ok, buf = cv2.imencode(".bmp", self.bgr)
+        if not ok:
+            print("[오류] 클립보드 복사 실패(BMP 변환)")
+            return
+        dib = buf.tobytes()[14:]
+        CF_DIB, GMEM_MOVEABLE = 8, 0x0002
+        u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+        k32.GlobalAlloc.restype = ctypes.c_void_p
+        k32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+        k32.GlobalLock.restype = ctypes.c_void_p
+        k32.GlobalLock.argtypes = [ctypes.c_void_p]
+        k32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        k32.GlobalFree.argtypes = [ctypes.c_void_p]
+        u32.OpenClipboard.argtypes = [ctypes.c_void_p]
+        u32.SetClipboardData.restype = ctypes.c_void_p
+        u32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+        try:
+            if not u32.OpenClipboard(None):
+                raise OSError("클립보드를 열 수 없습니다")
+            try:
+                u32.EmptyClipboard()
+                h = k32.GlobalAlloc(GMEM_MOVEABLE, len(dib))
+                if not h:
+                    raise OSError("메모리 확보 실패")
+                ptr = k32.GlobalLock(h)
+                if not ptr:
+                    k32.GlobalFree(h)
+                    raise OSError("메모리 잠금 실패")
+                ctypes.memmove(ptr, dib, len(dib))
+                k32.GlobalUnlock(h)
+                if not u32.SetClipboardData(CF_DIB, h):
+                    k32.GlobalFree(h)      # 실패면 메모리 소유권이 넘어가지 않았다
+                    raise OSError("클립보드 쓰기 실패")
+            finally:
+                u32.CloseClipboard()
+        except Exception as e:
+            print(f"[오류] 클립보드 복사 실패: {e}")
+            return
+        print("[스크린샷] 클립보드에 복사했습니다.")
+
+
 class DomimanApp:
     def __init__(self, root):
         self.root = root
@@ -1970,6 +2253,7 @@ class DomimanApp:
         self._login_top = None           # 로그인 창
         self.my_room_ready = False       # 내 방(피제어용) 준비 완료 여부
         self.joining_room = None         # 제어 대상 방 입장 시도 중
+        self.shot_wait = None            # 스크린샷 대기 상태(제어 측)
 
         root.title("domiman.py")
         try:
@@ -2061,6 +2345,18 @@ class DomimanApp:
         self.cb_chat = tk.Checkbutton(f, text="domichat 메시지", font=FONT,
                                       variable=self.var_chat, command=self.on_chat_toggle)
         self.cb_chat.grid(row=4, column=0, sticky="w", **pad)
+
+        # 원격 제어 모드에서 위 체크박스 자리를 그대로 차지하는 버튼(같은 칸).
+        # 그 체크박스는 원격에서 늘 봉인되므로 죽은 칸을 두는 대신 여기에 둔다.
+        # 바꿔 끼우는 것은 _update_remote_widgets().
+        self.bt_shot = tk.Button(f, text="스크린샷", font=FONT, bg=BTN_GRAY,
+                                 command=self.on_screenshot)
+        self.bt_shot.grid(row=4, column=0, sticky="w", **pad)
+        self.bt_shot.grid_remove()
+        # 버튼이 체크박스보다 좁아서, 그냥 바꿔 끼우면 원격 모드에서 **창 너비가
+        # 20px쯤 줄어 창이 튄다**(resizable(False)라 내용이 폭을 정한다). 이 칸의
+        # 최소 폭을 체크박스 기준으로 못 박아 두 모드의 창 크기를 같게 유지한다.
+        f.columnconfigure(0, minsize=self.cb_chat.winfo_reqwidth() + 12)
 
         self.var_rod = tk.BooleanVar(value=True)
         self.cb_rod = tk.Checkbutton(f, text="낚싯대 자동교체", font=FONT,
@@ -2194,7 +2490,8 @@ class DomimanApp:
         self.txt_log.configure(bg=t["log_bg"], fg=t["fg"], insertbackground=t["fg"])
         # 버튼은 회색 유지, 시작/중지 색 불변
         for bt in (self.bt_pc, self.bt_update, self.bt_res_manual, self.bt_res_auto,
-                   self.bt_tank_check, self.bt_sched_exit, self.bt_collect_now,
+                   self.bt_tank_check, self.bt_shot, self.bt_sched_exit,
+                   self.bt_collect_now,
                    self.bt_dark, self.bt_exit, self.bt_log_fold, self.bt_log_clear,
                    self.bt_log_export, self.bt_login, self.bt_logout):
             bt.configure(bg=BTN_GRAY, fg="black")
@@ -2553,6 +2850,126 @@ class DomimanApp:
 
         threading.Thread(target=_bg, daemon=True).start()
 
+    # ---------- 스크린샷 (원격 'I') ----------
+    def _screenshot_and_send(self, reply):
+        """피제어 측 처리: 게임 창을 앞으로 불러 화면을 찍어 **내 방**(상태 보고용)에
+        올린다. 절차는 실시간 수량확인과 같다(창 호출 → 3초 렌더 대기 → 캡처).
+        실패하면 ',Z,I,fail'로 알려 요청자가 헛되게 기다리지 않게 한다."""
+        def _bg():
+            try:
+                bring_game_to_front(GAME_KEYWORD)
+                abort_sleep(3.0)        # 창이 떠 화면이 렌더될 시간(수량확인과 동일)
+                res, err = capture_game_png()
+                if res is None:
+                    print(f"[스크린샷] {err}")
+                    reply("I,fail")
+                    return
+                png, size = res
+                name = f"shot_{MY_ID or 'domiman'}_{time.strftime('%Y%m%d_%H%M%S')}.png"
+                if chat_send_image(png, size, name) is None:
+                    reply("I,fail")
+                    return
+                print(f"[스크린샷] {size[0]}x{size[1]} 화면을 올렸습니다.")
+            except RoutineAborted:
+                print("[중지] 스크린샷을 중단했습니다.")
+                reply("I,fail")
+            except Exception:
+                traceback.print_exc()
+                reply("I,fail")
+            finally:
+                # 내가 이번에 켠 캡처는 정리(워커가 돌면 워커 소유이므로 두고 나온다)
+                if (not self._running() and game_capture is not None
+                        and game_capture.is_running):
+                    game_capture.stop()
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def on_screenshot(self):
+        """'스크린샷' 버튼(원격 제어 모드 전용) — I 명령을 보내고 사진을 기다린다.
+        직접 제어 모드에서는 이 자리에 'domichat 메시지' 체크박스가 있어 눌릴 일이 없다."""
+        if not self.remote_target or self.pending is not None:
+            return
+        if self.shot_wait is not None:
+            print("[스크린샷] 이미 요청한 사진을 기다리는 중입니다.")
+            return
+        self._send_command("I", "I")
+
+    def _begin_shot_wait(self):
+        """ack를 받았다 — 이제 이미지 도착을 기다린다(상태 문구는 대기 중 표시)."""
+        self.shot_wait = {"t0": time.time(), "last": time.time(), "fid": None,
+                          "size": 0, "prev": self.current_status_key}
+        self.set_status("shot")
+        self._apply_ui_locks()
+
+    def _end_shot_wait(self):
+        """스크린샷 대기 종료(성공·실패·시간 초과 공통). 직전 상태 문구로 되돌린다."""
+        w, self.shot_wait = self.shot_wait, None
+        if w and self.current_status_key == "shot":
+            self.set_status(w.get("prev") or "idle")
+        self._apply_ui_locks()
+        return w
+
+    def _check_shot_timeout(self):
+        """스크린샷 대기 시간 초과 검사(250ms 주기).
+
+        전송이 시작되기 전에는 SHOT_START_TIMEOUT, 시작된 뒤에는 청크가 끊긴 채
+        SHOT_STALL_TIMEOUT 만큼 지나면 접는다 — 2MB 남짓한 사진이 느린 회선에서
+        다 받아놓고 잘리는 일을 막으면서, 멈춘 전송은 확실히 끝낸다."""
+        w = self.shot_wait
+        if w is None:
+            return
+        if w["fid"] is None:
+            if time.time() - w["t0"] <= SHOT_START_TIMEOUT:
+                return
+            print("[스크린샷] 사진이 도착하지 않았습니다.")
+        else:
+            if time.time() - w["last"] <= SHOT_STALL_TIMEOUT:
+                return
+            got = len(w.get("buf") or b"")
+            print(f"[스크린샷] 전송이 멈췄습니다({got // 1024}/{w['size'] // 1024}KB).")
+        self._end_shot_wait()
+        self._flash_noresp()
+
+    def _on_file(self, t, d):
+        """스크린샷 이미지 수신(file_begin → bin × N → file_end).
+        기다리는 중이 아니거나 제어 대상이 보낸 것이 아니면 버린다(메모리 보호)."""
+        w = self.shot_wait
+        if w is None or not self.remote_target:
+            return
+        fid = d.get("fid")
+        if t == "file_begin":
+            if (d.get("from") != self.remote_target
+                    or d.get("room") != room_of(self.remote_target)):
+                return
+            w.update({"fid": fid, "size": int(d.get("size") or 0),
+                      "sha256": d.get("sha256"), "buf": bytearray(),
+                      "name": d.get("name") or "screenshot.png",
+                      "last": time.time()})
+            print(f"[스크린샷] 사진을 받는 중입니다... ({w['size'] // 1024}KB)")
+            return
+        if fid is None or fid != w["fid"]:
+            return                          # 다른 전송 — 무시
+        if t == "bin":
+            w["buf"] += d.get("data", b"")
+            w["last"] = time.time()
+            return
+        if t == "file_abort":
+            self._end_shot_wait()
+            print("[스크린샷] 전송이 중단되었습니다.")
+            return
+
+        # file_end — 크기·sha256을 확인하고 창을 띄운다
+        png, name = bytes(w["buf"]), w["name"]
+        ok = (not w["size"] or len(png) == w["size"])
+        if ok and w.get("sha256"):
+            ok = hashlib.sha256(png).hexdigest() == w["sha256"]
+        self._end_shot_wait()
+        if not ok:
+            print("[스크린샷] 사진이 깨져서 도착했습니다. 다시 요청하세요.")
+            return
+        print(f"[스크린샷] 도착했습니다({len(png) // 1024}KB).")
+        ScreenshotWindow(self, png, name)
+
     def on_tank_check(self):
         """'실시간 수량확인' 버튼. 로컬이면 창을 불러 수량과 낚시 상태를 함께
         새로 확인(대기 중 = '낚시 시작'이면 자동 재개), 원격이면 N 명령 발송.
@@ -2648,6 +3065,7 @@ class DomimanApp:
         except queue.Empty:
             pass
         self._check_pending_timeout()
+        self._check_shot_timeout()
         self.root.after(250, self._poll_chat_queue)
 
     def _on_chat_event(self, d):
@@ -2679,6 +3097,8 @@ class DomimanApp:
             if frm == MY_ID:
                 return                      # 서버는 발신자에게도 돌려준다 — 내 것은 무시
             return self._dispatch_msg(frm, d.get("body", ""))
+        if t in ("file_begin", "bin", "file_end", "file_abort"):
+            return self._on_file(t, d)      # 원격 스크린샷 수신
         if t == "ok":
             of = d.get("of")
             if of == "room_create":
@@ -2819,7 +3239,7 @@ class DomimanApp:
     def _handle_command(self, sender, args, raw):
         """원격 명령 실행(메인 스레드). sender=""이면 무명(휴대폰 등) 요청."""
         cmd = args[0]
-        if cmd not in ("S", "G", "P", "Y", "W", "Q", "V", "T", "C", "N"):
+        if cmd not in ("S", "G", "P", "Y", "W", "Q", "V", "T", "C", "N", "I"):
             return                     # 규격 외 — 무시
         print(f"[원격 명령] {raw} (from '{sender or '무명'}')")
 
@@ -2905,6 +3325,17 @@ class DomimanApp:
             self._tank_check_and_resume(lambda qty: reply(
                 "N," + (f"{qty[0]},{qty[1]}" if qty is not None else "fail")))
 
+        elif cmd == "I":
+            # 스크린샷: 먼저 ack(',Z,I')를 보내고 배경 스레드에서 찍어 방에 올린다.
+            # OCR은 필요 없다(글자를 읽지 않는다) — 해상도 감지 실패 상태의 화면을
+            # 눈으로 확인하는 것이 이 기능의 존재 이유이므로 준비 상태를 따지지 않는다.
+            if CHAT.server_ver < 2:
+                print("[스크린샷] 이 서버는 이미지 전송을 지원하지 않습니다.")
+                reply("I,fail")
+                return
+            reply("I")                 # 명령 수신 ack — 사진은 이어서 올라간다
+            self._screenshot_and_send(reply)
+
     # ---------- 제어(요청) 측 ----------
     def _send_command(self, cmdbody, kind):
         """제어 명령 발송 + 응답 대기(pending) 진입. 대기 중엔 대부분 봉인."""
@@ -2978,6 +3409,16 @@ class DomimanApp:
         elif first == "W":
             print(f"[원격] {self.remote_target}가 즉시 회수 명령을 받았습니다.")
             self.set_status("collect3")
+        elif first == "I":
+            # 스크린샷: ack면 사진이 올라올 때까지 기다리고, fail이면 즉시 접는다
+            if len(rest) >= 2 and rest[1] == "fail":
+                if self.shot_wait is not None:
+                    self._end_shot_wait()
+                print(f"[스크린샷] {self.remote_target}가 화면을 캡처하지 못했습니다.")
+            else:
+                print(f"[스크린샷] {self.remote_target}가 화면을 찍고 있습니다. "
+                      "사진을 기다립니다...")
+                self._begin_shot_wait()
         elif first == "N":
             # 수량 응답: rest = ['N','12','470'] 또는 ['N','fail']
             if len(rest) >= 3:
@@ -3148,6 +3589,7 @@ class DomimanApp:
         self.remote_running_shown = False
         self.remote_exit_deadline = None
         self.bt_pc.configure(text=target)
+        self._update_remote_widgets()
         self._set_start_button_remote()
         self.joining_room = room_of(target)
         print(f"\n[원격] '{target}' 제어를 시작합니다. 채팅방에 입장합니다...")
@@ -3164,6 +3606,8 @@ class DomimanApp:
         self.pending = None
         self.remote_running_shown = None
         self.remote_exit_deadline = None
+        self.shot_wait = None          # 기다리던 사진은 포기한다(대상이 사라졌으므로)
+        self._update_remote_widgets()
         if self._timer_debounce_id is not None:
             self.root.after_cancel(self._timer_debounce_id)
             self._timer_debounce_id = None
@@ -3192,6 +3636,17 @@ class DomimanApp:
         self._apply_ui_locks()
         print("[원격] 이 PC 제어로 복귀했습니다.")
 
+    def _update_remote_widgets(self):
+        """'domichat 메시지' 체크박스 칸을 모드에 따라 바꿔 끼운다(같은 grid 칸).
+        직접 제어 모드 = 체크박스, 원격 제어 모드 = '스크린샷' 버튼.
+        (그 체크박스는 원격에서 늘 봉인되므로 자리를 내주는 편이 낫다)"""
+        if self.remote_target:
+            self.cb_chat.grid_remove()
+            self.bt_shot.grid()
+        else:
+            self.bt_shot.grid_remove()
+            self.cb_chat.grid()
+
     def _set_start_button_remote(self, waiting=False):
         """원격 모드 시작/중지 버튼 표시 갱신. waiting=응답 대기(회색 '대기')."""
         if waiting:
@@ -3218,8 +3673,11 @@ class DomimanApp:
 
         st(self.bt_pc, not running)
         st(self.bt_update, not running)
-        # 'domichat 메시지' — 원격에선 항상 봉인, 로컬에선 실행 중 봉인
+        # 'domichat 메시지' — 원격에선 애초에 '스크린샷' 버튼으로 바뀌어 가려진다
+        # (_update_remote_widgets). 로컬에선 실행 중 봉인.
         st(self.cb_chat, (not running) and (not remote))
+        # '스크린샷'(원격 전용) — 응답 대기 중이거나 사진을 기다리는 중이면 봉인
+        st(self.bt_shot, remote and not pending and self.shot_wait is None)
         # 로그인/로그아웃은 **낚시 중에도 잠그지 않는다** — 원격 제어가 끊겼을 때
         # 되살릴 수단이 필요하기 때문이다. 원격 제어 중에만 봉인한다.
         st(self.bt_login, not remote and not MY_ID)

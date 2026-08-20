@@ -44,8 +44,10 @@ hiddenimports += ['win32gui', 'win32con', 'win32api', 'win32process']
 # 검사: python scripts/check_domiman_spec.py
 hiddenimports += ['pyautogui', 'requests', 'numpy',
                    'tkinter', 'tkinter.font', 'tkinter.messagebox',
+                   # 스크린샷 창의 '저장' 버튼(지연 임포트 — 없으면 고정 경로 폴백)
+                   'tkinter.filedialog',
                    # domichat 통신에 쓰는 것들(260815a 이식분)
-                   'ssl', 'struct', 'hashlib',
+                   'ssl', 'struct', 'hashlib', 'base64',
                    # 표준 라이브러리(다른 패키지에 딸려 들어오지만 명시해 둔다)
                    'ctypes', 'json', 'os', 'queue', 'random', 're', 'socket',
                    'subprocess', 'sys', 'threading', 'time', 'traceback',
