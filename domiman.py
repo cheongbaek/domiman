@@ -628,7 +628,7 @@ def send_report(code):
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260822b"
+APP_VERSION = "260822c"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -704,7 +704,17 @@ BAIT_USE_BTNS = [
 ]
 BAIT_COL_X = (715, 878, 1041, 1204)
 BAIT_NAME_ROW_Y = (503, 660)
-BAIT_TARGET_PATTERN = r"[갯개]지[렁렇령]"   # '갯지렁이' OCR 오인식 흡수
+# '황금 갯지렁이'를 찾는 패턴. **'갯'을 믿지 않는다(260822c 실측):** 같은 칸을
+# 전처리 5가지로 읽어 보니 '갯'이 **한 번도 맞지 않았다** —
+#   팔금개지렇미 · 활금개지렇미 · 왕금켓지렇이 · 왕금것지렇이 · 활금캠지렇미
+# (개/켓/것/캠). 반면 **'금'은 5번 전부 살아남았다.** 옛 패턴
+# `[갯개]지[렁렇령]`은 5번 중 2번만 걸려 미끼 교체가 대상을 놓치고 좌상단
+# 폴백을 쓰곤 했다. 그래서 **살아남는 음절('금')을 축으로 잡고** 그 뒤 2글자
+# 안에 '지렁이'꼴이 오는지 본다. 오인식 종류를 나열하는 방식(`[갯개것켓캠]`)도
+# 같은 5/5였지만, 새 오인식이 나오면 또 뚫린다는 점에서 이쪽이 낫다.
+# 실측: 판독 40건에서 적중 5/5 · 오검출 0. 영역 통째로 읽는 실제 경로에서도
+# 전처리 6가지 전부 적중했다.
+BAIT_TARGET_PATTERN = r"금.{0,2}지[렁렇령]"
 BAIT_MAX_PAGE_MOVES = 4
 
 # --- 낚싯대 자동 교체 ---
@@ -1351,9 +1361,9 @@ def _prep_number_ocr(img, scale=OCR_NUM_SCALE):
     return cv2.cvtColor(cv2.cvtColor(big, cv2.COLOR_RGB2GRAY), cv2.COLOR_GRAY2RGB)
 
 
-def _ocr_number_img(img, scaled=True):
+def _ocr_number_img(img, scale=1):
     r"""**이미 잘라 놓은** 크롭 하나를 읽어 공백 없는 문자열로 돌려준다.
-    `scaled=False`면 x3 전처리를 거치지 않고 원본 배율로 읽는다.
+    `scale`은 확대 배율(1=원본). 흑백 변환은 어느 배율에서도 한다.
 
     **왜 두 경로가 필요한가 (260822a 실측 — 전처리 4종을 표본 전부에 돌림):**
     획득 시간 16케이스(1·5·10·11·12·15·20·30·40·60·70초, QHD 원본 포함)와
@@ -1377,11 +1387,22 @@ def _ocr_number_img(img, scaled=True):
     (`244/470` -> `2441470`, `44/470` -> `441470`). 그러면 `(\d+)\D+(\d+)`가
     안 맞아 '판독 실패'가 된다. '수상한지'를 판정하는 방법은 값의 종류마다
     달라서 호출부가 정한다 — 수량은 위 정규식, 획득 시간은 글자 폭
-    (`_span_agrees`)이다."""
+    (`_span_agrees`)이다.
+
+    **주 경로는 원본 배율(x1)이다 — 260822c에서 뒤집었다.** 260822a까지는 x3가
+    주 경로였는데, x3가 유발한 실패가 셋이나 쌓였고 **세 번 모두 원본 배율은
+    정확했다**:
+        `'11초'`  -> x3 `'1초'`(확신도 0.99)   / 원본 `'11초'`
+        `244/470` -> x3 `'2441470'`(슬래시→1) / 원본 `244/470`
+        `112/570` -> x3 `'712/570'`(1→7 치환) / 원본 `112/570`(확신도 1.00)
+    마지막 것이 실제로 `cur > mx`를 만들어 낚싯대 교체를 유발했다. x3를 고른
+    260815c의 측정은 표본을 **인위적으로 0.5~0.6배로 흐리게 만들어** 비교한
+    것이라, 실제 실패 모드(선명한 화면에서의 오인식)를 대변하지 못했다.
+    x3는 흐린 화면용 **폴백**으로 남긴다."""
     if img is None or not img.size:
         return ""
-    src = _prep_number_ocr(img, OCR_NUM_SCALE if scaled else 1)
-    return " ".join(reader.readtext(src, detail=0)).replace(" ", "")
+    return " ".join(reader.readtext(_prep_number_ocr(img, scale),
+                                   detail=0)).replace(" ", "")
 
 
 def _ocr_region(region):
@@ -1489,19 +1510,21 @@ TANK_QTY_RE = r'(\d+)\D+(\d+)'      # 'cur/mx' — 구분자는 숫자가 아니
 def _read_tank_text():
     """살림망 수량 영역을 한 번 읽어 'cur/mx' 꼴 문자열을 돌려준다.
 
-    **x3 확대는 슬래시를 숫자 '1'로 바꿔 놓는다(260822a, 실측).** 설치본
-    `ocr_dump/`에 '판독 실패'로 남아 있던 크롭 중 사람 눈에 또렷한 12장이 전부
-    이 모양이었다: `244/470` -> '2441470', `44/470` -> '441470'. 구분자가 숫자가
-    되면 `TANK_QTY_RE`가 안 맞아 판독 실패로 처리된다. **같은 프레임을 원본
-    배율로** 읽으니 12/12 정확했다.
+    **원본 배율로 먼저 읽고, 정규식이 안 맞을 때만 x3로 한 번 더 읽는다.**
+    260822a까지는 순서가 반대였는데, x3 확대가 **슬래시를 숫자 '1'로 바꿔
+    놓는다**(실측): 설치본 `ocr_dump/`에 '판독 실패'로 남아 있던 크롭 중 사람
+    눈에 또렷한 12장이 전부 이 모양이었다 — `244/470` -> '2441470',
+    `44/470` -> '441470'. 구분자가 숫자가 되면 `TANK_QTY_RE`가 안 맞는다.
+    **원본 배율은 12/12 정확했고 x3는 0/12였다.** 게다가 `112/570`을
+    `'712/570'`으로 읽어(1->7 치환, 확신도 0.87) 낚싯대 교체까지 유발했다 —
+    그 크롭도 원본 배율은 확신도 1.00으로 정확했다.
 
-    그래도 배율을 갈아치우지 않고 **정규식이 안 맞을 때만** 한 번 더 읽는다 —
-    화면이 흐릴 때 x3가 주는 이득(260815c 실측)을 그대로 남기려는 것이다.
-    정상 화면에서는 추가 판독이 나가지 않으므로 비용도 늘지 않는다."""
+    x3는 **흐린 화면용 폴백**으로 남긴다(260815c의 이득을 버리지 않는다).
+    정상 화면에서는 첫 판독에서 끝나므로 비용도 늘지 않는다."""
     img = _watch_grab_region(REGION_TANK_QTY)
-    txt = _ocr_number_img(img, scaled=True)
+    txt = _ocr_number_img(img, scale=1)
     if not re.search(TANK_QTY_RE, txt or ""):
-        alt = _ocr_number_img(img, scaled=False)
+        alt = _ocr_number_img(img, scale=OCR_NUM_SCALE)
         if re.search(TANK_QTY_RE, alt or ""):
             return alt
     return txt
@@ -1607,12 +1630,13 @@ def _read_gain_time(region, retries=3, delay=0.2):
     100% 재현되며, **확신도로는 못 거른다**(오답 0.99 > 정답 0.47). 프레임 튐이
     아니므로 다시 읽어도 같은 답이 나와 `_confirm_rod_expiry`의 재판독마저
     통과해 버린다. 그래서 OCR 대신 **글자 폭을 직접 재서** 자릿수가 맞는지
-    본다(`_ink_span_fhd`). 어긋나면 같은 프레임을 원본 배율로 한 번 더 읽는데,
-    이 오인식은 x3 확대가 만드는 것이라 배율을 바꾸면 맞는다:
-        '11초' -> x3+흑백 '1초'(오답) / 원본+흑백 '11초'(정답)
-        '70초' -> x3+흑백 '70초'(정답) / 원본+흑백 '7초'(오답)
-    **양방향으로 깨지므로 배율을 갈아치우는 것으로는 못 고친다** — 폭이 심판을
+    본다(`_ink_span_fhd`). 어긋나면 같은 프레임을 **다른 배율로** 한 번 더
+    읽는다 — 이 오인식은 확대가 만드는 것이라 배율을 바꾸면 맞는다:
+        '11초' -> 원본 '11초'(정답) / x3 '1초'(오답)
+        '70초' -> 원본 '7초'(오답)  / x3 '70초'(정답)
+    **양방향으로 깨지므로 어느 배율도 혼자서는 안전하지 않다** — 폭이 심판을
     봐야 두 경우가 다 맞는다(표본 16케이스 전부 정답, `_ocr_number_img` 참고).
+    주 경로는 원본 배율이다(260822c에서 뒤집음 — 그쪽 주석의 실패 3건 참고).
 
     **동표면 값을 버린다:** 예전엔 `max(set(...), key=count)`가 1표씩 갈린
     경우(예: 1초와 15초가 각 1표)를 set 순서대로 임의로 골라, 튄 값 하나가
@@ -1623,9 +1647,9 @@ def _read_gain_time(region, retries=3, delay=0.2):
     for i in range(retries):
         img = _watch_grab_region(region)
         span = _ink_span_fhd(img, region[2])
-        sec = _parse_gain_sec(_ocr_number_img(img, scaled=True))
+        sec = _parse_gain_sec(_ocr_number_img(img, scale=1))
         if not _span_agrees(sec, span):
-            alt = _parse_gain_sec(_ocr_number_img(img, scaled=False))
+            alt = _parse_gain_sec(_ocr_number_img(img, scale=OCR_NUM_SCALE))
             sec = alt if _span_agrees(alt, span) else None
         if sec is not None:
             votes.append(sec)
