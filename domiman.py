@@ -628,7 +628,7 @@ def send_report(code):
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260822a"
+APP_VERSION = "260822b"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -1897,13 +1897,19 @@ def _restart_or_collect_after_rod_swap():
     return True
 
 
-def run_rod_swap_routine():
+def run_rod_swap_routine(reason="사유 미기재"):
     """낚싯대 자동 교체: ESC 3회(혹시 떠있을 팝업 정리) -> 리스트 직접 진입 ->
     '매직'/'스타'/'장미'/'푸' 중 하나라도 걸리면 채택.
     대상 미감지 시 좌상단 폴백을 쓰고 실패(x,r)로 보고한다.
     교체 후에는 '낚시 시작'을 바로 누르지 않고 살림망 수량부터 확인한다
-    (_restart_or_collect_after_rod_swap 참고)."""
-    print("\n=== [낚싯대 자동 교체] 최소 획득 시간 1초 감지 ===")
+    (_restart_or_collect_after_rod_swap 참고).
+
+    **`reason`을 반드시 받아 찍는다(260822b, 진단 함정):** 예전엔 이 자리에
+    `'최소 획득 시간 1초 감지'`가 **하드코딩**돼 있어, 트리거 ②(살림망 최대치
+    초과)로 들어와도 로그에는 ①처럼 찍혔다. 그 때문에 "버튼 확인이 안 된다"고
+    ①만 들여다보며 원인을 한참 놓쳤다 — 정작 게이트가 없던 쪽은 ②였다.
+    **호출부가 둘 이상인 분기에서 사유를 고정 문구로 찍지 말 것.**"""
+    print(f"\n=== [낚싯대 자동 교체] {reason} ===")
     set_status("rod")
     send_report("rs")          # 낚싯대 교체 시작 보고
 
@@ -2148,8 +2154,36 @@ class FishingWorker(threading.Thread):
                 # ①은 '1초/1초'만으로는 부족하다 — **낚시 버튼이 '낚시 시작'
                 # (대기 중)** 인지까지 AND로 본다(`_confirm_rod_expiry`).
                 rod_expired = maybe_expired and _confirm_rod_expiry()
-                if self.rod_swap and (rod_expired or qty[0] > qty[1]):
-                    run_rod_swap_routine()
+
+                # **②에도 같은 버튼 AND를 건다(260822b — 실제 사고로 확인).**
+                # 260822a는 ①에만 게이트를 달았는데, 정작 진행 중인 낚시를 끊은
+                # 것은 게이트가 없던 ②였다. 로그가 그 증거를 품고 있었다:
+                # 교체 직후 `_restart_or_collect_after_rod_swap`이 같은 살림망을
+                # 다시 읽어 `114/570 여유 있음`이라고 찍었다 — 즉 교체를 유발한
+                # `cur > mx` 판독이 틀렸던 것이다. ②는 확인 절차가 하나도
+                # 없었으므로 한 번의 오인식이 그대로 교체로 이어졌다.
+                # 조건 자체는 ①과 같은 논리로 정당하다: **초과 상태에선 낚시가
+                # 걸리지 않으므로 버튼은 '낚시 시작'이어야 한다.** 낚시가 잘
+                # 돌고 있다면 그 판독은 오인식이다.
+                # 초과가 진짜인데 버튼을 못 읽어 여기서 막혀도 갇히지 않는다 —
+                # 초과는 회수 조건(`cur+5>=mx`)의 부분집합이라 아래 회수 분기가
+                # 받아 살림망을 비운다.
+                rod_overflow = False
+                if qty[0] > qty[1]:
+                    if is_fishing_active() is False:
+                        rod_overflow = True
+                    else:
+                        print(f"[{now}] 살림망이 최대치를 넘은 것처럼 읽혔지만"
+                              f"({qty[0]}/{qty[1]}) 낚시가 멈춘 상태가 아닙니다 —"
+                              f" 오인식으로 보고 교체하지 않습니다"
+                              f" (OCR 원문='{_last_tank_ocr}').")
+                        _dump_ocr_crop("tank_overflow", REGION_TANK_QTY,
+                                       _last_tank_ocr)
+
+                if self.rod_swap and (rod_expired or rod_overflow):
+                    run_rod_swap_routine("낚싯대 기간 만료(획득 시간 1초/1초)"
+                                         if rod_expired else
+                                         f"살림망 최대치 초과 {qty[0]}/{qty[1]}")
                     self.stop_event.wait(0.5)
                     continue
 
