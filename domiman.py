@@ -628,7 +628,7 @@ def send_report(code):
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260821a"
+APP_VERSION = "260822a"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -1327,7 +1327,7 @@ def capture_game_png():
 OCR_NUM_SCALE = 3            # 숫자 영역 확대 배율(아래 실측 근거)
 
 
-def _prep_number_ocr(img):
+def _prep_number_ocr(img, scale=OCR_NUM_SCALE):
     """살림망 수량·획득 시간처럼 **작은 숫자**를 읽기 전 전처리: 3배 확대 + 흑백.
 
     실측(20260815121853.jpg의 세 영역을 1.0/0.8/0.6/0.5배로 흐리게 만들어
@@ -1340,24 +1340,109 @@ def _prep_number_ocr(img):
     **숫자 화이트리스트(allowlist)는 쓰지 않는다 — 측정에서 오히려 나빴다**
     (같은 표본에서 9케이스 중 3→2로 감소: '414/480'을 '473480'으로 만드는 등
     슬래시를 잃고 숫자로 밀어붙이는 부작용). 논리적으로 좋아 보여도 실측이
-    아니라고 하면 넣지 않는다."""
+    아니라고 하면 넣지 않는다.
+
+    `scale=1`을 넘기면 **확대 없이 흑백만** 한다 — 확대가 오히려 글자를 뭉개는
+    경우의 폴백 경로다(`_ocr_number_img` 주석의 실측표 참고)."""
     if img is None or not img.size:
         return img
-    big = cv2.resize(img, None, fx=OCR_NUM_SCALE, fy=OCR_NUM_SCALE,
-                     interpolation=cv2.INTER_CUBIC)
+    big = img if scale == 1 else cv2.resize(
+        img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     return cv2.cvtColor(cv2.cvtColor(big, cv2.COLOR_RGB2GRAY), cv2.COLOR_GRAY2RGB)
 
 
-def _ocr_region(region, numeric=False):
-    """영역 OCR. numeric=True면 숫자 전용 전처리를 거친다(위 함수 참고).
-    한글을 읽는 곳은 기존 동작 그대로 둔다 — 그쪽은 부분매칭이라 이미 관대하고,
-    전처리를 바꿨을 때의 영향을 측정하지 않았기 때문이다."""
+def _ocr_number_img(img, scaled=True):
+    r"""**이미 잘라 놓은** 크롭 하나를 읽어 공백 없는 문자열로 돌려준다.
+    `scaled=False`면 x3 전처리를 거치지 않고 원본 배율로 읽는다.
+
+    **왜 두 경로가 필요한가 (260822a 실측 — 전처리 4종을 표본 전부에 돌림):**
+    획득 시간 16케이스(1·5·10·11·12·15·20·30·40·60·70초, QHD 원본 포함)와
+    설치본 `ocr_dump/`에 '판독 실패'로 남아 있던 수량 크롭 13장.
+
+        전처리        | 획득 시간 | 수량   | 혼자서 틀리는 것
+        --------------+-----------+--------+-----------------------
+        원본+컬러     |   15/16   | 12/13  | '11초' -> '1초'
+        **원본+흑백** |   15/16   | 12/13  | '70초' -> '7초'
+        x3+컬러       |   15/16   |  3/13  | '20초' -> '2초'
+        **x3+흑백**   |   15/16   |  0/13  | '11초' -> '1초'
+
+    **어느 하나도 혼자서는 안전하지 않다** — 전부 15/16이면서 서로 다른 곳에서
+    깨진다. 그러니 "더 좋은 배율로 갈아치우기"는 답이 아니다. 대신 주 경로를
+    x3+흑백(흐린 화면에 강함, 260815c)으로 두고, 결과가 수상하면 **같은 프레임을
+    원본+흑백으로** 다시 읽는다. 이 조합이 두 경로의 실패를 서로 덮어
+    **획득 시간 16/16 · 수량 12/13**이 된다(남은 1장은 게임 패널이 화면에 아예
+    없던 프레임이라 사람도 못 읽는다).
+
+    수량 쪽 x3 실패는 전부 같은 모양이다: **슬래시가 숫자 1로 바뀐다**
+    (`244/470` -> `2441470`, `44/470` -> `441470`). 그러면 `(\d+)\D+(\d+)`가
+    안 맞아 '판독 실패'가 된다. '수상한지'를 판정하는 방법은 값의 종류마다
+    달라서 호출부가 정한다 — 수량은 위 정규식, 획득 시간은 글자 폭
+    (`_span_agrees`)이다."""
+    if img is None or not img.size:
+        return ""
+    src = _prep_number_ocr(img, OCR_NUM_SCALE if scaled else 1)
+    return " ".join(reader.readtext(src, detail=0)).replace(" ", "")
+
+
+def _ocr_region(region):
+    """**한글 영역** OCR(팝업 문구·버튼 글자). 전처리 없이 원본 그대로 읽는다 —
+    그쪽은 전부 부분매칭이라 이미 관대하고, 전처리를 바꿨을 때의 영향을
+    측정하지 않았기 때문이다.
+
+    숫자 영역은 이 함수를 쓰지 않는다: 배율 두 경로 + 자릿수 심판이 필요해
+    `_read_tank_text`(수량) / `_read_gain_time`(획득 시간)이 직접 처리한다."""
     img = _watch_grab_region(region)
     if img is None:
         return ""
-    if numeric:
-        img = _prep_number_ocr(img)
     return " ".join(reader.readtext(img, detail=0)).replace(" ", "")
+
+
+# --- 자릿수 심판 (OCR을 믿지 않고 글자 폭을 직접 잰다) ---
+INK_WHITE_MIN = 185         # 흰 글자만 남기는 밝기 임계
+INK_WHITE_PIXELS_MIN = 30   # 이만큼도 안 밝으면 글자가 없는 것으로 본다
+INK_DIGIT2_MIN = 26.0       # FHD 기준 잉크 폭이 이 이상이면 숫자가 두 자리 이상
+
+
+def _ink_span_fhd(img, region_w):
+    """크롭 안 '흰 글자'의 좌우 끝 거리를 **FHD(1920 폭) 기준 px**로. 없으면 None.
+
+    게임 글꼴은 고정폭이라 이 폭이 자릿수를 그대로 알려준다. 실측(밝기 임계
+    170~230을 훑어도 값이 흔들리지 않았다 — 230에서만 ±2):
+        1초 21 · 5초 22  |  10·11·12·15초 29 · 20·30·60·70초 30~32
+        (QHD 원본에서 정규화한 값도 30.1·32.0으로 같은 구간)
+    **1자리 21~22 vs 2자리 29~32로 7px 이상 벌어져 완전히 분리된다.**
+    그래서 경계는 그 중간(`INK_DIGIT2_MIN = 26`)에 둔다 — 양쪽으로 3px 이상
+    여유가 있다. 화면 크기와 무관하도록 크롭 실제 폭으로 되돌려 잰다(QHD면
+    크롭이 91px여도 FHD 72px 기준으로 환산)."""
+    if img is None or not img.size:
+        return None
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    ink = cv2.threshold(gray, INK_WHITE_MIN, 255, cv2.THRESH_BINARY)[1]
+    if int(ink.sum() // 255) < INK_WHITE_PIXELS_MIN:
+        return None
+    cols = np.where(ink.sum(axis=0) > 0)[0]
+    if not len(cols):
+        return None
+    return float(cols[-1] - cols[0] + 1) * region_w / img.shape[1]
+
+
+def _span_digits(span):
+    """잉크 폭 -> 화면에 있는 숫자의 자릿수. 1 또는 2(='둘 이상'), 모르면 None."""
+    if span is None:
+        return None
+    return 2 if span >= INK_DIGIT2_MIN else 1
+
+
+def _span_agrees(value, span):
+    """판독값 value의 자릿수가 화면 글자 폭과 맞는가. 폭을 못 재면 판단을
+    보류하고 True(수용) — 폭이 없다고 멀쩡한 판독을 버리면 진짜 만료를
+    놓칠 수 있다. value가 None이면 애초에 맞을 것이 없으므로 False."""
+    if value is None:
+        return False
+    want = _span_digits(span)
+    if want is None:
+        return True
+    return (len(str(value)) >= 2) if want == 2 else (len(str(value)) == 1)
 
 
 # --- 판독 실패 진단용 크롭 저장 ---
@@ -1398,6 +1483,30 @@ _last_tank_ocr = ""   # 마지막으로 읽은 수량 OCR 원문(판독 실패 �
 _last_tank_max = None # 마지막으로 받아들인 살림망 최대치(바뀌면 한 번 더 확인)
 
 
+TANK_QTY_RE = r'(\d+)\D+(\d+)'      # 'cur/mx' — 구분자는 숫자가 아니어야 한다
+
+
+def _read_tank_text():
+    """살림망 수량 영역을 한 번 읽어 'cur/mx' 꼴 문자열을 돌려준다.
+
+    **x3 확대는 슬래시를 숫자 '1'로 바꿔 놓는다(260822a, 실측).** 설치본
+    `ocr_dump/`에 '판독 실패'로 남아 있던 크롭 중 사람 눈에 또렷한 12장이 전부
+    이 모양이었다: `244/470` -> '2441470', `44/470` -> '441470'. 구분자가 숫자가
+    되면 `TANK_QTY_RE`가 안 맞아 판독 실패로 처리된다. **같은 프레임을 원본
+    배율로** 읽으니 12/12 정확했다.
+
+    그래도 배율을 갈아치우지 않고 **정규식이 안 맞을 때만** 한 번 더 읽는다 —
+    화면이 흐릴 때 x3가 주는 이득(260815c 실측)을 그대로 남기려는 것이다.
+    정상 화면에서는 추가 판독이 나가지 않으므로 비용도 늘지 않는다."""
+    img = _watch_grab_region(REGION_TANK_QTY)
+    txt = _ocr_number_img(img, scaled=True)
+    if not re.search(TANK_QTY_RE, txt or ""):
+        alt = _ocr_number_img(img, scaled=False)
+        if re.search(TANK_QTY_RE, alt or ""):
+            return alt
+    return txt
+
+
 def read_tank_quantity(retries=4, delay=0.3):
     """살림망 수량 (current, max) 또는 None. 프레임 재시도 포함.
 
@@ -1421,10 +1530,10 @@ def read_tank_quantity(retries=4, delay=0.3):
     global _last_tank_ocr, _last_tank_max
     votes = []
     for i in range(retries):
-        txt = _ocr_region(REGION_TANK_QTY, numeric=True)
+        txt = _read_tank_text()
         if txt:
             _last_tank_ocr = txt
-            m = re.search(r'(\d+)\D+(\d+)', txt)
+            m = re.search(TANK_QTY_RE, txt)
             if m:
                 cur, mx = int(m.group(1)), int(m.group(2))
                 if mx > 0:
@@ -1451,8 +1560,9 @@ def read_tank_quantity(retries=4, delay=0.3):
         print(f"    [수량 재확인] 최대치가 {_last_tank_max} → {best[1]} 로 바뀐 것처럼 "
               f"읽혔습니다(OCR='{_last_tank_ocr}'). 한 번 더 확인합니다.")
         abort_sleep(delay)
-        txt = _ocr_region(REGION_TANK_QTY, numeric=True)
-        m = re.search(r'(\d+)\D+(\d+)', txt or "")
+        # 재확인도 **같은 폴백 경로**로 읽는다 — 여기만 x3로 읽으면 슬래시가
+        # 숫자로 바뀐 판독 때문에 멀쩡한 값을 버리게 된다(위 함수 주석 참고).
+        m = re.search(TANK_QTY_RE, _read_tank_text() or "")
         if not m or int(m.group(2)) != best[1]:
             return None            # 다음 사이클에 다시 읽는다
     _last_tank_max = best[1]
@@ -1474,27 +1584,59 @@ def _tank_needs_collect(qty):
     return cur >= mx - TANK_COLLECT_MARGIN
 
 
+def _parse_gain_sec(txt):
+    """'n초' 판독 문자열에서 초를 뽑는다. 값이 안 되면 None."""
+    m = re.search(r'(\d+)', txt or "")
+    if not m:
+        return None
+    sec = int(m.group(1))
+    return sec if 0 < sec <= 600 else None
+
+
 def _read_gain_time(region, retries=3, delay=0.2):
     """획득 시간 영역('n초')에서 초를 읽는다. 실패면 None.
 
     **먼저 읽힌 값을 그냥 쓰지 않고 여러 프레임의 다수결로 고른다(260815c):**
     '15초'가 한 프레임에서 '1초'로 튀는 사례가 있었는데, 첫 성공을 그대로
     쓰면 그 한 번에 낚싯대를 갈아 끼우게 된다. 같은 비용(재시도 횟수)으로
-    가장 많이 나온 값을 고르는 편이 낫다."""
+    가장 많이 나온 값을 고르는 편이 낫다.
+
+    **그 위에 자릿수 심판을 얹었다(260822a — 오탐의 실제 원인):** easyocr은
+    붙어 있는 같은 글자를 하나로 합쳐 '11초'를 **'1초'(확신도 0.99)** 로
+    읽는다. 리포의 20260813001332.jpg(실제 11초/12초)에서 정적 이미지인데도
+    100% 재현되며, **확신도로는 못 거른다**(오답 0.99 > 정답 0.47). 프레임 튐이
+    아니므로 다시 읽어도 같은 답이 나와 `_confirm_rod_expiry`의 재판독마저
+    통과해 버린다. 그래서 OCR 대신 **글자 폭을 직접 재서** 자릿수가 맞는지
+    본다(`_ink_span_fhd`). 어긋나면 같은 프레임을 원본 배율로 한 번 더 읽는데,
+    이 오인식은 x3 확대가 만드는 것이라 배율을 바꾸면 맞는다:
+        '11초' -> x3+흑백 '1초'(오답) / 원본+흑백 '11초'(정답)
+        '70초' -> x3+흑백 '70초'(정답) / 원본+흑백 '7초'(오답)
+    **양방향으로 깨지므로 배율을 갈아치우는 것으로는 못 고친다** — 폭이 심판을
+    봐야 두 경우가 다 맞는다(표본 16케이스 전부 정답, `_ocr_number_img` 참고).
+
+    **동표면 값을 버린다:** 예전엔 `max(set(...), key=count)`가 1표씩 갈린
+    경우(예: 1초와 15초가 각 1표)를 set 순서대로 임의로 골라, 튄 값 하나가
+    낚싯대를 갈 수 있었다. 지금은 과반이 아니면 None을 돌려준다 — 획득 시간을
+    못 읽으면 폴링 간격을 직전 값으로 유지하고 교체도 하지 않으므로, 조용히
+    다음 사이클에 다시 읽는 것이 가장 안전하다."""
     votes = []
     for i in range(retries):
-        txt = _ocr_region(region, numeric=True)
-        if txt:
-            m = re.search(r'(\d+)', txt)
-            if m:
-                sec = int(m.group(1))
-                if 0 < sec <= 600:
-                    votes.append(sec)
+        img = _watch_grab_region(region)
+        span = _ink_span_fhd(img, region[2])
+        sec = _parse_gain_sec(_ocr_number_img(img, scaled=True))
+        if not _span_agrees(sec, span):
+            alt = _parse_gain_sec(_ocr_number_img(img, scaled=False))
+            sec = alt if _span_agrees(alt, span) else None
+        if sec is not None:
+            votes.append(sec)
         if i < retries - 1:
             abort_sleep(delay)
     if not votes:
         return None
-    return max(set(votes), key=votes.count)
+    best = max(set(votes), key=votes.count)
+    if votes.count(best) * 2 <= len(votes):
+        return None            # 과반이 아니면 보류 (위 docstring 참고)
+    return best
 
 
 def read_min_gain_time(retries=3, delay=0.2):
@@ -1525,26 +1667,44 @@ def read_max_gain_time(retries=3, delay=0.2):
 
 
 ROD_EXPIRY_CONFIRM_READS = 2     # '1초/1초'를 다시 읽어 확인하는 횟수
-ROD_EXPIRY_FROZEN_CYCLES = 10    # 낚시 중으로 보여도 이만큼 수량이 멈춰 있으면 교체 허용
 
 
-def _confirm_rod_expiry(frozen_cycles):
-    """'최소·최대 획득 시간이 둘 다 1초'가 **진짜 만료인지** 한 번 더 확인한다.
+def _confirm_rod_expiry():
+    """'최소·최대 획득 시간이 둘 다 1초'가 **진짜 만료인지** 확인한다.
 
-    **왜 필요한가(실측, 260815b):** 최소·최대가 둘 다 **15초**인 정상 화면에서
-    둘 다 '1초'로 읽혀 낚싯대를 헛교체한 사례가 나왔다(사용자 제공
-    `20260815121853.jpg`). 그 스크린샷을 지금 좌표·배율로 다시 읽으면
-    **'15초'가 확신도 0.99~1.00으로 정확히** 나온다 — 즉 좌표나 전처리 문제가
-    아니라 **실시간 캡처에서 한 프레임이 튄 것**이다. 그래서 '최대도 1초'라는
-    교차 확인(260813a)만으로는 못 거른다. 한 번의 판독으로 낚싯대를 갈지 않는다:
+    **낚싯대 교체 조건은 세 개의 AND다(260822a):**
+        최소 = 1초  AND  최대 = 1초  AND  낚시 버튼 = '낚시 시작'(대기 중)
 
-    1. 잠깐 뒤 **다시 읽어** 최소·최대가 계속 1초인지 본다. 한 프레임짜리
-       오인식은 여기서 걸러진다(진짜 만료면 계속 1초로 남아 있다).
-    2. 그래도 낚시가 **진행 중**('낚시 취소')으로 보이면 만료가 아니라고 본다.
-       단 그 판독마저 틀릴 수 있으므로, **살림망 수량이 오랫동안 멈춰 있으면**
-       (기본 10사이클 ≈ 30초) 진행 중 표시를 무시하고 교체한다 — 진짜 만료는
-       수량이 영원히 늘지 않으므로 여기서 반드시 빠져나온다.
-    """
+    세 번째가 핵심이다 — **낚싯대 기간이 만료되면 낚시가 멈추므로 버튼은
+    반드시 '낚시 시작'이 된다.** 반대로 오인식은 대개 낚시가 **잘 돌고 있는**
+    화면에서 나므로 버튼이 '낚시 취소'다. 보유 표본이 그대로 보여준다:
+
+        expire_20260719025713 (진짜 만료 1초/1초) -> '낚시시작' 확신도 1.00  → 교체 O
+        20260813001332        (실제 11초/12초)    -> '낚시취소' 확신도 0.99  → 교체 X
+        20260815121853        (실제 15초/15초)    -> '낚시취소' 확신도 1.00  → 교체 X
+
+    즉 **기록에 남은 헛교체 사고 두 건이 이 조건 하나로 다 막힌다.** 값을 읽는
+    쪽을 아무리 조여도 완벽할 수 없으니, 원인이 다른 신호를 하나 더 요구해
+    교차 확인하는 편이 훨씬 싸고 강하다.
+
+    **`is_fishing_active()`가 None(판독 불가)이면 교체하지 않는다.** '모르겠다'를
+    '대기 중'으로 취급하면 조건을 하나 잃는 셈이다.
+
+    그 앞의 **재판독**(`ROD_EXPIRY_CONFIRM_READS`)은 남겨 둔다(260815b): 낚시가
+    실제로 멈춰 있는 상태(미끼 소진 등)에서 획득 시간이 한 프레임 튀면 버튼
+    조건만으로는 못 걸러지기 때문이다. 버튼 확인을 먼저 하는 이유는 OCR 한 번
+    으로 끝나 재판독 4번보다 싸기 때문이다.
+
+    ~~수량이 오래 멈춰 있으면 진행 중 표시를 무시하고 교체~~ 하던 예외
+    (`ROD_EXPIRY_FROZEN_CYCLES`)는 **없앴다** — 그것이 바로 버튼 조건을
+    우회하는 구멍이었다. 대신 버튼이 영구히 안 읽히는 사태를 대비한 통로는
+    남아 있다: 최대치 초과(`cur > mx`) 트리거는 버튼을 보지 않는다."""
+    active = is_fishing_active()
+    if active is not False:
+        state = "진행 중('낚시 취소')" if active else "판독 불가"
+        print(f"[{time.strftime('%H:%M:%S')}] 획득 시간이 1초로 읽혔지만 낚시 "
+              f"버튼이 {state} — 만료가 아니라고 보고 교체하지 않습니다.")
+        return False
     for _ in range(ROD_EXPIRY_CONFIRM_READS):
         abort_sleep(0.4)
         again_min, again_max = read_min_gain_time(), read_max_gain_time()
@@ -1553,10 +1713,6 @@ def _confirm_rod_expiry(frozen_cycles):
                   f"{again_min}초/{again_max}초 — 한 프레임 오인식으로 보고 "
                   f"낚싯대를 교체하지 않습니다.")
             return False
-    if is_fishing_active() is True and frozen_cycles < ROD_EXPIRY_FROZEN_CYCLES:
-        print(f"[{time.strftime('%H:%M:%S')}] 획득 시간이 1초로 읽히지만 낚시가 "
-              f"진행 중이고 수량도 도는 중({frozen_cycles}회) — 교체하지 않습니다.")
-        return False
     return True
 
 
@@ -1989,7 +2145,9 @@ class FishingWorker(threading.Thread):
                 # 260811a에서 뺀 것은 ②가 아니라 회수 조건 **전체**(cur+5>=mx)였다
                 # — 그건 467/470처럼 멀쩡한 낚싯대까지 갈아 끼웠다. cur>mx는 낚싯대
                 # 최대치가 실제로 모자란 상태만 가리키므로 그 오작동이 없다.
-                rod_expired = maybe_expired and _confirm_rod_expiry(same_count)
+                # ①은 '1초/1초'만으로는 부족하다 — **낚시 버튼이 '낚시 시작'
+                # (대기 중)** 인지까지 AND로 본다(`_confirm_rod_expiry`).
+                rod_expired = maybe_expired and _confirm_rod_expiry()
                 if self.rod_swap and (rod_expired or qty[0] > qty[1]):
                     run_rod_swap_routine()
                     self.stop_event.wait(0.5)
@@ -2003,8 +2161,16 @@ class FishingWorker(threading.Thread):
                     self.stop_event.wait(0.5)
                     continue
 
-                # 매 사이클 팝업 확인(체크박스로 개별 on/off)
-                if self.bait_swap and _detect_no_bait_popup():
+                # 매 사이클 팝업 확인(체크박스로 개별 on/off).
+                # **낚싯대와 같은 AND 조건**: 미끼가 정말 떨어졌으면 낚시가
+                # 멈추므로 버튼이 '낚시 시작'이어야 한다(표본 실측 —
+                # bait_20260719015418 · popup_20260719015400 둘 다 '낚시시작'
+                # 확신도 1.00). 팝업 글자는 conf 0.3~0.5대로 낮아 부분매칭에
+                # 의존하는데, 그 매칭이 헛걸리면 낚시 중에 리스트 창을 열어
+                # 낚시를 망친다. 버튼 확인은 팝업이 보일 때만 하므로 평시
+                # OCR 부담은 그대로다(순서를 바꾸지 말 것).
+                if (self.bait_swap and _detect_no_bait_popup()
+                        and is_fishing_active() is False):
                     run_bait_swap_routine()
                     self.stop_event.wait(0.5)
                     continue
