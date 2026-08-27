@@ -50,12 +50,14 @@ kotlin {
 
 chaquopy {
     defaultConfig {
-        version = "3.12"
+        version = "3.13"
         // buildPython 자동 탐지는 이 PC의 py 런처 슬롯이 Microsoft Store 스텁일
         // 때 실패한다(반복된 함정) — python.org 정식 설치 경로를 명시적으로 지정.
         // ⚠️ 다른 PC에서 빌드하려면 이 경로를 그 PC의 python.org 인터프리터로
         //    바꿔야 하며, version 값과 major.minor가 같아야 한다.
-        buildPython("C:/Users/windo/AppData/Local/Programs/Python/Python312/python.exe")
+        // 260828a: 3.12로 적혀 있었으나 이 PC에는 3.12가 설치돼 있지 않다
+        // (`py -0` = 3.14·3.13). 3.13은 실제로 APK를 만들어낸 조합이다.
+        buildPython("C:/Users/windo/AppData/Local/Programs/Python/Python313/python.exe")
         // pip 의존성 없음: domichat 이식 후 domiman_m.py는 표준 라이브러리
         // (socket/ssl/struct/hashlib/json/threading/queue)만 쓴다. ntfy 시절의
         // requests는 더 이상 필요 없어 걷어냈다(빌드도 그만큼 빨라진다).

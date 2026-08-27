@@ -1,5 +1,6 @@
 package com.example.domiman.ui.main
 
+import android.util.Base64
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.domiman.data.DomimanEvent
@@ -19,6 +20,9 @@ private const val NO_TARGET_STATUS = "제어할 PC를 먼저 선택하세요."
 private const val LOG_MAX_LINES = 8 // 항상 펼쳐진 채 마지막 8줄만
 private const val PENDING_TIMEOUT_MS = 15_000L // domiman.py _check_pending_timeout과 동일
 private const val TIMER_DEBOUNCE_MS = 1_500L // PC의 타이머 3초 디바운스에 대응(과발신 방지)
+// 스크린샷은 ack(15초) 뒤에도 사진 전송을 더 기다려야 하므로 일반 명령보다 길게 잡는다
+// (domiman_m.SHOT_START_TIMEOUT 15초 + SHOT_STALL_TIMEOUT 10초보다 넉넉한 전체 상한).
+private const val SHOT_TIMEOUT_MS = 45_000L
 
 data class MainUiState(
   val resolutionLabel: String = "감지 중",
@@ -35,9 +39,19 @@ data class MainUiState(
   val isConnectingTarget: Boolean = false,
 )
 
+/** 도착한 스크린샷 — 원본 PNG 바이트는 저장·클립보드 복사에 그대로 쓰인다
+ * (domiman.py ScreenshotWindow.png와 같은 역할). ByteArray를 담으므로 MainUiState
+ * 안에 두지 않고 별도 StateFlow로 뺐다(data class equals가 매번 배열을 훑지 않게). */
+class ScreenshotData(val name: String, val bytes: ByteArray)
+
 class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel() {
   private val _uiState = MutableStateFlow(seedState())
   val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
+
+  private val _screenshotResult = MutableStateFlow<ScreenshotData?>(null)
+  val screenshotResult: StateFlow<ScreenshotData?> = _screenshotResult.asStateFlow()
+
+  private var shotTimeoutJob: Job? = null
 
   /** 최상단 박스에 표시할 제어 PC(없으면 '제어 PC 선택하기'). */
   val selectedPc: StateFlow<String?> = repository.selectedPc
@@ -156,6 +170,17 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
             }
           }
           "Q" -> addLog("원격 프로그램이 종료되었습니다.")
+          "I" -> {
+            if (event.shotFail) {
+              shotTimeoutJob?.cancel()
+              addLog("화면을 캡처하지 못했습니다.")
+            } else {
+              // ack만 왔다 — 사진은 이어서 "screenshot" 이벤트로 온다. shotTimeoutJob이
+              // 이미 돌고 있으므로 isPending을 그대로 두고(잠금 유지) 여기서 끝낸다.
+              addLog("화면을 찍는 중입니다. 사진을 기다립니다...")
+              return
+            }
+          }
         }
         if (event.tank != null && event.tank.size >= 2) {
           addLog("살림망 ${event.tank[0]}/${event.tank[1]}")
@@ -163,6 +188,16 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
           addLog("수량 파싱 실패")
         }
         clearPending()
+      }
+      "screenshot" -> {
+        shotTimeoutJob?.cancel()
+        _uiState.value = _uiState.value.copy(isPending = false)
+        if (event.ok == true && event.pngB64 != null) {
+          _screenshotResult.value =
+            ScreenshotData(event.name ?: "screenshot.png", Base64.decode(event.pngB64, Base64.DEFAULT))
+        } else {
+          addLog(screenshotFailText(event.reason))
+        }
       }
       "report" -> event.reportText?.let(::addLog)
       "target_joined" -> addLog("'${event.pc}' 채팅방에 입장했습니다.")
@@ -287,6 +322,34 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
     markPending()
     viewModelScope.launch { repository.sendTankQuery() }
   }
+
+  /** '스크린샷' — ack(15초)뿐 아니라 사진 전송까지 기다려야 해서 일반
+   * markPending()의 15초보다 긴 자체 타임아웃(SHOT_TIMEOUT_MS)을 쓴다. */
+  fun onScreenshot() {
+    _uiState.value = _uiState.value.copy(isPending = true)
+    shotTimeoutJob?.cancel()
+    shotTimeoutJob =
+      viewModelScope.launch {
+        delay(SHOT_TIMEOUT_MS)
+        if (_uiState.value.isPending) {
+          _uiState.value = _uiState.value.copy(isPending = false)
+          addLog("스크린샷 요청이 시간 초과되었습니다.")
+        }
+      }
+    viewModelScope.launch { repository.sendScreenshot() }
+  }
+
+  fun onScreenshotDialogDismiss() {
+    _screenshotResult.value = null
+  }
+
+  private fun screenshotFailText(reason: String?): String =
+    when (reason) {
+      "timeout" -> "사진이 도착하지 않았습니다."
+      "corrupt" -> "사진이 깨져서 도착했습니다. 다시 요청하세요."
+      "aborted" -> "전송이 중단되었습니다."
+      else -> "스크린샷을 받지 못했습니다."
+    }
 
   fun onLogClear() {
     _uiState.value = _uiState.value.copy(logLines = emptyList())

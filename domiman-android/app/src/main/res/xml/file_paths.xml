@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider가 노출할 경로. 스크린샷 클립보드 복사가 캐시에 쓰는 파일만 연다. -->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <cache-path name="screenshots" path="screenshots/" />
+</paths>

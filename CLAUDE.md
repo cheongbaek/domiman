@@ -73,8 +73,9 @@ os._exit는 그 정리를 건너뛴다. 저장은 os._exit 전에 동기로 끝�
 ## 현재 아키텍처 (중요)
 
 ### 해상도 두 모드 — 둘 다 동일한 윤곽선 매칭 사용
-- **FHD (1080p)**: `pyautogui`로 화면 직접 캡처. 게임이 화면 (0,0) 기준에
-  있다고 가정. 좌표는 FHD 기준 하드코딩.
+- **FHD (1080p)**: `pyautogui`로 화면 직접 캡처. 좌표는 FHD 기준 하드코딩.
+  ~~게임이 화면 (0,0) 기준에 있다고 가정~~ → **260828a에 폐기.** 클릭·자르기
+  둘 다 QHD와 같은 창 기준 변환(`_client_geometry`)을 쓴다(아래 [2] 참고).
 - **QHD (1440p)**: WGC(Windows Graphics Capture)로 게임 창을 원본으로 잡아
   1920x1080으로 축소(INTER_AREA) 후 **FHD와 동일한 좌표/로직**으로
   인식. `windows-capture` 패키지 필요.
@@ -160,9 +161,11 @@ CNN·torch·torchvision·result_qhd 폴더 의존성을 모두 제거했다. **�
 제목만으로 찾으면 숨은 창(1920x1080, (0,0))을 잡아서 좌표 변환이 무력화된다
 (`ClientToScreen(0,0)`이 (1,1)을 반환해 오프셋이 안 더해짐).
 **해결: 창 선택 시 반드시 `IsWindowVisible` 체크 + 클라이언트 영역이 가장 큰
-창을 고른다.** `bring_game_to_front`와 `_find_game_hwnd` 둘 다 이 방식.
+창을 고른다.** `bring_game_to_front`와 `_pick_game_hwnd` 둘 다 이 방식.
+(`_find_game_hwnd`는 '보이는 창 중 첫 번째'를 고르는 옛 함수라 260828a에
+**삭제**했다 — 창 선택은 `_pick_game_hwnd` 하나로 모은다.)
 
-### 2. 좌표 변환 (`to_screen`)
+### 2. 좌표 변환 (`to_screen`) — **FHD/QHD 공통** (260828a)
 좌표는 항상 FHD(1920x1080 공간) 기준으로 저장. 클릭 시 실제 화면 좌표로 변환:
 - `GetWindowRect`(2403x1353)가 아니라 **`GetClientRect`(2400x1350) +
   `ClientToScreen`**을 써야 3px 테두리 오차가 없다.
@@ -172,6 +175,29 @@ CNN·torch·torchvision·result_qhd 폴더 의존성을 모두 제거했다. **�
 - top이 음수(-337)일 수 있음(창이 화면 위로 삐져나감). 공식은 음수 정상 처리.
 - DPI: 시작 시 `SetProcessDpiAwareness(2)` 설정. GetClientRect/ClientToScreen/
   SetCursorPos 모두 물리 픽셀로 일관됨.
+
+**FHD 모드도 이 변환을 쓴다 (260828a, 실제 증상으로 고침 — 되돌리지 말 것):**
+예전 `to_screen`은 `CURRENT_RESOLUTION == "1080p"`이면 **변환을 건너뛰고 FHD
+좌표를 화면 좌표로 그대로** 돌려줬다(= 클라이언트 영역이 화면 (0,0)에
+1920x1080으로 딱 붙어 있다는 전제). 그래서 **QHD는 창이 움직여도 정확한데 FHD만
+창이 조금 움직이면 클릭이 전부 어긋나** 루틴이 진행되지 않았다.
+- 증상이 헷갈리는 이유: **수량 파싱은 멀쩡했다.** 감시 모드 읽기는 FHD에서도
+  WGC로 창을 직접 잡아(창 기준) 창이 어디 있든 잘 읽는다 — 즉 "숫자는 잘 읽는데
+  버튼만 헛클릭"이 정상적인 증상 조합이다. 판독 쪽을 의심할 일이 아니다.
+- 자르기도 같이 고쳤다: 1080p의 `grab_region_rgb`(pyautogui)는 **찍을 자리도**
+  창을 따라가야 한다(`_fhd_region_to_client`). 안 그러면 창이 움직였을 때
+  퀴즈 인식·성공 판정이 조용히 실패한다. `capture_game_png`의 pyautogui
+  폴백(원격 스크린샷)도 같은 변환을 쓴다.
+- 창이 전제 위치(0,0 · 1920x1080)에 있으면 오프셋 0·배율 1이라 **결과가 예전과
+  글자 그대로 같다** — 검증된 좌표는 그대로 유효하다(9개 좌표로 옛 코드와
+  동일함을 확인, QHD 2400x1350·top -337 케이스도 동일).
+- `_client_geometry()`가 유일한 근거이고 창은 `GAME_HWND`(=`bring_game_to_front`가
+  골라 둔 것)를 먼저 쓴다. 그것이 **죽었거나 최소화(GetClientRect가 0x0)면**
+  `_pick_game_hwnd`로 다시 찾는다(매 클릭마다 EnumWindows를 돌지 않기 위한 순서).
+  창을 아예 못 찾으면 예전 동작(FHD 좌표 그대로)으로 폴백하고 경고를 찍는다.
+- 창 클라이언트가 움직이거나 크기가 바뀌면 `[좌표] 게임 창 클라이언트 (x,y)
+  WxH 기준으로 변환합니다.`를 **바뀔 때 한 번만** 찍는다(클릭마다 찍으면 로그가
+  그것만으로 가득 찬다). 다음에 "클릭이 어긋난다"는 보고를 받으면 이 줄부터 볼 것.
 
 ### 3. WGC 캡처
 - `windows_capture.WindowsCapture(window_name="Tales Runner")` — **정확 일치**
@@ -842,8 +868,14 @@ exe 사용자는 새 의존성을 받을 수 없다**(재설치 전까지 `Modul
 연결을 끊는다). ② 세션이 끊기면 큐에 남은 청크를 **버린다** — 되돌려 넣으면
 재접속마다 다시 나가 1초 간격 재접속 고리에 빠진다(domichat.md의 실제 사고).
 
-**모바일은 아직 없다.** `domiman_m.py`/안드로이드 앱에는 `I` 명령이 없다(애초에
-ntfy 기반이라 domichat 전환 자체가 미포팅). PC끼리만 동작한다.
+**모바일에도 들어왔다(260821~, 260828a 커밋에 포함 — 실기기 검증은 아직):**
+`domiman_m.py`에 `cmd_screenshot`/`_begin_shot_wait`/`_on_file`(청크 조립·sha256
+확인)과 `{"ev":"screenshot"}` 이벤트가 있고, 앱은 `ScreenshotActivity` +
+`ui/screenshot/{ScreenshotViewModel,ScreenshotViewer}`로 보여준다(클립보드 복사는
+`FileProvider`+`res/xml/file_paths.xml`). **홈 위젯의 '즉시 회수' 칸이 '스크린샷'
+칸으로 바뀌었다** — 그 Activity는 `taskAffinity=""`+`singleInstance`라 뒤로 가기를
+누르면 앱을 거치지 않고 곧바로 홈으로 돌아간다. 이 부분은 컴파일까지만 확인했고
+실제 사진 왕복은 휴대폰에서 눌러봐야 한다.
 
 **검증(260821a, 실제 domiserver 경유 e2e):** 격리 서버(포트 47899, 평문)에 두
 클라이언트를 붙여 실제 게임 화면 PNG **2.23MB = 청크 35개**를 왕복시켜, 받은
@@ -862,6 +894,84 @@ ntfy 기반이라 domichat 전환 자체가 미포팅). PC끼리만 동작한다
 `UnicodeEncodeError`로 죽는다(실제로 겪음). 클라이언트 쪽은 `DomimanApp`을 통째로
 띄우지 않고 `_on_file`·`_begin_shot_wait` 같은 메서드만 껍데기 객체에 붙여 쓰면
 GUI 없이 수신 경로를 그대로 검증할 수 있다.
+
+---
+
+## 살림망 수량 상시 방송 (260828a, 구현됨 — PC 발신 + 모바일 위젯 수신)
+
+예전에는 제어 측이 `N`으로 **물어볼 때만** 수량이 건너갔다. 그래서 휴대폰·제어
+PC는 버튼을 누른 순간의 값만 볼 수 있었다. 감시 루프는 어차피 사이클마다 수량을
+읽으므로, **읽은 값을 그대로 흘려보내면** 받는 쪽은 요청 왕복 없이 현재 수량을
+계속 알 수 있다(폴링이 아니라 밀어내기).
+
+**발신(`note_tank_qty`)** — 수량을 읽는 두 곳이 이 함수 하나로 모인다:
+감시 루프(`_watch_loop`, 사이클마다)와 실시간 수량확인(`_tank_check_and_resume`).
+하는 일은 ① `_last_tank` 기록 ② `,Z,N,cur,mx` (판독 실패면 `,Z,N,fail`) 방송.
+- **초과 상태(`cur > mx`)도 그대로 보낸다** — 파싱이 초과를 정상 값으로 취급하는
+  것과 같은 이유다(read_tank_quantity 절 참고). 받는 쪽이 걸러선 안 된다.
+- **`chat_send(..., quiet=True)`로 조용히 보낸다(중요):** 사이클마다 `[발신]`
+  한 줄이 찍히면 로그가 그것만으로 가득 찬다. `quiet`는 이 용도로 추가된
+  인자이며, 몇 초에 한 번이 아닌 발신에만 쓴다(명령·응답·보고는 그대로 찍는다).
+- 서버는 메시지를 **저장하지 않고 방에 뿌리기만** 하므로(domiserver에 msgs
+  테이블이 없다) 사이클마다 보내도 쌓이는 것이 없다. 로그인 전이면 `chat_send`가
+  그대로 무시하므로 큐에 고이지도 않는다.
+
+**PC는 보내는 것까지만 한다(사용자 확정):** '항상 갱신되는 수량 표시'는
+**모바일 위젯**의 몫이다. 그래서 domiman.py 쪽에는 전용 표시 위젯을 두지 않았고
+(창 크기를 건드리지 않으려는 이유도 있다 — 체크박스↔스크린샷 전례),
+받는 쪽은 **상태가 바뀔 때만 로그 한 줄**을 남긴다(`_handle_remote_tank`):
+연결 직후 첫 값 · 판독 실패 ↔ 회복. 값이 오를 때마다 찍으면 로그가 그것만으로
+가득 차기 때문이다. 지금 값을 확인하려면 예전처럼 '실시간 수량확인'(N)을 쓴다.
+- 방송은 **`pending`(응답 대기)을 건드리지 않는다** — 명령 응답을 기다리는 중에
+  방송이 끼어들어도 그 대기를 깨면 안 된다.
+- `N` 응답을 받은 직후에는 `remote_tank`를 그 값으로 맞춰 둔다. 안 그러면 뒤이어
+  올 방송이 같은 상태를 한 번 더 찍는다.
+- 제어 대상이 아닌 발신자의 방송은 버린다(보고 처리와 같은 규칙).
+
+### 모바일 수신 (260828a, 구현됨) — 위젯이 상시로 갱신된다
+
+**요구는 두 개였고 서로 당긴다:** 위젯 수량은 항상 최신이어야 하고, 백그라운드는
+"필요 이상의 리소스를 먹지 않고 적절한 선에서 살림망 변화만 감지"해야 한다.
+그래서 **값은 오는 대로 받고, 그리는 일만 묶는다.**
+
+`domiman_m.py`:
+- `dispatch()`가 무명 방송 `,Z,N,*`를 `("tank", 필드)`로 분류한다. **`reply`가
+  아니다** — `_on_msg`의 `resolve_pending()`은 `reply`에만 걸려 있으므로, 명령
+  응답을 기다리는 중에 방송이 끼어들어도 그 대기를 풀지 않는다(끼어들어 풀면
+  예약종료 창 같은 UI가 잘못 열린다).
+- `dispatch_result`가 `{"ev":"tank","tank":[cur,mx]|null,"tank_fail":bool}`을
+  만든다. **알림 키·상태문구를 붙이지 않는다** — 사이클마다 오는 신호에 알림을
+  달면 알림창이 그것만으로 찬다.
+- N 응답과 방송이 **같은 파서**(`parse_tank_fields`)를 쓴다. 두 경로가 어긋나면
+  '새로고침으로 본 값'과 '위젯이 보여주는 값'이 달라진다.
+
+Kotlin(`DomimanRepository`):
+- `handleEvent`는 `ev == "tank"`를 **맨 앞에서 가로채 끝낸다** — 알림·상태·
+  `_events`(화면) 흐름에 태우지 않는다. 태우면 8줄짜리 모바일 로그가 수량으로
+  도배되고(`MainScreenViewModel`이 `tank`를 로그에 찍는다) UI도 헛돈다.
+- `onTankBroadcast`가 비용을 묶는다: ① 값이 같으면 즉시 반환(prefs·RemoteViews
+  둘 다 안 건드림) ② `DomimanWidgetProvider.hasInstances()`가 false면(홈에 위젯이
+  없으면) 아무 것도 하지 않음 ③ 값이 바뀌어도 재그림은
+  **`TANK_WIDGET_MIN_INTERVAL_MS = 30초`에 한 번**. 묶는 동안 들어온 값은
+  `pendingTankText`에 덮어써 두고 창이 열리면 마지막 값 하나만 그린다 —
+  **지연될 뿐 버려지지 않는다.** 살림망은 몇 시간에 걸쳐 차는 값이라 초 단위
+  재그림은 의미가 없다.
+- **N 응답은 즉시 그린다**(사람이 새로고침을 눌러 기다리고 있으므로). 방송만
+  묶는다 — 둘의 차이는 '사람이 기다리는가'다.
+- 로그아웃·세션 정리에서 `cancelTankFlush()`로 대기 중인 재그림을 접는다(늦게
+  깨어나 죽은 세션의 값을 그리지 않게).
+
+**PC는 매 사이클 보내고 조이지 않는다:** 휴대폰 쪽 소켓은 이미 열려 있어(포그라운드
+서비스) 작은 텍스트 한 줄을 더 받는 비용은 사실상 없고, 값 판독은 어차피 사이클마다
+하고 있다. 비싼 쪽은 **위젯 재그림·prefs 쓰기**이므로 상한은 거기에 뒀다. 트래픽까지
+줄여야 하면 발신부(`note_tank_qty`)에 '값이 같으면 건너뛰기'를 넣으면 되지만, 그러면
+휴대폰이 늦게 붙었을 때 다음 변화까지 옛 값을 들고 있게 된다(그래서 안 넣었다).
+
+**검증(260828a):** 발신 규격(성공·실패·초과·quiet·로그인 전 무발신)과 수신
+처리(첫 값 로그 → 값만 오를 때 침묵 → 실패 전환 로그 → 실패 연속 침묵 → 회복
+로그 → pending 불변 → 타 발신자 무시 → 로컬 모드 무시 → N 응답 뒤 중복 침묵)를
+GUI 없이 메서드만 붙인 껍데기 객체로 전부 확인했다. 창 크기가 바뀌지 않는지도
+개량 전/후 GUI를 실제로 만들어 `winfo_reqwidth/reqheight`로 재봤다(595x399 동일).
 
 ---
 
@@ -899,6 +1009,10 @@ GUI 없이 수신 경로를 그대로 검증할 수 있다.
   그 서술이 남아 있던 것을 바로잡은 것.
 - 스크린샷 응답(I): `,Z,I`(ack — 지금 찍는다) 또는 `,Z,I,fail`(캡처·전송 불가).
   사진 자체는 메시지가 아니라 **방에 올라오는 이미지**로 온다(아래 절).
+- **수량 방송(무명 브로드캐스트, 260828a 추가): `,Z,N,(cur),(mx)` /
+  `,Z,N,fail`** — 피제어 PC가 **수량을 읽을 때마다**(감시 사이클마다 =
+  최소 획득 시간마다) 요청 없이 자기 방으로 흘려보낸다. 요청자 자리가 비어
+  있어 위의 N **응답**과 구분된다(아래 전용 절 참고).
 - 보고(무명 브로드캐스트): `,Z,F,코드` — s(루틴시작) g(회수성공) f(회수실패)
   rs/bs(낚싯대/미끼 교체 **시작**) y,r/y,b(낚싯대/미끼 교체 성공)
   x,d/x,r/x,b(튕김/낚싯대/미끼 교체 실패).
@@ -1110,8 +1224,11 @@ Navigation3/ViewModel과 겹쳐서, `DomimanRepository`는 그보다 낮은
 복사**해야 반영된다(`Copy-Item`, gradle 자동 태스크 없음). **원본만 고치고
 끝내면 앱은 옛 코드로 계속 돈다.**
 
-**2026-08-10 점검 결과 — 아래 문서 내용은 맞다. 다만 Kotlin 소스가 이 PC에
-없다(빌드 산출물만 있다).**
+**2026-08-28 정정 — Kotlin 소스는 이제 이 저장소 안에 있다.** 아래 ②는
+2026-08-10 시점의 관찰이고 지금은 해당되지 않는다: 안드로이드 프로젝트가
+`macro/domiman-android/`로 들어와 **macro 저장소가 63개 파일을 추적**하고 있으며,
+그 트리가 최신·권위 사본이다(빌드만 ASCII 경로에서 한다 — 아래 [빌드·배포
+워크플로] 참고). ①(배포 APK로 내용 검증)과 ③(가짜 폴더 목록)은 여전히 유효하다.
 
 **① 배포된 APK가 문서 내용을 증명한다.** `C:\Users\windo\OneDrive -
 한국교통대학교\domiman.apk`(약 47MB, 2026-07-28 13:32)를 열어 확인:
@@ -1133,13 +1250,9 @@ Navigation3/ViewModel과 겹쳐서, `DomimanRepository`는 그보다 낮은
   `Lcom/...;` 문자열을 뽑고, `app.imy`(역시 zip)에서 `domiman_m.pyc`를 꺼내
   심볼 문자열을 확인한다.
 
-**② 그런데 Kotlin 소스는 이 PC에 없다.** 문서에 적힌
-`C:\Users\windo\dev\domiman-android`가 없고(`C:\Users\windo\dev` 자체가 없음),
-`DomimanService.kt`·`NotificationPrefs.kt`·`DomimanRepository.kt`
-·`DomimanWidgetProvider.kt`를 **C 드라이브 전체에서 찾아도 하나도 없다.**
-`domiman_android.md`·`domiman_protocol.md`·`domiman-release.jks`도 없다.
-→ **Kotlin 쪽 수정 요청은 소스를 확보하기 전에는 착수할 수 없다.** 먼저
-사용자에게 실제 프로젝트 위치(다른 PC인지 등)를 확인하고 이 문서를 갱신할 것.
+**② (낡음 — 2026-08-10 당시) Kotlin 소스가 이 PC에 없었다.** 지금은
+`macro/domiman-android/`에 전부 있다. 이 항목은 "문서가 가리키는 경로가 비어
+있으면 먼저 찾아보고 문서를 고쳐라"는 사례로만 남겨 둔다.
 
 **③ 헷갈리기 쉬운 '가짜' 폴더 3개 — 문서의 그 프로젝트가 아니다:**
 | 경로 | 정체 |
@@ -1150,12 +1263,18 @@ Navigation3/ViewModel과 겹쳐서, `DomimanRepository`는 그보다 낮은
 
 ---
 
-**실제 안드로이드 프로젝트(구현됨) — 위치가 이 저장소 밖입니다(중요):**
-`C:\Users\windo\dev\domiman-android` (Kotlin/Compose, Chaquopy 17.0.0으로
-`domiman_m.py`를 그대로 내장). **이 `macro` 폴더 안이 아니다** — AGP/Chaquopy가
-네이티브 빌드 도구 특성상 **비ASCII 경로에서 빌드를 거부**해서(`macro` 폴더가
-"한국교통대학교" 등 한글을 포함) 별도 ASCII 전용 경로로 옮겨 시작했다. 새
-기능을 추가할 때 이 사실을 잊고 `macro\domiman-android`를 찾지 말 것.
+**실제 안드로이드 프로젝트(구현됨) — 소스는 이 저장소 안, 빌드는 ASCII 경로에서
+(2026-08-28 정정):**
+- **소스(권위 사본) = `macro/domiman-android/`** — git으로 추적되고 GitHub
+  원격(`cheongbaek/domiman`)까지 올라간다. **여기를 고친다.**
+- **빌드 = `C:\Users\windo\dev\domiman-android`** — AGP/Chaquopy가 네이티브
+  빌드 도구 특성상 **비ASCII 경로에서 빌드를 거부**하는데(`macro` 경로에
+  "한국교통대학교" 등 한글이 있다) 그 제약은 그대로다. 그래서 이 폴더는 이제
+  **빌드 전용 거울**이다: 소스를 여기로 복사해 넣고 gradle을 돌린다.
+  `local.properties`(SDK 경로)와 `.gradle`/`app/build` 캐시가 여기 있어 빌드가
+  빠르다. 이 폴더의 git은 옛 백업(원격 없음)이고 지금은 권위가 없다.
+- 예전 문서는 "macro 안이 아니다"라고 못박아 뒀었다. 2026-08-21에 프로젝트가
+  저장소로 들어오면서 그 서술이 뒤집혔다 — **소스는 macro, 빌드만 dev**다.
 
 ### ⚠️ 현재 안드로이드 앱 상태 = 유지 대상(권위 문서, 재설계 금지)
 **새 세션에서 절대 UI/구조를 새로 설계하지 말 것.** 아래가 지금 실제로
@@ -1217,9 +1336,21 @@ Navigation3/ViewModel과 겹쳐서, `DomimanRepository`는 그보다 낮은
   시작/성공/실패, 낚싯대 교체 시작/성공/실패, 미끼 교체 시작/성공/실패, 게임 튕김.
   기본값 전부 on, SharedPreferences 영속(앱데이터 삭제 시 소멸).
 
-**빌드·배포 워크플로(현재 방식, 유지):**
-1. `cd C:\Users\windo\dev\domiman-android; $env:JAVA_HOME="C:\Program Files\Android\Android Studio\jbr"; .\gradlew.bat assembleDebug`
-2. 빌드 결과 `app\build\outputs\apk\debug\app-debug.apk`를 **손으로 복사해
+**빌드·배포 워크플로(2026-08-28 실측 기준):**
+1. `domiman_m.py`를 고쳤으면 **사본을 먼저 갱신**한다(자동 동기화 없음):
+   `Copy-Item domiman_m.py domiman-android\app\src\main\python\domiman_m.py`
+2. **소스를 빌드 거울로 복사**한다(비ASCII 경로에서는 빌드가 안 되므로):
+   `macro\domiman-android`의 `app\src`, `app\build.gradle.kts`, 루트 gradle
+   파일들 → `C:\Users\windo\dev\domiman-android`의 같은 자리.
+   (`app/src`는 통째로 지우고 새로 복사해야 지운 파일이 남지 않는다.
+    `local.properties`·`.gradle`·`app/build`는 **건드리지 말 것** — 거울의 SDK
+    경로와 캐시다.)
+3. `cd C:\Users\windo\dev\domiman-android; $env:JAVA_HOME="C:\Program Files\Android\Android Studio\jbr"; .\gradlew.bat assembleDebug`
+   - **`buildPython`은 빌드하는 PC에 실제로 있는 python.org 인터프리터여야 하고
+     `version`과 major.minor가 같아야 한다.** 260828a에 `3.12`로 적혀 있던 것을
+     `3.13`으로 되돌렸다 — 이 PC에는 3.12가 없다(`py -0` = 3.14·3.13). 3.13은
+     실제로 APK를 만들어낸 조합이다(APK 안 `libpython3.13.so`).
+4. 빌드 결과 `app\build\outputs\apk\debug\app-debug.apk`를 **손으로 복사해
    `C:\Users\windo\OneDrive - 한국교통대학교\domiman.apk`를 덮어쓴다**(사용자
    지정 배포 위치). gradle 자동복사 태스크는 두지 않음(사용자 요청).
 - **구조**: `Login`/`RecentLogins`/`Main` 3화면(Navigation3), 각 화면=
@@ -1318,15 +1449,19 @@ ntfy 발신·수신이 죽어 껐다 켜야 정상" 문제를 잡기 위해 세�
   절전모드가 백그라운드 서비스/네트워크를 죽이지 않도록. `savedInstanceState
   == null`일 때만(회전 재요청 방지).
 
-**홈 위젯 4x1(`DomimanWidgetProvider`, 구현됨):** `[새로고침]|수량|[다운로드]|[재생/중지]`.
+**홈 위젯 4x1(`DomimanWidgetProvider`, 구현됨):** `[새로고침]|수량|[스크린샷]|[재생/중지]`.
 아이콘은 제공된 초록 원형 세트(`widget_ic_*`, `A_clean_2x2_grid_icon_set...png`를
 사분면 크롭). 동작: 새로고침=`cmd_tank_query`(N, 토스트 "실시간 수량 확인"),
-다운로드=`cmd_collect_now`(토스트 "즉시 살림망 회수"), 재생/중지=시작·중지 토글
+스크린샷=`ScreenshotActivity`(옛 '즉시 회수' 칸을 260821~에 바꿔 끼움 — 아이콘·위치는
+그대로), 재생/중지=시작·중지 토글
 (running이면 정지 아이콘 `widget_ic_pause`+토스트 "매크로가 중지되었습니다",
 아니면 재생 `widget_ic_play`+"매크로가 시작되었습니다"). 각 버튼 누름 하이라이트
-(`widget_btn_bg`). **수량 표시는 새로고침(N 응답) 때만 갱신**(자동 폴링 없음),
-running 아이콘은 상태 변할 때 갱신 — 둘 다 `DomimanRepository`가 prefs
-(`widget_qty`/`widget_running`)에 쓰고 `DomimanWidgetProvider.refresh()` 호출.
+(`widget_btn_bg`). **수량 표시는 260828a부터 상시 갱신된다** — 피제어 PC가
+사이클마다 보내는 방송(`,Z,N,cur,mx`)을 받아 **30초에 한 번씩 묶어** 다시 그린다
+(값이 같으면·홈에 위젯이 없으면 아무 일도 하지 않는다. 위 [모바일 수신] 절 참고).
+새로고침(N 응답)은 사람이 기다리므로 즉시 그린다. running 아이콘은 상태가 변할 때
+갱신 — 전부 `DomimanRepository`가 prefs(`widget_qty`/`widget_running`)에 쓰고
+`DomimanWidgetProvider.refresh()`를 호출하는 구조다.
 **로그인 세션 없으면 수량칸에 '로그인' 표시**, 그 상태에선 모든 칸 탭이 앱을
 연다(로그인 유도). **로그인 상태에선 수량칸 탭도 앱을 연다.** 위젯 명령은
 `repository.widget*()` → `ensureClientReady()`(세션 없으면 마지막 로그인으로

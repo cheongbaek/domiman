@@ -32,6 +32,28 @@
             </intent-filter>
         </activity>
 
+        <!-- 홈 위젯 '스크린샷' 칸에서 여는 단독 화면. taskAffinity=""로 앱의 다른
+             화면과 별개 태스크로 띄워, 뒤로 가기를 누르면 MainActivity를 거치지
+             않고 곧바로 홈 화면으로 돌아간다(singleInstance로 항상 새 태스크). -->
+        <activity
+            android:name=".ScreenshotActivity"
+            android:exported="false"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:launchMode="singleInstance" />
+
+        <!-- 스크린샷 클립보드 복사용 FileProvider — 캐시에 쓴 PNG를 content:// URI로
+             내줘 ClipData.newUri가 다른 앱에도 읽기 권한을 넘길 수 있게 한다. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
         <!-- 백그라운드 domichat 수신·알림 유지용 포그라운드 서비스.
              specialUse|dataSync: 34+는 시간제한 없는 specialUse, 그 미만은 dataSync. -->
         <service

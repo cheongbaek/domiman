@@ -14,6 +14,10 @@ win32 클릭, WGC 캡처, OCR, 낚시 자동화 루틴)를 전부 제외하고, 
       명령:  "(대상PC),(명령)[,인자...]"   예) seoul,S / seoul,T,30
       응답:  "(요청자ID),Z,..."            예) mypho,Z,0,1080,a,f,t,t
       보고:  ",Z,F,(코드)[,(서브)]"        예) ,Z,F,y,b (미끼 교체 성공)
+      수량:  ",Z,N,(cur),(mx)" / ",Z,N,fail"   예) ,Z,N,114,570
+             (260828a 추가 — 피제어 PC가 살림망을 읽을 때마다 요청 없이
+              방송한다. 요청자 자리가 비어 있어 N **응답**과 구분된다.
+              위젯이 '새로고침을 눌렀을 때만' 갱신되던 제약을 없애는 신호다.)
   바뀐 것은 전송 계층뿐이다:
     - 방 이름 = domi_fishing_{피제어 PC의 domichat 로그인 ID}
     - 방 유형 = 비밀번호 방, 고정 비번 `domi_fishing_9714`
@@ -49,6 +53,7 @@ win32 클릭, WGC 캡처, OCR, 낚시 자동화 루틴)를 전부 제외하고, 
 단독 실행하면 로그인 → PC 선택 → 상태 질의까지의 스모크 테스트가 된다:
     python domiman_m.py <서버IP> <domichat ID> <PW> [제어할 PC 이름]
 """
+import base64
 import hashlib
 import json
 import queue
@@ -67,6 +72,7 @@ CHAT_PORT = 47821                       # domiserver 기본 포트
 ROOM_PREFIX = "domi_fishing_"
 ROOM_PW = "domi_fishing_9714"           # 고정(오진입 방지용)
 FRAME_HEAD = struct.Struct(">IB")       # [길이 4][종류 1]
+FILE_HEAD = struct.Struct(">16sI")      # 'B'(이미지 청크) 머리: fid 16B + seq 4B
 MAX_FRAME = 1024 * 1024
 CONNECT_TIMEOUT = 6.0
 READ_TIMEOUT = 60.0                     # 서버 ping 15초 → 60초 침묵이면 죽은 연결
@@ -75,6 +81,8 @@ RECONNECT_BACKOFF = (1, 2, 5, 10, 30)
 PENDING_TIMEOUT_SEC = 15.0   # domiman.py _check_pending_timeout과 동일
 LOGIN_TIMEOUT_SEC = 20.0     # 접속+로그인 왕복 대기 상한
 TARGET_TIMEOUT_SEC = 20.0    # 방 입장 + S 응답 대기 상한
+SHOT_START_TIMEOUT = 15.0    # ack 이후 사진(file_begin)이 시작될 때까지 대기 상한
+SHOT_STALL_TIMEOUT = 10.0    # 전송 시작 후 청크가 이 시간 넘게 끊기면 포기(domiman.py와 동일)
 
 # domichat 계정 ID 규칙(domiserver.ID_RE와 동일). 제어할 PC 이름도 그 PC의
 # domichat 로그인 ID이므로 같은 규칙을 쓴다.
@@ -264,8 +272,15 @@ class ChatClient:
         body = self._recv_exact(sock, ln) if ln else b""
         if body is None:
             return None
-        if chr(typ) != "T":
-            return {}                      # 이미지 등 — 원격 제어는 쓰지 않는다
+        kind = chr(typ)
+        if kind == "B":                    # 이미지 청크(스크린샷) — domichat.py와 동일 디코드
+            if len(body) < FILE_HEAD.size:
+                return {}
+            raw_fid, seq = FILE_HEAD.unpack(body[:FILE_HEAD.size])
+            return {"t": "bin", "fid": raw_fid.hex(), "seq": seq,
+                    "data": body[FILE_HEAD.size:]}
+        if kind != "T":
+            return {}
         return json.loads(body.decode("utf-8"))
 
     # ---------- 세션 ----------
@@ -430,6 +445,7 @@ class DomimanSession:
         self.my_id = ""             # domichat 로그인 ID(= 응답이 돌아올 이름)
         self.target = ""            # 제어 중인 PC 이름(= 그 PC의 domichat ID)
         self.pending = None         # {"kind": str, "sent": epoch}
+        self.shot_wait = None       # 스크린샷 ack 후 사진 도착 대기 상태(domiman.py와 동일 개념)
         self.server = ""            # "ip:port"(지문 저장 키)
         self.joined_target = ""     # 실제로 입장까지 끝난 대상
         self._stop = threading.Event()
@@ -574,6 +590,75 @@ class DomimanSession:
         파싱해 응답하므로 최대 5초 안팎 걸릴 수 있다(15초 타임아웃 내)."""
         self.send_command("N", "N")
 
+    def cmd_screenshot(self):
+        """'스크린샷'(I). 이미 사진을 기다리는 중이면 보내지 않는다(중복 요청
+        방지 — domiman.py on_screenshot과 동일한 정책)."""
+        if self.shot_wait is not None:
+            return False
+        return self.send_command("I", "I")
+
+    # ---------- 스크린샷 수신(ack 이후 file_begin→bin×N→file_end) ----------
+    def _begin_shot_wait(self):
+        self.shot_wait = {"t0": time.time(), "last": time.time(), "fid": None,
+                          "size": 0, "sha256": None, "name": "screenshot.png",
+                          "buf": None}
+
+    def _end_shot_wait(self):
+        self.shot_wait = None
+
+    def check_shot_timeout(self):
+        """ack 후 사진이 시작되지 않거나(SHOT_START_TIMEOUT), 시작된 뒤 청크가
+        멈추면(SHOT_STALL_TIMEOUT) 포기하고 실패 이벤트를 낸다. _pump_loop가
+        유휴 주기(0.2초)마다 불러 domiman.py의 250ms 틱과 같은 역할을 한다."""
+        w = self.shot_wait
+        if w is None:
+            return
+        now = time.time()
+        if w["fid"] is None:
+            if now - w["t0"] <= SHOT_START_TIMEOUT:
+                return
+        elif now - w["last"] <= SHOT_STALL_TIMEOUT:
+            return
+        self._end_shot_wait()
+        self._emit({"ev": "screenshot", "ok": False, "reason": "timeout"})
+
+    def _on_file(self, t, d):
+        """스크린샷 이미지 수신. 기다리는 중이 아니거나 제어 대상이 보낸 것이
+        아니면 버린다(domiman.py _on_file과 동일한 방어)."""
+        w = self.shot_wait
+        if w is None or not self.target:
+            return
+        fid = d.get("fid")
+        if t == "file_begin":
+            if d.get("from") != self.target or d.get("room") != room_of(self.target):
+                return
+            w.update({"fid": fid, "size": int(d.get("size") or 0),
+                      "sha256": d.get("sha256"), "buf": bytearray(),
+                      "name": d.get("name") or "screenshot.png",
+                      "last": time.time()})
+            return
+        if fid is None or fid != w.get("fid"):
+            return                          # 다른 전송 — 무시
+        if t == "bin":
+            w["buf"] += d.get("data", b"")
+            w["last"] = time.time()
+            return
+        if t == "file_abort":
+            self._end_shot_wait()
+            return self._emit({"ev": "screenshot", "ok": False, "reason": "aborted"})
+
+        # file_end — 크기·sha256을 확인하고 base64로 실어 보낸다(Kotlin 경계는
+        # JSON 문자열뿐이라 PyObject를 직접 건네지 않는다는 규칙을 이미지도 지킨다).
+        png, name = bytes(w["buf"]), w["name"]
+        ok = (not w["size"] or len(png) == w["size"])
+        if ok and w.get("sha256"):
+            ok = hashlib.sha256(png).hexdigest() == w["sha256"]
+        self._end_shot_wait()
+        if not ok:
+            return self._emit({"ev": "screenshot", "ok": False, "reason": "corrupt"})
+        self._emit({"ev": "screenshot", "ok": True, "name": name,
+                    "png_b64": base64.b64encode(png).decode("ascii")})
+
     # ---------- 수신 펌프 ----------
     def _emit(self, obj):
         self.q.put(obj)
@@ -598,11 +683,13 @@ class DomimanSession:
             try:
                 d = self.chat.q.get(timeout=0.2)
             except queue.Empty:
+                self.check_shot_timeout()   # 유휴 주기에도 타임아웃은 검사한다
                 continue
             try:
                 self._handle(d)
             except Exception as e:      # 한 프레임의 오류로 펌프가 죽지 않게
                 self._emit({"ev": "error", "msg": f"수신 처리 실패: {e}"})
+            self.check_shot_timeout()
 
     def _handle(self, d):
         ev = d.get("_ev")
@@ -626,6 +713,8 @@ class DomimanSession:
             return
 
         t = d.get("t")
+        if t in ("file_begin", "bin", "file_end", "file_abort"):
+            return self._on_file(t, d)
         if t == "welcome":
             return self._on_welcome(d)
         if t == "msg":
@@ -706,7 +795,13 @@ class DomimanSession:
         들어온 것 말고는 규칙이 같다:
           ("reply", [필드...])   -- 내 질의/명령에 대한 응답 ({my_id},Z,...)
           ("report", [필드...])  -- 대상 PC의 상황 보고 (,Z,F,... 브로드캐스트)
-          (None, None)           -- 무시 대상(대상 PC 것이 아니거나 규격 밖)"""
+          ("tank", [필드...])    -- 살림망 수량 상시 방송 (,Z,N,... 브로드캐스트)
+          (None, None)           -- 무시 대상(대상 PC 것이 아니거나 규격 밖)
+
+        **'tank'는 응답이 아니다(중요):** 요청 없이 감시 사이클마다 오므로
+        pending(응답 대기)을 소모해선 안 된다 — 명령 응답을 기다리는 중에
+        방송이 끼어들어 그 대기를 풀어버리면 UI가 잘못 열린다. 그래서 _on_msg의
+        resolve_pending()은 'reply'에만 걸려 있다."""
         if not self.target or frm != self.target:
             return None, None
         parts = [p.strip() for p in body.split(",")]
@@ -714,8 +809,11 @@ class DomimanSession:
             return None, None
         if parts[0] == self.my_id and parts[1] == "Z":
             return "reply", parts[2:]
-        if parts[0] == "" and parts[1] == "Z" and len(parts) >= 3 and parts[2] == "F":
-            return "report", parts[3:]
+        if parts[0] == "" and parts[1] == "Z" and len(parts) >= 3:
+            if parts[2] == "F":
+                return "report", parts[3:]
+            if parts[2] == "N":
+                return "tank", parts[3:]
         return None, None
 
     # ---------- Kotlin 경계(JSON 문자열) ----------
@@ -785,9 +883,16 @@ class DomimanSession:
     def parse_tank_reply(rest):
         """N 응답(rest[0]=='N' 가정) 뒤 필드 -> (cur, mx) 또는 None(파싱 실패).
         rest=['N','12','470'] -> (12,470),  ['N','fail'] -> None."""
-        if len(rest) >= 3:
+        return DomimanSession.parse_tank_fields(rest[1:])
+
+    @staticmethod
+    def parse_tank_fields(fields):
+        """['12','470'] -> (12,470). 'fail'이나 규격 밖이면 None(판독 실패).
+        N 응답(위)과 수량 방송(',Z,N,...')이 **같은 파서를 쓴다** — 두 경로가
+        어긋나면 응답과 방송이 서로 다른 값을 보여주게 된다."""
+        if len(fields) >= 2:
             try:
-                return int(rest[1]), int(rest[2])
+                return int(fields[0]), int(fields[1])
             except ValueError:
                 return None
         return None
@@ -795,12 +900,13 @@ class DomimanSession:
 
 def dispatch_result(session, kind, rest):
     """수신 메시지 하나를 Kotlin이 쓰는 이벤트 dict로 만든다. 스키마:
-      {"ev": "reply"|"report",
+      {"ev": "reply"|"report"|"tank",
        "status": {...}|null,            # 상태 응답(S/V/T/C)일 때
-       "tank": [cur,mx]|null,           # N(수량) 응답일 때
+       "tank": [cur,mx]|null,           # N(수량) 응답 또는 수량 방송일 때
        "tank_fail": bool,               # 위와 같되 파싱 실패(",Z,N,fail")
-       "echo": "G"|"P"|"W"|"Q"|"Y"|null, # 상태 없는 명령 에코일 때
+       "echo": "G"|"P"|"W"|"Q"|"Y"|"I"|null, # 상태 없는 명령 에코일 때
        "sched_minutes": str|null,       # echo=="Y"에 분 인자가 붙은 경우
+       "shot_fail": bool,               # echo=="I"인데 ',Z,I,fail'(캡처 실패)일 때만 true
        "report_text": str|null,         # ev=="report"일 때 로그에 띄울 문장
        "report_status_key": str|null,   # 위와 같이 온 상태문구 키(STATUS_TEXT)
        "report_notify_key": str|null}   # 위와 같이 온 알림 설정 키(NOTIFY_KEYS)
@@ -817,6 +923,14 @@ def dispatch_result(session, kind, rest):
             tank = DomimanSession.parse_tank_reply(rest)
             out["tank"] = list(tank) if tank else None
             out["tank_fail"] = tank is None
+        elif first == "I":
+            # 스크린샷 ack — ',Z,I'면 사진을 기다리기 시작하고, ',Z,I,fail'이면
+            # 그 자리에서 끝(domiman.py _handle_remote_reply의 'I' 분기와 동일).
+            out["echo"] = "I"
+            if len(rest) >= 2 and rest[1] == "fail":
+                out["shot_fail"] = True
+            else:
+                session._begin_shot_wait()
         elif first in ("G", "P", "W", "Q", "Y"):
             out["echo"] = first
             if first == "Y" and len(rest) >= 2:
@@ -828,6 +942,14 @@ def dispatch_result(session, kind, rest):
         out["report_text"] = text
         out["report_status_key"] = status_key
         out["report_notify_key"] = notify_key_for_report(rest)
+    elif kind == "tank":
+        # 살림망 수량 상시 방송(260828a). 필드 모양은 N 응답과 같지만 'N' 글자가
+        # 앞에 없다. **알림·상태문구는 붙이지 않는다** — 사이클마다 오는 신호라
+        # 알림을 띄우면 그것만으로 알림창이 가득 찬다. 받는 쪽(Kotlin)은 이
+        # 이벤트로 **위젯 표시만** 갱신하고, 화면 로그에는 남기지 않는다.
+        tank = DomimanSession.parse_tank_fields(rest)
+        out["tank"] = list(tank) if tank else None
+        out["tank_fail"] = tank is None
     return out
 
 

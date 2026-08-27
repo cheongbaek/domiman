@@ -32,11 +32,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.domiman.data.DomimanRepository
+import com.example.domiman.ui.screenshot.ScreenshotViewer
 
 @Composable
 fun MainScreen(
@@ -52,6 +55,7 @@ fun MainScreen(
   val selectedPc by viewModel.selectedPc.collectAsStateWithLifecycle()
   val pcList by viewModel.pcList.collectAsStateWithLifecycle()
   val connected by viewModel.connected.collectAsStateWithLifecycle()
+  val screenshotResult by viewModel.screenshotResult.collectAsStateWithLifecycle()
 
   var backPressCount by remember { mutableStateOf(0) }
   var showResolutionDialog by remember { mutableStateOf(false) }
@@ -105,9 +109,10 @@ fun MainScreen(
       Text("해상도", modifier = Modifier.weight(1f))
       Text(state.resolutionLabel, style = MaterialTheme.typography.bodyMedium)
     }
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
       OutlinedButton(onClick = { showResolutionDialog = true }, enabled = controlsEnabled) { Text("직접 설정") }
       OutlinedButton(onClick = viewModel::onResolutionAuto, enabled = controlsEnabled) { Text("자동 감지") }
+      OutlinedButton(onClick = viewModel::onScreenshot, enabled = controlsEnabled) { Text("스크린샷") }
     }
 
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -213,6 +218,15 @@ fun MainScreen(
         Text("로그아웃")
       }
       TextButton(onClick = onOpenNotificationSettings) { Text("알림 설정") }
+    }
+  }
+
+  screenshotResult?.let { shot ->
+    Dialog(
+      onDismissRequest = viewModel::onScreenshotDialogDismiss,
+      properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+      ScreenshotViewer(name = shot.name, bytes = shot.bytes, onClose = viewModel::onScreenshotDialogDismiss)
     }
   }
 

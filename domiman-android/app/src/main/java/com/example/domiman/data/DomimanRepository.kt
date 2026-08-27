@@ -36,6 +36,13 @@ private const val KEY_SELECTED_PC = "selected_pc"
 private const val KEY_WIDGET_QTY = "widget_qty" // 위젯 수량 표시(마지막 새로고침 값)
 private const val KEY_WIDGET_RUNNING = "widget_running" // 위젯 재생/중지 아이콘 상태
 
+/** 수량 방송(",Z,N,cur,mx")을 위젯에 반영하는 최소 간격.
+ * 피제어 PC는 감시 사이클마다(최소 획득 시간 = 보통 5~20초) 보내오지만,
+ * 살림망은 몇 시간에 걸쳐 차는 값이라 초 단위로 다시 그릴 이유가 없다.
+ * 값은 항상 메모리에 담아 두고 재그림만 이 간격으로 **묶는다**(버리지 않는다).
+ * 백그라운드가 하는 일을 '살림망 변화 감지' 수준으로 묶어두려는 값이다. */
+private const val TANK_WIDGET_MIN_INTERVAL_MS = 30_000L
+
 private const val LOGIN_TIMEOUT_SEC = 20.0
 private const val TARGET_TIMEOUT_SEC = 20.0
 private const val TEARDOWN_TIMEOUT_MS = 4_000L
@@ -109,6 +116,14 @@ class DomimanRepository(context: Context) {
   val events: SharedFlow<DomimanEvent> = _events.asSharedFlow()
 
   private var pumpJob: Job? = null
+
+  // 수량 방송 코얼레싱 상태(아래 onTankBroadcast). **락이 필요하다** —
+  // appScope는 Dispatchers.IO(다중 스레드)라 이벤트 펌프 코루틴과 30초 뒤
+  // 깨어나는 지연 코루틴이 동시에 여기를 만질 수 있다.
+  private val tankLock = Any()
+  private var pendingTankText: String? = null // 아직 위젯에 못 그린 최신 값
+  private var lastTankFlushMs = 0L
+  private var tankFlushJob: Job? = null
 
   // ---------- 영속 상태(파이썬 없이 읽고 쓰는 값들) ----------
   private fun readStoreFromPrefs(): LoginStoreJson =
@@ -307,6 +322,7 @@ class DomimanRepository(context: Context) {
     session = null
     pumpJob?.cancel()
     pumpJob = null
+    cancelTankFlush() // 세션이 없으니 늦게 깨어나 그릴 이유도 없다
     DomimanWidgetProvider.refresh(appContext) // 수량 → '로그인' 표시로 전환
 
     // 2) 실제 정리는 뒤에서. 소켓이 물려 있어도 UI는 이미 넘어가 있다.
@@ -326,8 +342,17 @@ class DomimanRepository(context: Context) {
     _connected.value = false
     pumpJob?.cancel()
     pumpJob = null
+    cancelTankFlush()
     withTimeoutOrNull(TEARDOWN_TIMEOUT_MS) {
       withContext(Dispatchers.IO) { runCatching { dead.callAttr("stop") } }
+    }
+  }
+
+  private fun cancelTankFlush() {
+    synchronized(tankLock) {
+      tankFlushJob?.cancel()
+      tankFlushJob = null
+      pendingTankText = null
     }
   }
 
@@ -377,6 +402,13 @@ class DomimanRepository(context: Context) {
 
   suspend fun sendTankQuery() = cmd("cmd_tank_query")
 
+  /** '스크린샷'(I) 요청. 이미 사진을 기다리는 중이면 파이썬이 보내지 않고
+   * false를 돌려준다(cmd_screenshot의 중복 요청 방지 그대로). */
+  suspend fun sendScreenshot(): Boolean =
+    withContext(Dispatchers.IO) {
+      runCatching { session?.callAttr("cmd_screenshot")?.toBoolean() ?: false }.getOrElse { false }
+    }
+
   // ---------- 이벤트 펌프 ----------
   /** 파이썬 세션 큐를 IO 코루틴에서 계속 비워 Kotlin 이벤트로 흘린다.
    * 파이썬으로 콜백(람다)을 넘기지 않는 이유: 로그아웃 때 죽은 스코프를 붙잡아
@@ -400,6 +432,14 @@ class DomimanRepository(context: Context) {
   }
 
   private suspend fun handleEvent(event: DomimanEvent) {
+    // 수량 방송은 여기서 끝낸다(260828a). 아래의 알림·상태·이벤트 흐름에
+    // 태우지 않는 이유: 사이클마다 오는 신호라 알림창과 8줄짜리 화면 로그가
+    // 그것만으로 가득 차고, UI 재구성도 헛돌게 된다. 이 신호가 바꾸는 것은
+    // **위젯 표시 하나뿐**이다.
+    if (event.ev == "tank") {
+      onTankBroadcast(event)
+      return
+    }
     when (event.ev) {
       "login_ok", "reconnected" -> _connected.value = true
       "disconnected", "login_fail", "cert_changed" -> _connected.value = false
@@ -428,15 +468,66 @@ class DomimanRepository(context: Context) {
       "G" -> if (setWidgetRunning(true)) widgetChanged = true
       "P" -> if (setWidgetRunning(false)) widgetChanged = true
     }
-    // 수량: N 응답(tank)일 때만 갱신(= 수동 새로고침 시에만, 요구사항).
+    // 수량: N **응답**(사용자가 새로고침을 누른 결과)은 기다리는 사람이 있으니
+    // 지체 없이 그린다. 사이클마다 오는 방송은 위 onTankBroadcast가 30초로
+    // 묶어서 처리한다(둘의 차이는 '사람이 기다리는가'다).
     if (event.tank != null && event.tank.size >= 2) {
-      prefs.edit().putString(KEY_WIDGET_QTY, "${event.tank[0]}/${event.tank[1]}").apply()
+      setWidgetQty("${event.tank[0]}/${event.tank[1]}")
       widgetChanged = true
     } else if (event.tankFail && event.ev == "reply") {
-      prefs.edit().putString(KEY_WIDGET_QTY, "실패").apply()
+      setWidgetQty("실패")
       widgetChanged = true
     }
     if (widgetChanged) DomimanWidgetProvider.refresh(appContext)
+  }
+
+  // ---------- 수량 상시 방송(위젯 전용) ----------
+  /** 피제어 PC가 감시 사이클마다 보내오는 살림망 수량을 위젯에 반영한다.
+   *
+   * **백그라운드가 하는 일을 최소로 묶는 것이 이 함수의 요지다:**
+   *  - 값이 이미 같으면 즉시 반환(prefs·RemoteViews 둘 다 건드리지 않는다).
+   *  - 홈에 위젯이 하나도 없으면 아무 것도 하지 않는다(그릴 대상이 없다).
+   *  - 값이 바뀌었어도 재그림은 30초에 한 번(TANK_WIDGET_MIN_INTERVAL_MS).
+   *    묶는 동안 들어온 값은 pendingTankText에 덮어써 두고, 창이 열리면
+   *    **마지막 값 하나만** 그린다 — 지연될 뿐 버려지지 않는다. */
+  private fun onTankBroadcast(event: DomimanEvent) {
+    val text =
+      if (event.tank != null && event.tank.size >= 2) "${event.tank[0]}/${event.tank[1]}"
+      else if (event.tankFail) "실패"
+      else return
+    var flushNow = false
+    synchronized(tankLock) {
+      if (text == pendingTankText) return // 이미 대기 중인 값과 같다
+      if (pendingTankText == null && text == widgetQtyText()) return // 이미 그려진 값
+      // 홈에 위젯이 없으면 그릴 대상이 없다 — prefs도 건드리지 않고 끝낸다.
+      if (!DomimanWidgetProvider.hasInstances(appContext)) return
+      pendingTankText = text
+      val waited = System.currentTimeMillis() - lastTankFlushMs
+      if (waited >= TANK_WIDGET_MIN_INTERVAL_MS) {
+        flushNow = true
+      } else if (tankFlushJob?.isActive != true) {
+        tankFlushJob = appScope.launch { delay(TANK_WIDGET_MIN_INTERVAL_MS - waited); flushTank() }
+      }
+    }
+    if (flushNow) flushTank() // 그리는 일은 락 밖에서(바인더 호출을 물고 있지 않게)
+  }
+
+  private fun flushTank() {
+    var taken: String? = null
+    synchronized(tankLock) {
+      taken = pendingTankText ?: return
+      pendingTankText = null
+      lastTankFlushMs = System.currentTimeMillis()
+    }
+    val text = taken ?: return
+    setWidgetQty(text)
+    DomimanWidgetProvider.refresh(appContext)
+  }
+
+  /** 위젯 수량 표시 저장. 같은 값이면 쓰지 않는다(디스크 I/O 절약). */
+  private fun setWidgetQty(text: String) {
+    if (widgetQtyText() == text) return
+    prefs.edit().putString(KEY_WIDGET_QTY, text).apply()
   }
 
   /** running 상태를 위젯용으로 저장. 값이 바뀌었으면 true(그때만 위젯 재그림). */
@@ -457,17 +548,15 @@ class DomimanRepository(context: Context) {
 
   fun widgetRunning(): Boolean = prefs.getBoolean(KEY_WIDGET_RUNNING, false)
 
-  /** 위젯 단발 명령 전에 세션 + 제어 PC가 준비돼 있는지 보장. 제어 PC를 아직
-   * 고르지 않았으면 보낼 곳이 없으므로 false. */
-  private suspend fun ensureClientReady(): Boolean {
+  /** 위젯·스크린샷 화면 등 단발 명령 전에 세션 + 제어 PC가 준비돼 있는지 보장.
+   * 제어 PC를 아직 고르지 않았으면 보낼 곳이 없으므로 false. */
+  suspend fun ensureClientReady(): Boolean {
     if (_selectedPc.value == null) return false
     if (session != null) return true
     return ensureSessionAlive()
   }
 
   fun widgetRefresh() = appScope.launch { if (ensureClientReady()) sendTankQuery() }
-
-  fun widgetCollect() = appScope.launch { if (ensureClientReady()) sendCollectNow() }
 
   fun widgetToggle() =
     appScope.launch {

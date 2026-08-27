@@ -563,16 +563,21 @@ class ChatClient:
 CHAT = ChatClient()
 
 
-def chat_send(body, room=None, wait=False):
+def chat_send(body, room=None, wait=False, quiet=False):
     """프로토콜 메시지 발신. room 을 안 주면 **내 방**(피제어 역할)으로 보낸다.
-    ntfy 시절 발신 함수 자리를 그대로 대신한다."""
+    ntfy 시절 발신 함수 자리를 그대로 대신한다.
+
+    `quiet=True`는 로그를 남기지 않는다 — 살림망 수량 상시 방송처럼 **감시
+    사이클마다 나가는** 발신용이다(사이클마다 '[발신]' 한 줄이면 로그가 그것만
+    으로 가득 찬다). 명령·응답·보고는 몇 초에 한 번이 아니므로 그대로 찍는다."""
     if not chat_enabled or not CHAT.logged_in.is_set():
         return False
     target = room or MY_ROOM
     if not target:
         return False
     ok = CHAT.send({"t": "msg", "room": target, "body": body}, wait=wait)
-    print(f"[발신] {body}" if ok else f"[발신 보류] {body} (연결 없음)")
+    if not quiet:
+        print(f"[발신] {body}" if ok else f"[발신 보류] {body} (연결 없음)")
     return ok
 
 
@@ -628,7 +633,7 @@ def send_report(code):
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260822c"
+APP_VERSION = "260828a"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -859,24 +864,6 @@ game_capture = None
 # ============================================================
 # [6. 창 탐색 / 해상도 감지 / 좌표 변환 / 입력 (낚시.py 이식)]
 # ============================================================
-def _find_game_hwnd(keyword=GAME_KEYWORD):
-    found = [None]
-
-    def cb(hwnd, _):
-        try:
-            if win32gui.IsWindowVisible(hwnd):
-                if keyword.lower() in win32gui.GetWindowText(hwnd).lower():
-                    found[0] = hwnd
-        except Exception:
-            pass
-
-    try:
-        win32gui.EnumWindows(cb, None)
-    except Exception:
-        pass
-    return found[0]
-
-
 def _pick_game_hwnd(keyword=GAME_KEYWORD):
     """진짜 렌더링 창 선택(숨은 중복 창 제외, 최소화 아닌 창 우선)."""
     wins = []
@@ -933,11 +920,87 @@ def detect_resolution(keyword=GAME_KEYWORD):
     return "1440p", mw, mh, is_primary
 
 
+def _client_geometry_of(hwnd):
+    """hwnd의 클라이언트 영역 (화면 원점x, 원점y, 폭, 높이). 못 얻으면 None.
+    창이 죽었으면 GetClientRect가 예외를, 최소화 상태면 0x0을 주므로 둘 다
+    None으로 떨어진다(호출부가 다른 창을 다시 찾을 수 있게)."""
+    if not hwnd:
+        return None
+    try:
+        cl, ct, cr, cb = win32gui.GetClientRect(hwnd)
+        cw, ch = cr - cl, cb - ct
+        if cw <= 0 or ch <= 0:
+            return None
+        ox, oy = win32gui.ClientToScreen(hwnd, (0, 0))
+    except Exception:
+        return None
+    return int(ox), int(oy), int(cw), int(ch)
+
+
+def _client_geometry():
+    """게임 창 클라이언트 영역 (원점x, 원점y, 폭, 높이). 실패 시 None.
+
+    **좌표 변환·화면 자르기의 유일한 근거이며 FHD/QHD 공통이다(260828a).**
+    예전에는 1080p 모드에서 이 값을 아예 보지 않고 FHD 좌표를 화면 좌표로
+    그대로 썼는데, 그건 '게임 클라이언트 영역이 화면 (0,0)에 1920x1080으로 딱
+    붙어 있다'는 전제였다. 창이 조금이라도 움직이면 그 전제만 깨지므로 **판독은
+    멀쩡한데 클릭만 어긋나는** 상태가 된다(실제 증상): 감시 모드 판독은 FHD에서도
+    WGC로 창을 직접 잡아 창 기준이라 수량을 잘 읽는데, 클릭은 화면 절대좌표라
+    엉뚱한 곳을 눌러 루틴이 진행되지 않았다. QHD가 창이 움직여도 정확했던 이유가
+    바로 이 변환을 쓰고 있었기 때문이니, 두 모드가 같은 길을 쓰게 한다.
+
+    창 선택은 반드시 '보이는 창 중 클라이언트가 가장 큰 것'(`_pick_game_hwnd`)
+    이다 — 게임은 같은 제목의 **숨은 창**(1920x1080, (0,0))을 하나 더 만들고,
+    그 창을 잡으면 변환이 무력화된다. 평소에는 `bring_game_to_front`가 그렇게
+    골라 둔 `GAME_HWND`를 그대로 쓰고, 그것이 죽었거나 최소화됐을 때만 다시
+    찾는다(매 클릭마다 EnumWindows를 돌지 않게)."""
+    return (_client_geometry_of(GAME_HWND)
+            or _client_geometry_of(_pick_game_hwnd()))
+
+
+_last_client_geo = None
+
+
+def _note_client_geometry(geo):
+    """게임 창 클라이언트 영역이 바뀌면 그때 한 줄만 남긴다(진단용).
+    창이 움직였다는 사실과, 좌표 변환이 그걸 따라가고 있다는 사실을 로그에서
+    확인하려는 것 — 클릭마다 찍으면 로그가 그것만으로 가득 찬다."""
+    global _last_client_geo
+    if geo == _last_client_geo:
+        return
+    _last_client_geo = geo
+    ox, oy, cw, ch = geo
+    print(f"[좌표] 게임 창 클라이언트 ({ox},{oy}) {cw}x{ch} 기준으로 변환합니다.")
+
+
+def _fhd_region_to_client(region):
+    """FHD 기준 (x,y,w,h)를 실제 화면 기준 (x,y,w,h)로. 창을 못 찾으면 None.
+    to_screen과 같은 변환이라 클릭 자리와 자르는 자리가 항상 함께 움직인다."""
+    geo = _client_geometry()
+    if geo is None:
+        return None
+    ox, oy, cw, ch = geo
+    x, y, w, h = region
+    sx, sy = cw / 1920.0, ch / 1080.0
+    return (int(ox + x * sx), int(oy + y * sy),
+            max(1, int(round(w * sx))), max(1, int(round(h * sy))))
+
+
 def grab_region_rgb(region):
-    """FHD 좌표 region의 화면 조각을 RGB numpy로. 실패 시 None."""
+    """FHD 좌표 region의 화면 조각을 RGB numpy로. 실패 시 None.
+
+    1080p 모드는 화면을 직접 찍는데(pyautogui), **찍을 자리도 창을 따라가야
+    한다(260828a)** — 예전엔 FHD 좌표를 화면 좌표로 그대로 써서 창이 움직이면
+    엉뚱한 자리를 잘랐다(퀴즈 인식·성공 판정이 조용히 실패하는 원인). 클릭과
+    같은 변환을 쓰므로 창이 (0,0)에 1920x1080으로 있으면 예전과 완전히 같은
+    영역이 나온다. 창을 못 찾으면 예전 동작(화면 절대좌표)으로 폴백.
+
+    잘라낸 크기는 환산된 그대로 둔다(FHD 크기로 되돌리지 않는다) —
+    `_watch_grab_region`도 원본 배율로 자르고, 호출부(윤곽선 매칭·OCR·잉크 폭)는
+    전부 크롭 실제 크기로 정규화하도록 되어 있다."""
     x, y, w, h = region
     if CURRENT_RESOLUTION == "1080p":
-        shot = pyautogui.screenshot(region=region)
+        shot = pyautogui.screenshot(region=_fhd_region_to_client(region) or region)
         return np.array(shot)
     frame = game_capture.get_frame_1080() if game_capture else None
     if frame is None:
@@ -949,16 +1012,24 @@ def grab_region_rgb(region):
 
 
 def to_screen(coords):
+    """FHD(1920x1080) 기준 좌표 -> 실제 화면 좌표. **FHD/QHD 공통 경로**.
+
+    260828a 전까지 1080p 모드는 이 변환을 건너뛰고 FHD 좌표를 그대로 화면
+    좌표로 썼다(= 창이 화면 (0,0)에 1920x1080으로 있다는 전제). 그래서 창이
+    조금 움직이면 그만큼 전부 어긋난 자리를 눌러 루틴이 진행되지 않았다.
+    이제 두 모드가 같은 공식을 쓴다 — 창이 전제 위치에 있으면 결과는 예전과
+    똑같으므로(오프셋 0, 배율 1) 검증된 좌표는 그대로 유효하다.
+
+    `GetWindowRect`가 아니라 `GetClientRect`+`ClientToScreen`을 쓰는 이유는
+    3px 테두리 오차를 없애기 위함(검증 기록 참고). top이 음수(창이 화면 위로
+    삐져나감)여도 공식은 그대로 성립한다."""
     fx, fy = coords
-    if CURRENT_RESOLUTION == "1080p":
-        return int(fx), int(fy)
-    hwnd = GAME_HWND or _find_game_hwnd()
-    if not hwnd:
+    geo = _client_geometry()
+    if geo is None:
         print("[경고] 게임 창을 찾지 못해 좌표 보정을 건너뜁니다.")
         return int(fx), int(fy)
-    cl, ct, cr, cbm = win32gui.GetClientRect(hwnd)
-    cw, ch = cr - cl, cbm - ct
-    ox, oy = win32gui.ClientToScreen(hwnd, (0, 0))
+    _note_client_geometry(geo)
+    ox, oy, cw, ch = geo
     return int(ox + fx / 1920.0 * cw), int(oy + fy / 1080.0 * ch)
 
 
@@ -1319,8 +1390,14 @@ def capture_game_png():
         if CURRENT_RESOLUTION != "1080p":
             return None, "게임 화면을 캡처하지 못했습니다(WGC 캡처 불가)."
         try:
-            shot = pyautogui.screenshot(region=(0, 0, 1920, 1080))
-            frame = cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2BGR)
+            # 폴백도 창 기준으로 자른다(grab_region_rgb가 변환을 안다) — 창이
+            # 움직인 채로 화면 (0,0)을 찍으면 진단용 사진이 밀려서 온다.
+            rgb = grab_region_rgb((0, 0, 1920, 1080))
+            if rgb is None:
+                return None, "화면 캡처에 실패했습니다."
+            frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            if frame.shape[:2] != (1080, 1920):
+                frame = cv2.resize(frame, (1920, 1080), interpolation=cv2.INTER_AREA)
         except Exception as e:
             return None, f"화면 캡처에 실패했습니다({e})."
     try:
@@ -1497,8 +1574,8 @@ def _dump_ocr_crop(tag, region, text):
 
 # 마지막으로 파싱한 살림망 수량. (cur, mx)면 성공, None이면 직전 실패/미파싱.
 # 원래 '실시간 수량확인'이 캐시로 읽었으나, 260728b에서 캐시 우선 분기를
-# 없애며(항상 창을 불러 새로 읽음) 읽는 쪽이 사라졌다 — 지금은 기록만 되고
-# 참조하는 곳이 없다.
+# 없애며(항상 창을 불러 새로 읽음) 읽는 쪽이 사라졌다. 지금은 note_tank_qty가
+# 여기에 기록하면서 방송까지 함께 처리한다.
 _last_tank = None
 _last_tank_ocr = ""   # 마지막으로 읽은 수량 OCR 원문(판독 실패 원인 추적용)
 _last_tank_max = None # 마지막으로 받아들인 살림망 최대치(바뀌면 한 번 더 확인)
@@ -1590,6 +1667,34 @@ def read_tank_quantity(retries=4, delay=0.3):
             return None            # 다음 사이클에 다시 읽는다
     _last_tank_max = best[1]
     return best
+
+
+def note_tank_qty(qty):
+    """살림망 수량을 **읽을 때마다** 한 곳으로 모은다((cur,mx) 또는 실패 None):
+    최근값을 기록하고(_last_tank) 그대로 내 방으로 방송한다.
+
+    방송이 260828a에 추가됐다. 예전에는 제어 측이 'N'을 물어볼 때만 수량이
+    건너갔으므로 휴대폰·제어 PC는 **버튼을 누른 순간의 값**만 볼 수 있었다.
+    감시 루프는 어차피 사이클마다(=최소 획득 시간마다) 수량을 읽으니, 읽은
+    값을 그대로 흘려보내면 받는 쪽은 프로세스가 도는 동안 상시로 현재 수량을
+    본다 — 요청 왕복이 없는 밀어내기라 폴링보다 싸고 즉시다.
+
+    규격은 기존 N 응답과 같은 모양을 쓰되 **요청자 자리를 비운다**:
+    `,Z,N,(cur),(mx)` / `,Z,N,fail`. 보고(`,Z,F,*`)와 같은 무명 방송이므로
+    '누구 앞으로 온 응답인가'와 구분되고, 받는 쪽은 pending을 건드리지 않는다.
+
+    발신은 `quiet=True`로 조용히 한다(사이클마다 '[발신]'을 찍으면 로그가
+    그것만으로 가득 찬다). 서버는 메시지를 저장하지 않고 방에 뿌리기만 하므로
+    사이클마다 보내도 쌓이는 것이 없고, 로그인 전이면 chat_send가 그대로
+    무시한다.
+
+    **PC는 보내는 것까지만 한다** — '항상 갱신되는 수량 표시'는 모바일 위젯의
+    몫이다(사용자 확정). 그래서 이 방송을 받는 PC 쪽도 전용 표시 위젯을 두지
+    않고, 상태가 바뀔 때만 로그 한 줄을 남긴다(_handle_remote_tank)."""
+    global _last_tank
+    _last_tank = qty
+    chat_send(",Z,N," + (f"{qty[0]},{qty[1]}" if qty is not None else "fail"),
+              quiet=True)
 
 
 def _tank_needs_collect(qty):
@@ -2111,7 +2216,6 @@ class FishingWorker(threading.Thread):
 
     # --- 살림망 감시 모드 (낚시.py watch_tank_mode 이식) ---
     def _watch_loop(self):
-        global _last_tank
         print("\n=== [살림망 감시 모드] ===")
         print("살림망 수량이 (최대-5)에 도달하면 자동 회수합니다.")
         set_status("fishing")
@@ -2126,7 +2230,9 @@ class FishingWorker(threading.Thread):
             _ensure_watch_capture()
 
             qty = read_tank_quantity()
-            _last_tank = qty          # 기록만 (성공=(cur,mx)/실패=None, 위 정의 주석 참고)
+            # 기록 + 방송(성공=(cur,mx)/실패=None). 사이클마다 나가므로 제어
+            # 측·휴대폰은 요청 없이도 현재 수량을 계속 받는다(note_tank_qty 참고).
+            note_tank_qty(qty)
             minsec = read_min_gain_time()
 
             # '1초'는 낚싯대 만료 신호지만 **'11초'의 오인식일 수도** 있다
@@ -2478,6 +2584,7 @@ class DomimanApp:
         self.my_room_ready = False       # 내 방(피제어용) 준비 완료 여부
         self.joining_room = None         # 제어 대상 방 입장 시도 중
         self.shot_wait = None            # 스크린샷 대기 상태(제어 측)
+        self.remote_tank = None          # 제어 대상의 최근 수량: (cur,mx)|"fail"|None
 
         root.title("domiman.py")
         try:
@@ -3038,14 +3145,12 @@ class DomimanApp:
             on_result(qty)
 
         def _bg():
-            global _last_tank
             try:
                 bring_game_to_front(GAME_KEYWORD)
                 _ensure_watch_capture()
                 abort_sleep(3.0)        # 창이 떠 숫자가 렌더될 시간
                 qty = read_tank_quantity()
-                if qty is not None:
-                    _last_tank = qty
+                note_tank_qty(qty)      # 기록 + 방송(감시 루프와 같은 통로)
                 _report(qty)            # 결과 먼저 알림(원격 N 응답을 빠르게)
                 # 낚시 상태 확인 후 '낚시 시작'(대기 중)이면 눌러서 재개.
                 # 단 회수해야 할 수량(특히 최대치 초과)이면 눌러도 낚시가 안
@@ -3440,6 +3545,12 @@ class DomimanApp:
                   and len(parts) >= 3 and parts[2] == "F"
                   and title == self.remote_target):
                 self._handle_remote_report(parts[3:])
+            elif (parts[0] == "" and parts[1] == "Z"
+                  and len(parts) >= 3 and parts[2] == "N"
+                  and title == self.remote_target):
+                # 요청 없이 흘러오는 살림망 수량(피제어 PC가 사이클마다 방송).
+                # 응답(요청자,Z,N,...)과 달리 요청자 자리가 비어 구분된다.
+                self._handle_remote_tank(parts[3:])
             return
 
         # 로컬 모드: 나를 지목한 명령만 처리 (Z=응답은 명령이 아님)
@@ -3650,6 +3761,10 @@ class DomimanApp:
                       f"살림망 {rest[1]}/{rest[2]}")
             else:
                 print(f"[실시간 수량 확인] {self.remote_target}: 수량 파싱 실패")
+            # 방금 찍은 값이 곧 최신 상태다 — 뒤이어 올 방송이 같은 상태를
+            # 한 번 더 찍지 않도록 여기서 맞춰 둔다.
+            qty = self._parse_tank_fields(rest[1:])
+            self.remote_tank = qty if qty is not None else "fail"
         elif first == "Q":
             print(f"[원격] {self.remote_target}가 종료되었습니다. 이 PC 제어로 복귀합니다.")
             self._exit_remote()
@@ -3687,6 +3802,32 @@ class DomimanApp:
             self._applying_remote = False
         self.remote_running_shown = (rest[4] == "t")
         self._set_start_button_remote()
+
+    @staticmethod
+    def _parse_tank_fields(fields):
+        """['114','570'] -> (114,570). 'fail'이나 규격 밖이면 None(판독 실패)."""
+        if len(fields) >= 2 and fields[0].isdigit() and fields[1].isdigit():
+            return int(fields[0]), int(fields[1])
+        return None
+
+    def _handle_remote_tank(self, rest):
+        """제어 대상이 사이클마다 보내는 살림망 수량(',Z,N,cur,mx' / ',Z,N,fail').
+
+        요청에 대한 응답이 아니므로 **pending은 건드리지 않는다** — 명령 응답을
+        기다리는 중에 방송이 끼어들어도 그 대기를 깨지 않아야 한다.
+
+        **사이클마다 오지만 로그는 상태가 바뀔 때만 남긴다**(연결 직후 첫 값 ·
+        판독 실패 <-> 회복). 값이 오를 때마다 찍으면 로그가 그것만으로 가득
+        찬다 — 값 자체를 계속 보여주는 일은 모바일 위젯이 맡는다(사용자 확정).
+        지금 값이 궁금하면 '실시간 수량확인'(N)을 누르면 된다."""
+        qty = self._parse_tank_fields(rest)
+        prev, self.remote_tank = self.remote_tank, (qty if qty is not None else "fail")
+        if prev is not None and (prev == "fail") == (self.remote_tank == "fail"):
+            return                      # 상태 그대로 — 조용히 값만 갱신
+        body = ("수량을 판독하지 못하고 있습니다" if qty is None
+                else f"살림망 {qty[0]}/{qty[1]}")
+        print(f"[{time.strftime('%H:%M:%S')}] [원격 수량] "
+              f"{self.remote_target}: {body}")
 
     def _handle_remote_report(self, rest):
         """제어 대상의 상황 보고(,Z,F,*)를 로그 문구로 변환·표시."""
@@ -3813,6 +3954,7 @@ class DomimanApp:
         self.remote_running_shown = False
         self.remote_exit_deadline = None
         self.bt_pc.configure(text=target)
+        self.remote_tank = None          # 첫 방송을 '새 소식'으로 받기 위해 비운다
         self._update_remote_widgets()
         self._set_start_button_remote()
         self.joining_room = room_of(target)
@@ -3831,6 +3973,7 @@ class DomimanApp:
         self.remote_running_shown = None
         self.remote_exit_deadline = None
         self.shot_wait = None          # 기다리던 사진은 포기한다(대상이 사라졌으므로)
+        self.remote_tank = None
         self._update_remote_widgets()
         if self._timer_debounce_id is not None:
             self.root.after_cancel(self._timer_debounce_id)

@@ -41,12 +41,18 @@ data class DomimanEvent(
   val status: DomimanStatus? = null,
   val tank: List<Int>? = null,
   @SerialName("tank_fail") val tankFail: Boolean = false,
-  // 상태 필드 없는 명령 에코("G"/"P"/"W"/"Q"/"Y"). G/P로 시작/중지 상태를 갱신한다.
+  // 상태 필드 없는 명령 에코("G"/"P"/"W"/"Q"/"Y"/"I"). G/P로 시작/중지 상태를 갱신한다.
   val echo: String? = null,
   @SerialName("sched_minutes") val schedMinutes: String? = null,
   @SerialName("report_text") val reportText: String? = null,
   @SerialName("report_status_key") val reportStatusKey: String? = null,
   @SerialName("report_notify_key") val reportNotifyKey: String? = null,
+  // echo=="I"인데 캡처 자체가 실패("`,Z,I,fail`")했을 때만 true.
+  @SerialName("shot_fail") val shotFail: Boolean = false,
+  // ev=="screenshot"(파일 전송 결과) 전용 필드.
+  val ok: Boolean? = null,
+  val name: String? = null,
+  @SerialName("png_b64") val pngB64: String? = null,
 )
 
 /** domiman_m.DomimanSession.wait_login_json()의 반환 스키마. */

@@ -10,9 +10,11 @@ import android.widget.RemoteViews
 import android.widget.Toast
 
 /**
- * 홈 위젯(4x1): [새로고침] | 수량 | [다운로드=즉시회수] | [재생/중지].
+ * 홈 위젯(4x1): [새로고침] | 수량 | [스크린샷] | [재생/중지].
  *  - 새로고침: '실시간 수량확인'(N). 응답이 오면 수량 칸을 갱신(수동 새로고침 시에만).
- *  - 다운로드: '즉시 회수'.
+ *  - 스크린샷(아이콘·위치는 기존 '즉시 회수' 칸 그대로): ScreenshotActivity를 열어
+ *    'I' 명령을 보내고 사진을 받아 보여준다. 그 Activity는 별도 태스크라 뒤로
+ *    가기를 누르면 앱을 거치지 않고 곧바로 홈 화면으로 돌아간다.
  *  - 재생/중지: 시작/중지 토글. running이면 정지(pause) 아이콘, 아니면 재생(play).
  *  - 로그인 세션이 없으면(로그아웃/미로그인) 수량 칸에 '로그인'을 표시하고, 아무
  *    칸이나 누르면 앱(로그인 화면)을 연다.
@@ -29,7 +31,9 @@ class DomimanWidgetProvider : AppWidgetProvider() {
 
   override fun onReceive(context: Context, intent: Intent) {
     super.onReceive(context, intent)
-    if (intent.action !in setOf(ACTION_REFRESH, ACTION_COLLECT, ACTION_TOGGLE)) return
+    // 스크린샷 칸은 브로드캐스트가 아니라 buildViews에서 바로 ScreenshotActivity로
+    // 묶여 있으므로 여기서 다룰 액션은 REFRESH/TOGGLE뿐이다.
+    if (intent.action !in setOf(ACTION_REFRESH, ACTION_TOGGLE)) return
     try {
       val repo = (context.applicationContext as? DomimanApplication)?.repository ?: return
       // 로그인 전이거나 제어할 PC를 아직 고르지 않았으면 보낼 곳이 없다
@@ -44,10 +48,6 @@ class DomimanWidgetProvider : AppWidgetProvider() {
           toast(context, "실시간 수량 확인")
           repo.widgetRefresh()
         }
-        ACTION_COLLECT -> {
-          toast(context, "즉시 살림망 회수")
-          repo.widgetCollect()
-        }
         ACTION_TOGGLE -> {
           // 현재 상태 기준으로 즉시 피드백(정지 중이면 시작, 진행 중이면 중지).
           toast(context, if (repo.widgetRunning()) "매크로가 중지되었습니다" else "매크로가 시작되었습니다")
@@ -61,12 +61,24 @@ class DomimanWidgetProvider : AppWidgetProvider() {
 
   companion object {
     private const val ACTION_REFRESH = "com.example.domiman.widget.REFRESH"
-    private const val ACTION_COLLECT = "com.example.domiman.widget.COLLECT"
     private const val ACTION_TOGGLE = "com.example.domiman.widget.TOGGLE"
 
     private fun toast(context: Context, msg: String) {
       runCatching { Toast.makeText(context.applicationContext, msg, Toast.LENGTH_SHORT).show() }
     }
+
+    /** 홈 화면에 이 위젯이 하나라도 놓여 있는가.
+     * 상시로 들어오는 신호(수량 방송)를 처리하기 전에 먼저 물어봐서, 위젯을
+     * 쓰지 않는 사용자에게는 prefs 쓰기도 RemoteViews 갱신도 하지 않는다. */
+    fun hasInstances(context: Context): Boolean =
+      try {
+        val appCtx = context.applicationContext
+        AppWidgetManager.getInstance(appCtx)
+          .getAppWidgetIds(ComponentName(appCtx, DomimanWidgetProvider::class.java))
+          .isNotEmpty()
+      } catch (_: Exception) {
+        false
+      }
 
     /** 현재 저장된 상태(로그인여부·수량·running)로 모든 위젯 인스턴스를 다시 그린다.
      * 스트림 스레드 등 어디서 불려도 예외로 앱을 죽이지 않도록 방어. */
@@ -112,7 +124,7 @@ class DomimanWidgetProvider : AppWidgetProvider() {
       if (ready) {
         views.setTextViewText(R.id.widget_qty, qtyText)
         views.setOnClickPendingIntent(R.id.widget_refresh, broadcast(context, ACTION_REFRESH, 1))
-        views.setOnClickPendingIntent(R.id.widget_collect, broadcast(context, ACTION_COLLECT, 2))
+        views.setOnClickPendingIntent(R.id.widget_collect, screenshotActivity(context))
         views.setOnClickPendingIntent(R.id.widget_toggle, broadcast(context, ACTION_TOGGLE, 3))
         // 수량 칸(4/470 등)을 누르면 앱으로 들어간다(요구사항).
         views.setOnClickPendingIntent(R.id.widget_qty, openApp(context))
@@ -133,6 +145,19 @@ class DomimanWidgetProvider : AppWidgetProvider() {
       return PendingIntent.getBroadcast(
         context,
         req,
+        intent,
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+      )
+    }
+
+    /** 스크린샷 칸 — 앱의 다른 화면을 거치지 않는 별도 태스크로 연다(뒤로 가기
+     * 시 곧바로 홈 화면으로 돌아가도록 ScreenshotActivity의 taskAffinity를
+     * 비워둔 것과 짝이 되는 설정). */
+    private fun screenshotActivity(context: Context): PendingIntent {
+      val intent = Intent(context, ScreenshotActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      return PendingIntent.getActivity(
+        context,
+        4,
         intent,
         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
       )
