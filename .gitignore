@@ -41,3 +41,7 @@ __pycache__/
 
 # Claude Code 로컬 상태 (도구 개인 설정, 프로젝트 소스 아님)
 .claude/
+
+# domiweb 설정 — domichat 계정 비밀번호와 인증서 경로가 들어 있어 커밋하지 않는다.
+# (첫 실행 때 기본값으로 만들어진다 — web.md의 설치 절차 참고)
+domiweb.json
