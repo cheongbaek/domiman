@@ -125,7 +125,10 @@ def load_config():
     global CONFIG
     CONFIG = dict(DEFAULT_CONFIG)
     try:
-        with open(CONFIG_PATH, encoding="utf-8") as fp:
+        # utf-8-sig: PowerShell의 `Set-Content -Encoding UTF8`은 **BOM을 붙인다.**
+        # 그냥 utf-8로 읽으면 json이 BOM에서 깨져 설정이 조용히 기본값으로 돌아가고,
+        # 그러면 인증서 경로가 비어 평문 ws로 열려 "브라우저가 못 붙는다".
+        with open(CONFIG_PATH, encoding="utf-8-sig") as fp:
             data = json.load(fp)
         for k, v in data.items():
             if k in DEFAULT_CONFIG and isinstance(v, type(DEFAULT_CONFIG[k])):

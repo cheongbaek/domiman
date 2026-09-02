@@ -1,0 +1,180 @@
+/* 유니버설(모바일+PC) 레이아웃. 모바일 앱(앱UI설명.xlsx Sheet2)과 PC GUI가 원래
+   같은 배치라 한 벌로 둘을 만족시킨다. 넓은 화면에서는 로그·사진을 오른쪽으로 뺀다.
+
+   테마는 세 상태다: 사용자가 고르면 <html data-theme="dark|light">가 박히고,
+   고르지 않으면 아무것도 안 박혀 prefers-color-scheme을 따른다. 그래서 색은
+   **모두 bare :root에 정의**하고 다크에서는 같은 토큰만 덮어쓴다. */
+:root {
+  --bg: #ffffff;
+  --fg: #16181d;
+  --muted: #6b7280;
+  --line: #d6d9de;
+  --panel: #f2f3f5;
+  --panel2: #e8eaee;
+  --accent: #2f6bff;
+  --accent-fg: #ffffff;
+  --ok: #1a7f37;
+  --warn: #b45309;
+  --danger: #c0392b;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .06);
+}
+:root:not([data-theme="light"]) {
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #14161a;
+    --fg: #e7e9ee;
+    --muted: #9aa1ac;
+    --line: #333a45;
+    --panel: #1d2127;
+    --panel2: #262b33;
+    --accent: #4c8bff;
+    --accent-fg: #0b1020;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --danger: #f87171;
+    --shadow: none;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #14161a;
+  --fg: #e7e9ee;
+  --muted: #9aa1ac;
+  --line: #333a45;
+  --panel: #1d2127;
+  --panel2: #262b33;
+  --accent: #4c8bff;
+  --accent-fg: #0b1020;
+  --ok: #4ade80;
+  --warn: #fbbf24;
+  --danger: #f87171;
+  --shadow: none;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--fg); }
+body {
+  font-family: "Malgun Gothic", "Apple SD Gothic Neo", system-ui, -apple-system, sans-serif;
+  font-size: 15px;
+  line-height: 1.45;
+  -webkit-text-size-adjust: 100%;
+}
+button, input, select { font: inherit; color: inherit; }
+
+.wrap {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 12px 14px 40px;
+}
+@media (min-width: 900px) {
+  .cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+}
+
+/* 상단 바 */
+.top { display: flex; align-items: center; gap: 8px; margin: 4px 0 12px; }
+.top h1 { font-size: 17px; margin: 0; letter-spacing: -.2px; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+.dot.on { background: var(--ok); }
+.dot.off { background: var(--danger); }
+.spacer { flex: 1; }
+.tank {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  white-space: nowrap;
+}
+.tank.fail { color: var(--warn); font-weight: 500; }
+
+/* 줄 · 라벨 */
+.row { display: flex; align-items: center; gap: 10px; margin: 12px 0; flex-wrap: wrap; }
+.row.tight { margin: 8px 0; }
+.label { color: var(--fg); font-weight: 600; }
+.note { color: var(--muted); font-size: 13px; margin: 6px 0 14px; }
+.value { color: var(--muted); }
+
+/* 컨트롤 */
+select, input[type="text"], input[type="number"] {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  min-width: 0;
+}
+select.pc { flex: 1; font-size: 17px; font-weight: 700; }
+input.timer { flex: 1; text-align: left; font-variant-numeric: tabular-nums; }
+
+button {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 9px 16px;
+  cursor: pointer;
+  box-shadow: var(--shadow);
+}
+button:hover:not(:disabled) { background: var(--panel2); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+button.icon { padding: 9px 12px; border-radius: 10px; }
+button.big {
+  width: 100%;
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: transparent;
+  font-size: 17px;
+  font-weight: 700;
+  border-radius: 14px;
+  padding: 14px;
+}
+/* 시작/중지는 **글자만 바뀌는 같은 버튼**이다 — 모바일 앱과 PC GUI가 그렇고,
+   피제어 PC 쪽에서도 실제로 같은 좌표의 토글 버튼이다. 색을 갈라 놓으면
+   "다른 버튼"처럼 보여 앱과 어긋난다. */
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0; }
+.grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 10px 0; }
+
+/* 체크박스 */
+.check { display: flex; align-items: center; gap: 10px; margin: 14px 0; cursor: pointer; }
+.check input { width: 20px; height: 20px; accent-color: var(--accent); }
+.check.off { opacity: .5; }
+
+/* 상태 문구 */
+.status { margin: 12px 0; min-height: 1.5em; }
+.status.warn { color: var(--warn); }
+
+/* 로그 */
+.loghead { display: flex; align-items: center; margin: 18px 0 6px; }
+.loghead .label { flex: 1; }
+.log {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  height: 220px;
+  overflow-y: auto;
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+@media (min-width: 900px) { .log { height: 420px; } }
+.log .t { color: var(--muted); }
+.log .empty { color: var(--muted); }
+
+/* 대화상자 · 사진 */
+.veil {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, .5);
+  display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 10;
+}
+.card {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 14px;
+  padding: 16px; max-width: 420px; width: 100%;
+}
+.card h2 { font-size: 16px; margin: 0 0 10px; }
+.shotcard { max-width: min(96vw, 1400px); }
+.shotbox {
+  background: #000; border-radius: 10px; overflow: auto;
+  max-height: 74vh; display: flex; align-items: center; justify-content: center;
+}
+.shotbox img.fit { max-width: 100%; max-height: 74vh; }
+.shotbox img.raw { max-width: none; }
