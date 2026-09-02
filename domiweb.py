@@ -18,6 +18,9 @@ domiserver 쪽은 기존 domichat 프로토콜로 말한다.
   브라우저 ──wss://<호스트>:47822/ws── domiweb ──TLS 47821── domiserver
                                                                   ▲
                                             피제어 PC(seoul 등) ───┘
+  - **브라우저가 지목한 PC의 방에만 들어간다**(마지막 사람이 그 PC를 떠나면 방에서
+    나온다). 동시에 여러 PC를 돌릴 일이 없고, 보지도 않는 방의 수량 방송을 계속
+    받을 이유도 없다.
   - 방 이름·비번·명령 문자열은 domichat.md / domiman.py 규격 그대로다. domiweb는
     `web,Z,...` 응답과 `,Z,F,*`·`,Z,N,*` 방송을 **해석하지 않고 그대로 넘긴다**
     (파싱은 브라우저가 한다 — 규격의 단일 소유자를 늘리지 않기 위해서).
@@ -621,6 +624,7 @@ class Hub:
             self.clients.discard(conn)
             n = len(self.clients)
         log(f"[웹] 해제 {conn.who()} (총 {n}명)")
+        self._maybe_leave(conn.pc)      # 마지막 사람이 나가면 그 방도 뜬다
 
     # ---------- 브라우저 → 상류 ----------
     def queue_cmd(self, pc, body):
@@ -657,13 +661,18 @@ class Hub:
             pc = (d.get("pc") or "").strip()
             if pc and pc not in CONFIG["pcs"]:
                 return conn.send({"t": "err", "msg": "목록에 없는 PC입니다."})
-            conn.pc = pc
-            if pc:
-                conn.send(self.snapshot(pc))
-                # 브라우저가 새로 붙었으니 상태를 한 번 맞춘다(5초 내 중복은 생략).
-                if time.time() - self.last_query.get(pc, 0) > 5.0:
-                    self.last_query[pc] = time.time()
-                    self.queue_cmd(pc, "S")
+            old_pc, conn.pc = conn.pc, pc
+            if old_pc and old_pc != pc:
+                self._maybe_leave(old_pc)
+            if not pc:
+                return
+            conn.send(self.snapshot(pc))
+            if not self._ensure_state(pc)["joined"]:
+                self._ensure_join(pc)
+            elif time.time() - self.last_query.get(pc, 0) > 5.0:
+                # 이미 들어가 있는 방이면 상태만 한 번 맞춘다(5초 내 중복은 생략).
+                self.last_query[pc] = time.time()
+                self.queue_cmd(pc, "S")
             return
         if t == "cmd":
             pc = (d.get("pc") or "").strip()
@@ -672,6 +681,10 @@ class Hub:
                 return conn.send({"t": "err", "msg": "목록에 없는 PC입니다."})
             if not CMD_RE.fullmatch(body):
                 return conn.send({"t": "err", "msg": f"규격 밖 명령입니다: {body}"})
+            if not self._ensure_state(pc)["joined"]:
+                # 방에 못 들어간 상태로 보내면 서버가 not_joined로 되돌려준다.
+                self._ensure_join(pc)
+                return conn.send({"t": "err", "msg": f"'{pc}'의 방에 아직 들어가지 못했습니다."})
             if body == "I":
                 conn.shot_wait = time.time()
             self.queue_cmd(pc, body)
@@ -692,7 +705,6 @@ class Hub:
             CONFIG["pcs"] = pcs
             save_config()
             self._ensure_state(pc)
-            self._join_missing()
             log(f"[목록] '{pc}' 추가 ({conn.who()})")
         else:
             if pc not in pcs:
@@ -700,35 +712,70 @@ class Hub:
             pcs.remove(pc)
             CONFIG["pcs"] = pcs
             save_config()
-            st = self.state.pop(pc, None)
-            if st and st["joined"]:
-                self.chat.send({"t": "sub", "room": room_of(pc), "on": False})
-                self.chat.send({"t": "leave", "room": room_of(pc)})
             with self.lock:
                 for c in self.clients:
                     if c.pc == pc:
                         c.pc = ""
+            st = self.state.pop(pc, None)
+            if st and st["joined"]:
+                self.chat.send({"t": "sub", "room": room_of(pc), "on": False})
+                self.chat.send({"t": "leave", "room": room_of(pc)})
             log(f"[목록] '{pc}' 삭제 ({conn.who()})")
         self.broadcast({"t": "pcs", "pcs": list(CONFIG["pcs"])})
 
     # ---------- 상류 수신 ----------
-    def _join_missing(self):
-        """방이 있는데 아직 안 들어간 PC의 방에 입장한다. 방이 없는 PC(그 PC가
-        domichat에 한 번도 접속하지 않은 경우)는 조용히 넘긴다 — 나중에 그 PC가
-        켜지면 rooms 재조회로 잡힌다."""
-        if not self.chat.logged_in.is_set():
+    def _watchers(self, pc):
+        with self.lock:
+            return [c for c in self.clients if c.pc == pc]
+
+    def _watched_pcs(self):
+        with self.lock:
+            return {c.pc for c in self.clients if c.pc}
+
+    def _notify_pc(self, pc):
+        st = self._ensure_state(pc)
+        self.broadcast({"t": "pc", "pc": pc, "joined": st["joined"],
+                        "online": st["online"], "reason": st["reason"]})
+
+    def _ensure_join(self, pc):
+        """**지목된 PC의 방에만** 들어간다.
+
+        예전에는 시작할 때 목록의 방을 전부 잡아 두었다. 그러면 보지도 않는 PC의
+        수량 방송(사이클마다)을 계속 받고, 그 방 참가자 목록에도 `web`이 늘 떠
+        있게 된다. 동시에 여러 PC를 돌릴 일이 없으므로 필요할 때만 붙는다."""
+        st = self._ensure_state(pc)
+        if st["joined"] or not self.chat.logged_in.is_set():
             return
-        for pc in CONFIG["pcs"]:
-            st = self._ensure_state(pc)
-            room = room_of(pc)
-            if st["joined"]:
-                continue
-            if room in self.rooms_known:
-                self.chat.send({"t": "join", "room": room, "pw": ROOM_PW})
-            elif st["reason"] != "no_room":
-                st["reason"] = "no_room"
-                self.broadcast({"t": "pc", "pc": pc, "joined": False,
-                                "online": None, "reason": "no_room"})
+        room = room_of(pc)
+        if room in self.rooms_known:
+            self.chat.send({"t": "join", "room": room, "pw": ROOM_PW})
+            return
+        # 그 PC가 domichat에 접속한 적이 없어 방이 아직 없다. 방금 켰을 수도 있으니
+        # 목록을 새로 받아 본다(응답이 오면 rooms 분기가 다시 이 함수를 부른다).
+        if st["reason"] != "no_room":
+            st["reason"] = "no_room"
+            self._notify_pc(pc)
+        self.chat.send({"t": "rooms"})
+
+    def _maybe_leave(self, pc):
+        """보는 사람이 아무도 없으면 그 방에서 나온다. 캐시도 버린다 — 다시 들어갈
+        때 옛 상태를 잠깐 보여주면 '지금 값'으로 오해하게 된다(입장 직후 S 질의로
+        새로 받는다)."""
+        st = self.state.get(pc) if pc else None
+        if st is None or not st["joined"] or self._watchers(pc):
+            return
+        self.chat.send({"t": "sub", "room": room_of(pc), "on": False})
+        self.chat.send({"t": "leave", "room": room_of(pc)})
+        st.update({"joined": False, "online": None, "reason": "",
+                   "status": None, "tank": None})
+        st["reports"].clear()
+        self.last_query.pop(pc, None)
+        log(f"[상류] '{pc}' 방에서 나왔습니다(보는 사람 없음).")
+
+    def _rejoin_watched(self):
+        """재접속·목록 갱신 뒤, 지금 누군가 보고 있는 PC의 방에만 다시 들어간다."""
+        for pc in self._watched_pcs():
+            self._ensure_join(pc)
 
     def _pump_loop(self):
         while True:
@@ -764,11 +811,11 @@ class Hub:
             self.rooms_known = {r.get("name") for r in (d.get("rooms") or [])}
             log(f"[상류] '{d.get('id')}'로 로그인했습니다. (방 {len(self.rooms_known)}개)")
             self.broadcast({"t": "up", "connected": True, "msg": "연결됨"})
-            self._join_missing()
+            self._rejoin_watched()
             return
         if t == "rooms":
             self.rooms_known = {r.get("name") for r in (d.get("list") or [])}
-            self._join_missing()
+            self._rejoin_watched()
             return
         if t == "joined":
             pc = self._pc_of_room(d.get("room"))
@@ -818,7 +865,7 @@ class Hub:
             code = d.get("code")
             log(f"[상류 오류] {code}: {d.get('msg')}")
             if code == "room_missing":
-                self._join_missing()
+                self.chat.send({"t": "rooms"})
             elif code in ("bad_login", "already_online", "disabled"):
                 # 계정 문제는 사람이 손봐야 하지만, 데몬이므로 포기하지 않고
                 # 재접속을 계속 시도한다(상대편이 로그아웃하면 저절로 풀린다).
@@ -925,8 +972,10 @@ class Hub:
                     self._shot_fail(f["pc"], "timeout")
             if now - last_retry >= ROOM_RETRY_SEC:
                 last_retry = now
+                # 보고 있는 PC 중 아직 못 들어간 방이 있으면 목록을 새로 받아 본다
+                # (그 PC가 뒤늦게 켜지면 방이 생긴다). 아무도 안 보고 있으면 조용히 있는다.
                 if self.chat.logged_in.is_set() and any(
-                        not self._ensure_state(pc)["joined"] for pc in CONFIG["pcs"]):
+                        not self._ensure_state(pc)["joined"] for pc in self._watched_pcs()):
                     self.chat.send({"t": "rooms"})
 
     def start(self):
@@ -1083,10 +1132,10 @@ def repl():
             print(f"  상류 {'연결됨' if HUB.chat.logged_in.is_set() else '끊김'}"
                   f"  ({CONFIG['server']}, ID={CONFIG['id']})")
         elif cmd == "add" and arg:
-            CONFIG["pcs"].append(arg) if arg not in CONFIG["pcs"] else None
-            save_config()
-            HUB._ensure_state(arg)
-            HUB._join_missing()
+            if arg not in CONFIG["pcs"]:
+                CONFIG["pcs"].append(arg)
+                save_config()
+            HUB._ensure_state(arg)      # 입장은 브라우저가 그 PC를 고를 때 한다
             HUB.broadcast({"t": "pcs", "pcs": list(CONFIG["pcs"])})
             print(f"  목록: {', '.join(CONFIG['pcs'])}")
         elif cmd == "help":
