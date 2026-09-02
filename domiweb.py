@@ -1007,6 +1007,10 @@ def serve_web(sock, addr):
         sock.settimeout(None)
         reader = SockReader(sock)
         if not ws_handshake(reader, sock):
+            # WebSocket 업그레이드가 아닌 평범한 GET — 안내 페이지를 돌려줬다.
+            # 사람이 주소를 열어 인증서·도달 여부를 확인하는 경로이므로 로그를
+            # 남긴다(안 남기면 "브라우저는 뜨는데 서버 창은 조용하다"가 된다).
+            log(f"[웹] 안내 페이지 응답 {addr[0]}:{addr[1]}")
             return
         conn = WebConn(HUB, sock, addr)
         HUB.add_client(conn)
