@@ -633,7 +633,7 @@ def send_report(code):
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260909a"
+APP_VERSION = "260909b"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -1120,11 +1120,35 @@ def reset_to_base_state():
     press_esc(delay=0.5)
 
 
+_input_guard_until = 0.0     # 이 시각까지 들어오는 입력은 '매크로 자신의 것'
+
+
+def _mark_own_input(sec=0.15):
+    """매크로가 지금 입력을 보낸다는 표시. 암막('취침 모드')이 자기 클릭·키로
+    풀리지 않게 하는 **보조** 안전장치다.
+
+    주 방어선은 저수준 훅의 INJECTED 플래그다(260909b 실측: `mouse_event`
+    ±3px 이동 10건·`keybd_event` 6건 전부 플래그가 붙었고 해제되지 않았다).
+    이 시간 창은 `SetCursorPos`처럼 플래그를 신뢰할 수 없는 경로를 위한 보조다.
+
+    **0.15초로 짧게 잡는 이유(중요):** 훅은 입력을 주입하는 그 순간 동기로
+    불리므로 창이 길 필요가 없다. 반대로 길게 잡으면 루틴이 도는 동안
+    (클릭이 0.5초 간격이라) 창이 거의 항상 열려 있어, **사용자가 급히 키를
+    눌러도 암막이 안 풀리는** 상태가 된다 — 해제 수단이 사실상 사라진다."""
+    global _input_guard_until
+    _input_guard_until = max(_input_guard_until, time.time() + sec)
+
+
+def _own_input_recently():
+    return time.time() < _input_guard_until
+
+
 def click_real(coords, delay=0.5):
     """coords는 항상 FHD 좌표. to_screen이 실제 화면 좌표로 변환.
     클릭 후 대기(delay)는 **전 호출부 0.5초로 통일**되어 있다 — 호출부에서
     delay를 따로 넘기지 말고 이 기본값을 쓸 것(값 대장 참고)."""
     check_abort()
+    _mark_own_input()
     x, y = to_screen(coords)
     ctypes.windll.user32.SetCursorPos(x, y)
     time.sleep(0.1)
@@ -1139,6 +1163,7 @@ def click_real(coords, delay=0.5):
 def press_key(vk, delay=0.5, label=""):
     """키를 게임에 전송(클릭과 동일한 ctypes 채널) 후 delay초 대기."""
     check_abort()
+    _mark_own_input()
     ctypes.windll.user32.keybd_event(vk, 0, 0, 0)
     time.sleep(0.05)        # 누름/뗌 사이 — 여기서 끊으면 키가 눌린 채 남는다
     ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
@@ -2441,6 +2466,242 @@ THEME = {
 }
 
 
+class BlackoutOverlay:
+    """'취침 모드' 암막 — 화면 전체를 덮는 검은 창. **클릭은 통과한다.**
+
+    화면 보호기는 어떤 입력이든 들어오면 스스로 종료하도록 설계돼 있어, 매크로가
+    클릭을 보내는 순간 풀린다(매크로 입력은 드라이버 수준에 주입되어 사람 입력과
+    구분되지 않는다). 이 창은 그 제약이 없어 **루틴이 도는 동안에도 암막이
+    유지된다** — 그것이 이 기능의 존재 이유다.
+
+    실측으로 확인한 세 가지가 전부 필수다(260909b — 하나라도 어기면 깨진다):
+
+    1. **HWND는 `GetAncestor(winfo_id(), GA_ROOT)`로 얻는다.** `GetParent`는
+       최상위 창에서 부모가 아니라 **소유자**(앱 root)를 돌려주므로, 그것에
+       스타일을 붙이면 정작 검은 창은 그대로 남아 **보이지도 않으면서 클릭만
+       삼키는 창**이 된다(실제로 겪었다 — 화면은 안 검은데 사용자·매크로 클릭이
+       모두 먹혔다). 실측: `winfo_id`=TkChild, `GA_ROOT`=TkTopLevel.
+    2. **`WS_EX_LAYERED`는 tkinter의 `-alpha`가 붙이게 한다.** SetWindowLong으로
+       직접 붙이면 레이어 표면이 비어 창이 보이지 않는다.
+    3. **`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`를 반드시 건다.**
+       안 걸면 **화면 캡처에 이 검은 창이 잡혀 1080p 모드의 퀴즈 인식이
+       전멸한다**(1080p의 `grab_region_rgb`는 pyautogui = 화면 캡처).
+       실측: 미적용이면 pyautogui가 검은픽셀 100%, 적용하면 0%(화면에는 그대로
+       검게 보인다). WGC(1440p·감시 모드)는 창을 직접 캡처하므로 무관하다.
+
+    해제 조건: **실제** 키보드/마우스/터치 입력, 매크로 중지·종료, 원격 제어 명령.
+    매크로 자신의 입력으로는 풀리지 않는다 — 저수준 훅의 INJECTED 플래그와
+    `_mark_own_input`이 남기는 시간 창으로 걸러낸다. 훅 설치가 실패하면
+    `GetLastInputInfo` 폴링으로 물러선다(해제 수단이 아예 없어지면 사용자가 검은
+    화면에 갇히므로 폴백을 반드시 남긴다)."""
+
+    _GWL_EXSTYLE = -20
+    _WS_EX_TRANSPARENT = 0x00000020
+    _WS_EX_NOACTIVATE = 0x08000000
+    _WS_EX_TOOLWINDOW = 0x00000080
+    _WS_EX_LAYERED = 0x00080000
+    _GA_ROOT = 2
+    _HWND_TOPMOST = -1
+    _SWP_NOACTIVATE = 0x0010
+    _SWP_SHOWWINDOW = 0x0040
+    _WDA_EXCLUDEFROMCAPTURE = 0x11
+    _WH_KEYBOARD_LL = 13
+    _WH_MOUSE_LL = 14
+    _LLKHF_INJECTED = 0x10
+    _LLMHF_INJECTED = 0x01
+    _WM_MOUSEMOVE = 0x0200
+    _SM = (76, 77, 78, 79)      # X/Y/CX/CY VIRTUALSCREEN
+
+    class _KBD(ctypes.Structure):
+        _fields_ = [("vkCode", ctypes.c_ulong), ("scanCode", ctypes.c_ulong),
+                    ("flags", ctypes.c_ulong), ("time", ctypes.c_ulong),
+                    ("dwExtraInfo", ctypes.c_void_p)]
+
+    class _MS(ctypes.Structure):
+        _fields_ = [("pt", POINT), ("mouseData", ctypes.c_ulong),
+                    ("flags", ctypes.c_ulong), ("time", ctypes.c_ulong),
+                    ("dwExtraInfo", ctypes.c_void_p)]
+
+    class _LASTINPUT(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_ulong)]
+
+    def __init__(self, root, on_release=None):
+        self.root = root
+        self.on_release = on_release
+        self.alive = False
+        self.win = None
+        self.hwnd = 0
+        self._hooks = []
+        self._hook_refs = []
+        self._hook_stop = threading.Event()
+        self._poll_id = None
+        self._last_tick = None
+        # 훅이 실제로 도는지 확인하는 계수기(해제가 안 될 때 원인을 가르는 유일한
+        # 근거다 — '사용자가 입력을 안 했다'와 '훅이 안 잡는다'를 구분한다).
+        self.seen = {"key_inj": 0, "key_real": 0, "ms_inj": 0, "ms_real": 0}
+        self._u32 = ctypes.windll.user32
+        try:
+            self._build()
+            self.alive = True
+        except Exception:
+            print("[취침 모드] 암막 창 생성 실패")
+            traceback.print_exc()
+            self._teardown()
+            return
+        self._install_release_watch()
+        self._tick()
+
+    # ---------- 창 ----------
+    def _build(self):
+        u = self._u32
+        self.win = tk.Toplevel(self.root)
+        self.win.title("DOMIMAN_BLACKOUT")
+        self.win.configure(bg="black")
+        x, y, cw, ch = (u.GetSystemMetrics(m) for m in self._SM)
+        self.rect = (x, y, cw, ch)
+        self.win.geometry(f"{cw}x{ch}+{x}+{y}")
+        self.win.overrideredirect(True)
+        self.win.attributes("-alpha", 0.999)   # Tk가 WS_EX_LAYERED를 직접 붙인다
+        self.win.attributes("-topmost", True)
+        tk.Frame(self.win, bg="black").pack(fill="both", expand=True)
+        self.win.update()
+        cid = self.win.winfo_id()
+        self.hwnd = u.GetAncestor(cid, self._GA_ROOT) or cid
+        ex = u.GetWindowLongW(self.hwnd, self._GWL_EXSTYLE)
+        u.SetWindowLongW(self.hwnd, self._GWL_EXSTYLE,
+                         ex | self._WS_EX_TRANSPARENT | self._WS_EX_NOACTIVATE
+                         | self._WS_EX_TOOLWINDOW)
+        ok = u.SetWindowDisplayAffinity(self.hwnd, self._WDA_EXCLUDEFROMCAPTURE)
+        if not ok:
+            print("[취침 모드] 경고: 화면 캡처 제외 설정에 실패했습니다 — "
+                  "1080p 모드에서는 인식이 가려질 수 있습니다.")
+        self.win.update()
+        self._reassert()
+
+    def _reassert(self):
+        """게임 창을 앞으로 불러도 암막이 위에 남게 최상위를 다시 주장한다."""
+        if not self.alive or not self.hwnd:
+            return
+        x, y, cw, ch = self.rect
+        self._u32.SetWindowPos(self.hwnd, self._HWND_TOPMOST, x, y, cw, ch,
+                               self._SWP_NOACTIVATE | self._SWP_SHOWWINDOW)
+
+    # ---------- 해제 감시 ----------
+    def _install_release_watch(self):
+        proto = ctypes.CFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                                 ctypes.c_size_t, ctypes.c_void_p)
+        u = self._u32
+        u.CallNextHookEx.restype = ctypes.c_ssize_t
+        u.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                     ctypes.c_size_t, ctypes.c_void_p]
+        u.SetWindowsHookExW.restype = ctypes.c_void_p
+
+        def kb(code, wp, lp):
+            try:
+                if code == 0:
+                    st = ctypes.cast(lp, ctypes.POINTER(self._KBD)).contents
+                    inj = bool(st.flags & self._LLKHF_INJECTED)
+                    self.seen["key_inj" if inj else "key_real"] += 1
+                    if not inj and not _own_input_recently():
+                        self._request_release("실제 키보드 입력")
+            except Exception:
+                pass
+            return u.CallNextHookEx(None, code, wp, lp)
+
+        def ms(code, wp, lp):
+            try:
+                if code == 0:
+                    st = ctypes.cast(lp, ctypes.POINTER(self._MS)).contents
+                    inj = bool(st.flags & self._LLMHF_INJECTED)
+                    self.seen["ms_inj" if inj else "ms_real"] += 1
+                    if not inj and not _own_input_recently():
+                        self._request_release("실제 마우스/터치 입력")
+            except Exception:
+                pass
+            return u.CallNextHookEx(None, code, wp, lp)
+
+        self._hook_refs = [proto(kb), proto(ms)]
+
+        def run():
+            hs = []
+            for wh, fn in ((self._WH_KEYBOARD_LL, self._hook_refs[0]),
+                           (self._WH_MOUSE_LL, self._hook_refs[1])):
+                h = u.SetWindowsHookExW(wh, fn, None, 0)
+                if h:
+                    hs.append(h)
+            self._hooks = hs
+            if len(hs) < 2:
+                print("[취침 모드] 저수준 입력 훅 설치 실패 — "
+                      "마지막 입력 시각 폴링으로 해제를 감시합니다.")
+                return
+            buf = ctypes.create_string_buffer(64)   # MSG 구조체 자리(내용은 안 읽음)
+            while not self._hook_stop.is_set():
+                if u.PeekMessageW(buf, None, 0, 0, 1):
+                    u.DispatchMessageW(buf)
+                else:
+                    time.sleep(0.01)
+            for h in hs:
+                u.UnhookWindowsHookEx(h)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _last_input_tick(self):
+        li = self._LASTINPUT()
+        li.cbSize = ctypes.sizeof(li)
+        if not self._u32.GetLastInputInfo(ctypes.byref(li)):
+            return None
+        return int(li.dwTime)
+
+    def _tick(self):
+        """0.25초마다 최상위 재주장 + (훅이 없을 때) 입력 시각 폴백 감시."""
+        if not self.alive:
+            return
+        self._reassert()
+        if len(self._hooks) < 2:
+            t = self._last_input_tick()
+            if t is not None:
+                if self._last_tick is None:
+                    self._last_tick = t
+                elif t != self._last_tick:
+                    self._last_tick = t
+                    if not _own_input_recently():
+                        self._request_release("실제 입력 감지(폴백)")
+                        return
+        self._poll_id = self.root.after(250, self._tick)
+
+    def _request_release(self, why):
+        """훅 스레드에서 불릴 수 있으므로 메인 스레드로 넘긴다(tkinter 제약)."""
+        try:
+            self.root.after(0, lambda: self.release(why))
+        except Exception:
+            pass
+
+    # ---------- 해제 ----------
+    def release(self, why="요청"):
+        if not self.alive:
+            return
+        self.alive = False
+        self._teardown()
+        cb, self.on_release = self.on_release, None
+        if cb:
+            cb(why)
+
+    def _teardown(self):
+        self._hook_stop.set()
+        if self._poll_id is not None:
+            try:
+                self.root.after_cancel(self._poll_id)
+            except Exception:
+                pass
+            self._poll_id = None
+        if self.win is not None:
+            try:
+                self.win.destroy()
+            except Exception:
+                pass
+            self.win = None
+
+
 class ScreenshotWindow:
     """받은 스크린샷을 보여주는 별도 창(표시 + 확대/축소 + 저장 + 클립보드).
 
@@ -2630,6 +2891,7 @@ class DomimanApp:
         self.joining_room = None         # 제어 대상 방 입장 시도 중
         self.shot_wait = None            # 스크린샷 대기 상태(제어 측)
         self.remote_tank = None          # 제어 대상의 최근 수량: (cur,mx)|"fail"|None
+        self.blackout = None             # 취침 모드 암막(BlackoutOverlay)|None
 
         root.title("domiman.py")
         try:
@@ -2826,9 +3088,12 @@ class DomimanApp:
                                          variable=self.var_logsave,
                                          command=self._on_flag_toggle)
         self.cb_logsave.grid(row=11, column=2, sticky="w", **pad)
-        self.bt_log_export = tk.Button(f, text="로그 내보내기", font=FONT, bg=BTN_GRAY,
-                                       command=self.on_log_export)
-        self.bt_log_export.grid(row=11, column=3, sticky="ew", **pad)
+        # 예전 '로그 내보내기' 자리 — 260909b에 '취침 모드'(암막)로 대체됐다.
+        # (로그 내보내기 기능은 완전히 제거. '로그 저장' 체크박스는 그대로 남아
+        #  종료 시 전체 로그를 파일로 남긴다 — 별개 기능이다.)
+        self.bt_sleep = tk.Button(f, text="취침 모드", font=FONT, bg=BTN_GRAY,
+                                  command=self.on_sleep_mode)
+        self.bt_sleep.grid(row=11, column=3, sticky="ew", **pad)
 
         # -- 로그 영역 (기본 숨김) --
         self.frame_log = tk.Frame(f)
@@ -2869,7 +3134,7 @@ class DomimanApp:
                    self.bt_tank_check, self.bt_shot, self.bt_sched_exit,
                    self.bt_collect_now,
                    self.bt_dark, self.bt_exit, self.bt_log_fold, self.bt_log_clear,
-                   self.bt_log_export, self.bt_login, self.bt_logout):
+                   self.bt_sleep, self.bt_login, self.bt_logout):
             bt.configure(bg=BTN_GRAY, fg="black")
 
     def on_dark_toggle(self):
@@ -3389,14 +3654,37 @@ class DomimanApp:
         self.txt_log.delete("1.0", "end")
         self.txt_log.configure(state="disabled")
 
-    def on_log_export(self):
-        path = os.path.join(LOG_DIR, f"fishing_log_{time.strftime('%Y%m%d_%H%M%S')}.txt")
-        try:
-            with open(path, "w", encoding="utf-8") as fp:
-                fp.write(_log.dump())
-            print(f"[시스템] 로그를 내보냈습니다: {path}")
-        except Exception as e:
-            print(f"[오류] 로그 내보내기 실패: {e}")
+    # ---------- 취침 모드(암막) ----------
+    def on_sleep_mode(self):
+        """'취침 모드' 버튼(예전 '로그 내보내기' 자리).
+        직접 제어 모드면 **이 PC**를 즉시 암막으로, 원격 제어 모드면 **피제어
+        PC**에 B 명령을 보낸다. 낚시는 암막 중에도 그대로 계속된다."""
+        if self.remote_target:
+            if self.pending is None:
+                self._send_command("B", "B")
+            return
+        self.start_blackout("버튼")
+
+    def start_blackout(self, why="요청"):
+        if self.blackout is not None and self.blackout.alive:
+            print("[취침 모드] 이미 암막 상태입니다.")
+            return
+        ov = BlackoutOverlay(self.root, on_release=self._on_blackout_release)
+        if not ov.alive:
+            return
+        self.blackout = ov
+        print(f"[취침 모드] 화면을 덮었습니다({why}). 실제 키보드·마우스 입력이 "
+              "들어오면 해제됩니다. 낚시·회수는 그대로 계속됩니다.")
+
+    def stop_blackout(self, why="요청"):
+        """암막 해제. 매크로 중지·종료·원격 제어 명령 수신에서 부른다."""
+        ov, self.blackout = self.blackout, None
+        if ov is not None and ov.alive:
+            ov.release(why)
+
+    def _on_blackout_release(self, why):
+        self.blackout = None
+        print(f"[취침 모드] 암막을 해제했습니다({why}).")
 
     def _save_log_on_exit(self):
         if not self.var_logsave.get():
@@ -3619,9 +3907,15 @@ class DomimanApp:
     def _handle_command(self, sender, args, raw):
         """원격 명령 실행(메인 스레드). sender=""이면 무명(휴대폰 등) 요청."""
         cmd = args[0]
-        if cmd not in ("S", "G", "P", "Y", "W", "Q", "V", "T", "C", "N", "I"):
+        if cmd not in ("S", "G", "P", "Y", "W", "Q", "V", "T", "C", "N", "I", "B"):
             return                     # 규격 외 — 무시
         print(f"[원격 명령] {raw} (from '{sender or '무명'}')")
+
+        # 취침 모드는 **원격으로 제어되면 풀린다**(사용자 확정). 상태를 바꾸는
+        # 명령만 해당 — S(상태질의)·N(수량질의)·I(스크린샷)·B(취침)는 읽기/설정
+        # 성격이라 암막을 유지한다(무인 상태에서 계속 어두워야 하므로).
+        if cmd in ("G", "P", "Y", "W", "Q", "V", "T", "C"):
+            self.stop_blackout(f"원격 명령 {cmd}")
 
         def reply(tail):
             chat_send(f"{sender},Z,{tail}")
@@ -3716,6 +4010,13 @@ class DomimanApp:
             reply("I")                 # 명령 수신 ack — 사진은 이어서 올라간다
             self._screenshot_and_send(reply)
 
+        elif cmd == "B":
+            # 취침 모드: 이 PC 화면을 암막으로 덮는다. 낚시·회수는 계속된다.
+            # 암막은 tkinter 창이라 **메인 스레드에서** 만들어야 한다
+            # (_handle_command 자체가 메인 스레드에서 돈다).
+            reply("B")
+            self.start_blackout("원격 요청")
+
     # ---------- 제어(요청) 측 ----------
     def _send_command(self, cmdbody, kind):
         """제어 명령 발송 + 응답 대기(pending) 진입. 대기 중엔 대부분 봉인."""
@@ -3799,6 +4100,9 @@ class DomimanApp:
                 print(f"[스크린샷] {self.remote_target}가 화면을 찍고 있습니다. "
                       "사진을 기다립니다...")
                 self._begin_shot_wait()
+        elif first == "B":
+            print(f"[취침 모드] {self.remote_target}의 화면을 덮었습니다. "
+                  "그 PC에서 실제 입력이 들어오거나 제어 명령을 보내면 해제됩니다.")
         elif first == "N":
             # 수량 응답: rest = ['N','12','470'] 또는 ['N','fail']
             if len(rest) >= 3:
@@ -4074,7 +4378,7 @@ class DomimanApp:
     # ---------- UI 봉인(중앙 관리) ----------
     def _apply_ui_locks(self):
         """모드/실행/응답대기 상태에 따라 위젯 활성/비활성을 일괄 적용.
-        항상 활성: 로그 접기/지우기/내보내기, 다크모드.
+        항상 활성: 로그 접기/지우기, 다크모드.
         제어PC 변경 버튼: 로컬 낚시 실행 중에만 봉인(모드 무관)."""
         running = self._running()
         remote = self.remote_target is not None
@@ -4099,10 +4403,11 @@ class DomimanApp:
         for w in (self.en_timer, self.cb_rod, self.cb_bait, self.cb_logsave,
                   self.bt_res_manual, self.bt_res_auto):
             st(w, flags_ok)
-        # 예약 종료/즉시 회수/실시간 수량확인/프로그램 종료 — 로컬 상시, 원격은 대기 중 봉인
+        # 예약 종료/즉시 회수/실시간 수량확인/취침 모드/프로그램 종료
+        # — 로컬 상시, 원격은 대기 중 봉인
         always_ok = (not pending) if remote else True
         for w in (self.bt_sched_exit, self.bt_collect_now, self.bt_tank_check,
-                  self.bt_exit):
+                  self.bt_sleep, self.bt_exit):
             st(w, always_ok)
         # 시작/중지 — 원격 대기 중 봉인('대기' 표시는 G/P 전용 별도 처리)
         if remote:
@@ -4348,6 +4653,7 @@ class DomimanApp:
 
     def _stop_fishing(self):
         print("\n[시스템] 중지 요청 — 진행 중인 동작을 버리고 즉시 멈춥니다.")
+        self.stop_blackout("매크로 중지")
         self.bt_start.configure(text="중지 중...", state="disabled")
         self.worker.stop()
 
@@ -4474,6 +4780,7 @@ class DomimanApp:
         인터프리터 종료 때 torch/OpenMP 등 네이티브 스레드 정리를 기다리느라
         (로그 저장과 무관하게) 창이 '응답 없음'으로 늦게 꺼졌다 → 데몬/네이티브
         스레드 대기를 건너뛰는 os._exit(0)로 해결. 소켓은 OS가 닫아준다."""
+        self.stop_blackout("프로그램 종료")   # 검은 화면을 남긴 채 끝내지 않는다
         try:
             save_config(self.server_ip, MY_ID, self.pc_list)
             # 방장이 방을 나가는 것을 상대가 곧바로 알도록 정상 로그아웃을 보낸다
