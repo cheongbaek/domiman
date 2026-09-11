@@ -633,7 +633,7 @@ def send_report(code):
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260909b"
+APP_VERSION = "260911a"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -1215,6 +1215,7 @@ def _force_foreground(hwnd, timeout=2.0):
                 pass
     try:
         try:
+            _mark_own_input()        # ALT 주입도 매크로 자신의 입력이다
             ctypes.windll.user32.keybd_event(0x12, 0, 0, 0)
             ctypes.windll.user32.keybd_event(0x12, 0, 0x0002, 0)
         except Exception:
@@ -1641,27 +1642,60 @@ _last_tank_max = None # 마지막으로 받아들인 살림망 최대치(바뀌�
 TANK_QTY_RE = r'(\d+)\D+(\d+)'      # 'cur/mx' — 구분자는 숫자가 아니어야 한다
 
 
-def _read_tank_text():
-    """살림망 수량 영역을 한 번 읽어 'cur/mx' 꼴 문자열을 돌려준다.
+def _tank_parse(txt):
+    """'cur/mx' 꼴 문자열 -> (cur, mx) 또는 None.
+    `mx > 0`만 본다 — 값 범위 가드가 아니라 구조적 무의미값 차단이다
+    (max가 0이면 `cur >= mx-5`가 항상 참이라 회수가 무한 반복된다)."""
+    m = re.search(TANK_QTY_RE, txt or "")
+    if not m:
+        return None
+    cur, mx = int(m.group(1)), int(m.group(2))
+    return (cur, mx) if mx > 0 else None
 
-    **원본 배율로 먼저 읽고, 정규식이 안 맞을 때만 x3로 한 번 더 읽는다.**
-    260822a까지는 순서가 반대였는데, x3 확대가 **슬래시를 숫자 '1'로 바꿔
-    놓는다**(실측): 설치본 `ocr_dump/`에 '판독 실패'로 남아 있던 크롭 중 사람
-    눈에 또렷한 12장이 전부 이 모양이었다 — `244/470` -> '2441470',
-    `44/470` -> '441470'. 구분자가 숫자가 되면 `TANK_QTY_RE`가 안 맞는다.
-    **원본 배율은 12/12 정확했고 x3는 0/12였다.** 게다가 `112/570`을
-    `'712/570'`으로 읽어(1->7 치환, 확신도 0.87) 낚싯대 교체까지 유발했다 —
-    그 크롭도 원본 배율은 확신도 1.00으로 정확했다.
 
-    x3는 **흐린 화면용 폴백**으로 남긴다(260815c의 이득을 버리지 않는다).
-    정상 화면에서는 첫 판독에서 끝나므로 비용도 늘지 않는다."""
+def _read_tank_once():
+    """같은 프레임을 **서로 다른 배율로 읽어 값이 겹칠 때만** 받는다.
+    (cur, mx) 또는 None. 판독 원문은 `_last_tank_ocr`에 남긴다.
+
+    **왜 배율 합의인가 (260911a, 실측 — 프레임 재시도로는 절대 못 잡는다):**
+    설치본 `ocr_dump/`에 쌓인 `tank_overflow_*` 8장이 **전부 같은 값
+    `114/470`** 이었고 전부 `714/470`으로 읽혔다(1->7 치환). 수량이 114를
+    지나는 사이클마다, 즉 **83분 간격으로 어김없이** 재현됐다 — 프레임이 튄
+    것이 아니라 **그 글자 배열에 대한 결정적 오인식**이라 같은 전처리로 몇 번을
+    다시 읽어도 같은 답이 나온다(기존 `retries=4` 다수결이 무력한 이유).
+
+    그 8장을 전처리 12가지로 재보니 갈림이 선명했다:
+        원본+컬러 **0/8** · 원본+흑백(당시 주 경로) **0/8**
+        x2·x3·x4(흑백/컬러/이진 전부) **8/8**
+    260822c의 `112/570`은 정반대로 x3가 틀리고 원본이 맞았다. 즉 **어느 한
+    배율도 혼자서는 안전하지 않다** — 배율을 갈아치우는 것이 아니라 **서로
+    다른 실패 모드를 가진 두 경로를 함께 읽고 일치할 때만 받는 것**이 답이다.
+
+    순서: 원본 -> x3, 두 값이 같으면 채택(정상 경로, OCR 2회 0.28초).
+    다르면 x2를 추가로 읽어 **2표 이상 모인 값**을 채택(0.40초). 아무 값도
+    2표를 못 모으면 None(그 사이클은 버리고 다음에 다시 읽는다).
+
+    **한 경로만으로 값을 내지 않는 것이 요점이다.** 판독 실패 크롭 80장에
+    돌려 보면 원본 단독은 17장에서 값을 내지만 그 값들이 `44/330`·`4/1470`
+    같은 오인식이고, 합의 방식은 그것들을 전부 거부한다(0/80). '틀린 값'보다
+    '값 없음'이 안전하다 — 감시 루프는 직전 폴링 간격을 유지하고 다음 사이클에
+    다시 읽으면 그만이다."""
+    global _last_tank_ocr
     img = _watch_grab_region(REGION_TANK_QTY)
-    txt = _ocr_number_img(img, scale=1)
-    if not re.search(TANK_QTY_RE, txt or ""):
-        alt = _ocr_number_img(img, scale=OCR_NUM_SCALE)
-        if re.search(TANK_QTY_RE, alt or ""):
-            return alt
-    return txt
+    t1 = _ocr_number_img(img, scale=1)
+    _last_tank_ocr = t1
+    v1 = _tank_parse(t1)
+    t3 = _ocr_number_img(img, scale=OCR_NUM_SCALE)
+    v3 = _tank_parse(t3)
+    if v1 is not None and v1 == v3:
+        return v1
+    t2 = _ocr_number_img(img, scale=2)
+    v2 = _tank_parse(t2)
+    _last_tank_ocr = f"{t1} | x3='{t3}' | x2='{t2}'"
+    for v in (v1, v3, v2):
+        if v is not None and [v1, v3, v2].count(v) >= 2:
+            return v
+    return None
 
 
 def read_tank_quantity(retries=4, delay=0.3):
@@ -1687,17 +1721,16 @@ def read_tank_quantity(retries=4, delay=0.3):
     global _last_tank_ocr, _last_tank_max
     votes = []
     for i in range(retries):
-        txt = _read_tank_text()
-        if txt:
-            _last_tank_ocr = txt
-            m = re.search(TANK_QTY_RE, txt)
-            if m:
-                cur, mx = int(m.group(1)), int(m.group(2))
-                if mx > 0:
-                    votes.append((cur, mx))
-                    # 최대치가 직전과 같으면 그대로 신뢰(가장 흔한 정상 경로)
-                    if _last_tank_max is not None and mx == _last_tank_max:
-                        return cur, mx
+        # 한 프레임을 읽는 일 자체가 **배율 합의**다(_read_tank_once).
+        # 프레임을 여러 번 보는 아래 재시도는 '갱신 애니메이션·깜빡임'을
+        # 건너뛰기 위한 것이지 오인식을 거르는 장치가 아니다 — 결정적 오인식은
+        # 프레임을 아무리 바꿔도 똑같이 나오기 때문이다(260911a 참고).
+        v = _read_tank_once()
+        if v is not None:
+            votes.append(v)
+            # 최대치가 직전과 같으면 그대로 신뢰(가장 흔한 정상 경로)
+            if _last_tank_max is not None and v[1] == _last_tank_max:
+                return v
         if i < retries - 1:
             abort_sleep(delay)
 
@@ -1717,10 +1750,10 @@ def read_tank_quantity(retries=4, delay=0.3):
         print(f"    [수량 재확인] 최대치가 {_last_tank_max} → {best[1]} 로 바뀐 것처럼 "
               f"읽혔습니다(OCR='{_last_tank_ocr}'). 한 번 더 확인합니다.")
         abort_sleep(delay)
-        # 재확인도 **같은 폴백 경로**로 읽는다 — 여기만 x3로 읽으면 슬래시가
-        # 숫자로 바뀐 판독 때문에 멀쩡한 값을 버리게 된다(위 함수 주석 참고).
-        m = re.search(TANK_QTY_RE, _read_tank_text() or "")
-        if not m or int(m.group(2)) != best[1]:
+        # 재확인도 **같은 합의 경로**로 읽는다 — 여기만 다른 배율로 읽으면
+        # 그 배율 고유의 오인식 때문에 멀쩡한 값을 버리게 된다.
+        again = _read_tank_once()
+        if again is None or again[1] != best[1]:
             return None            # 다음 사이클에 다시 읽는다
     _last_tank_max = best[1]
     return best
@@ -2502,8 +2535,11 @@ class BlackoutOverlay:
     _WS_EX_LAYERED = 0x00080000
     _GA_ROOT = 2
     _HWND_TOPMOST = -1
+    _HWND_TOP = 0
     _SWP_NOACTIVATE = 0x0010
     _SWP_SHOWWINDOW = 0x0040
+    _SWP_NOSIZE = 0x0001
+    _SWP_NOMOVE = 0x0002
     _WDA_EXCLUDEFROMCAPTURE = 0x11
     _WH_KEYBOARD_LL = 13
     _WH_MOUSE_LL = 14
@@ -2576,15 +2612,34 @@ class BlackoutOverlay:
             print("[취침 모드] 경고: 화면 캡처 제외 설정에 실패했습니다 — "
                   "1080p 모드에서는 인식이 가려질 수 있습니다.")
         self.win.update()
+        self._place()
         self._reassert()
 
-    def _reassert(self):
-        """게임 창을 앞으로 불러도 암막이 위에 남게 최상위를 다시 주장한다."""
-        if not self.alive or not self.hwnd:
-            return
+    def _place(self):
+        """최초 배치 — 가상 화면 전체를 덮고 최상위로."""
         x, y, cw, ch = self.rect
         self._u32.SetWindowPos(self.hwnd, self._HWND_TOPMOST, x, y, cw, ch,
                                self._SWP_NOACTIVATE | self._SWP_SHOWWINDOW)
+
+    def _reassert(self):
+        """게임 창을 앞으로 불러도 암막이 위에 남게 z순서를 다시 주장한다.
+
+        **`HWND_TOPMOST`를 다시 거는 것으로는 안 된다(260911a, 실측):** 게임은
+        포그라운드가 되면 **스스로 `WS_EX_TOPMOST`가 된다**(실측: 호출 전 False
+        -> 호출 후 True). 그러면 암막과 게임이 같은 최상위 무리에 들어가는데,
+        **이미 최상위인 창에 `HWND_TOPMOST`를 재적용해도 무리 안 순서는 바뀌지
+        않는다** — 그래서 루틴이 한 번 돌고 나면 '암막 위에 게임창만 덩그러니'
+        뜨는 증상이 났다(실측 z: 오버레이 3 / 게임 2).
+
+        `HWND_TOP`은 **최상위 무리의 맨 위로** 올려준다(실측 복구 O, z 2/3으로
+        역전). `NOTOPMOST -> TOPMOST` 토글도 되지만 한 순간 최상위를 내려놓아
+        깜빡일 수 있으므로 쓰지 않는다. 위치·크기는 건드리지 않는다
+        (`SWP_NOMOVE|SWP_NOSIZE`) — 재배치는 `_place`가 한 번만 한다."""
+        if not self.alive or not self.hwnd:
+            return
+        self._u32.SetWindowPos(self.hwnd, self._HWND_TOP, 0, 0, 0, 0,
+                               self._SWP_NOMOVE | self._SWP_NOSIZE
+                               | self._SWP_NOACTIVATE)
 
     # ---------- 해제 감시 ----------
     def _install_release_watch(self):
