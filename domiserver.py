@@ -19,12 +19,19 @@
 서버 안에 자리를 잡고, 입장·비밀번호·팬아웃·도배 제한·이미지 중계를 기존 handle_*
 그대로 통과한다. 자세한 것은 아래 [8. 웹 중계] 절 머리말.
 
-콘솔은 계정·채팅방·웹 중계 관리용이며, 채팅 내용은 출력하지 않는다.
+**관리 창(tkinter)도 이 안에 들어 있다(옛 domiserver_gui.py).** 그냥 실행하면
+관리 창이 뜨고 서버·웹 중계가 그 뒤에서 돈다. `--console` 을 주면 예전처럼
+콘솔(repl)로 뜬다(창을 못 쓰는 환경·원격 세션용).
+
+콘솔·창 모두 계정·채팅방·웹 중계 관리용이며, 채팅 내용은 출력하지 않는다.
 """
 
 import base64
+import contextlib
+import ctypes
 import hashlib
 import hmac
+import io
 import json
 import os
 import queue
@@ -41,6 +48,9 @@ import threading
 import time
 import urllib.request
 from collections import deque
+
+import tkinter as tk
+from tkinter import messagebox, simpledialog, ttk
 
 # === [1. 상수 · 설정] ===
 
@@ -2468,10 +2478,1242 @@ def repl():
             print(f"명령 실패: {e}")
 
 
-# === [10. 진입점] ===
+# === [10. 관리 창 (tkinter, Windows) — 옛 domiserver_gui.py] ===
+# 콘솔(repl)이 하던 관리 작업을 창으로 옮긴 것. **서버 로직을 다시 구현하지 않는다**
+# — 관리 동작은 되도록 위 [9. 콘솔] 의 COMMANDS 를 `run_console` 로 **그대로 부르고**
+# 출력만 로그 칸으로 옮긴다(같은 일을 두 벌 구현하면 언젠가 어긋난다).
+#
+# 지켜야 할 것들(고치기 전에 읽을 것):
+# - **서버는 이 창이 떠 있는 동안 상시 가동**한다 — 켜고 끄는 버튼을 두지 않는다.
+#   창을 닫으면 서버도 함께 멈춘다.
+# - 콘솔이 `input()` 으로 되묻는 `delrooms` 만 창으로 다시 만들었다(그대로 부르면
+#   GUI 스레드가 입력을 기다리며 멈춘다).
+# - 로그는 `log` 를 `gui_log` 로 갈아 끼워 가로챈다. **`install_gui_log()` 는 창을
+#   띄울 때만 부른다** — 모듈을 읽자마자 갈아 끼우면 `--console` 로 띄웠을 때도
+#   창용 큐에만 쌓여 화면에 아무것도 안 나온다.
+# - `pythonw` 로 띄우면 표준 출력이 없어 `print` 가 그대로 터지므로 원래 stdout 이
+#   있을 때만 쓴다. 그리고 `sys.__stdout__` 에 직접 쓴다 — run_console 의 출력
+#   가로채기(redirect_stdout)에 다른 스레드의 로그가 휩쓸려 들어가지 않게.
+# - 방 보기는 `ROOM_OBSERVER` 훅으로 받는다. 서버는 여전히 대화를 저장하지 않으므로
+#   **창을 연 뒤에 오간 대화만** 보인다(설계상 공백).
+# - 서버 스레드에서 tkinter 를 직접 건드리면 안 된다. 로그·방 이벤트는 큐에 넣고
+#   GUI 스레드의 `after` 가 꺼내 그린다.
+# - 웹 중계('웹 중계' 칸)는 WEB_HUB 를 **읽기만** 하고, 목록 편집은 브라우저·콘솔과
+#   같은 `add_pc`/`del_pc` 를 부른다(목록 규칙의 주인을 늘리지 않는다).
 
 
-def main():
+# === [10-1. 창 상수] ===
+
+LOG_MAX_LINES = 3000      # 로그 창 보관 줄 수(넘으면 위에서부터 버린다)
+CHAT_MAX_LINES = 2000     # 방 보기 창 보관 줄 수
+REFRESH_MS = 1000         # 목록 갱신 주기 — 상태는 그때그때 DB·메모리에서 읽는다
+DRAIN_MS = 200            # 로그·방 이벤트 큐를 비우는 주기
+
+MONO = ("Consolas", 9)
+
+# 설정 창에 띄울 설명. '재시작' 표시가 붙은 값은 기동할 때 한 번만 쓰이는 것들이다
+# (port=bind, tls/require_tls=setup_tls). 나머지는 서버가 매번 CONFIG 를 다시
+# 보므로 저장 즉시 반영된다.
+CONFIG_HINT = {
+    "port": "서버 포트 · 바꾸면 재시작해야 적용",
+    "max_rooms": "채팅방 최대 개수",
+    "public_room_ttl_days": "공개방 자동 삭제 기준(일) · 0이면 자동 삭제 없음",
+    "msg_max_len": "메시지 최대 길이(글자)",
+    "ping_sec": "생존 확인 주기(초)",
+    "pong_timeout_sec": "무응답 판정 시간(초)",
+    "tls": "TLS 사용 · 바꾸면 재시작해야 적용",
+    "require_tls": "평문 접속 거부 · 바꾸면 재시작해야 적용",
+    "file_max_mb": "이미지 한 장 최대 크기(MB)",
+    "file_max_concurrent": "한 연결이 동시에 보낼 수 있는 이미지 수",
+    "web": "브라우저 웹 중계 사용 · 바꾸면 재시작해야 적용",
+    "web_host": "웹 중계가 들을 주소 · 재시작",
+    "web_port": "웹 중계 포트(브라우저 wss) · 재시작",
+    "web_id": "웹 중계가 방에서 쓰는 이름 · 재시작",
+    "web_certfile": "브라우저가 신뢰하는 인증서(fullchain) · 비면 평문 ws",
+    "web_keyfile": "그 개인키 · 비면 평문 ws",
+}
+
+
+# === [10-2. 로그 다리 — domiserver.log 가로채기] ===
+
+LOG_Q = queue.Queue()
+
+
+def gui_log(msg):
+    """`domiserver.log` 대체. 서버 스레드에서 불리므로 큐에만 넣고 돌아온다."""
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    LOG_Q.put(line)
+    out = sys.__stdout__          # redirect_stdout 에 휩쓸리지 않도록 원본에 직접
+    if out is None:               # pythonw 로 띄우면 표준 출력이 아예 없다
+        return
+    try:
+        out.write(line + "\n")
+        out.flush()
+    except Exception:
+        pass
+
+
+def install_gui_log():
+    """서버 로그를 창으로 돌린다. **창을 띄울 때만** 부른다 —
+    모듈을 읽자마자 갈아 끼우면 콘솔(`--console`)로 띄웠을 때도 창용 큐에만
+    쌓여 화면에 아무것도 안 나온다."""
+    global log
+    log = gui_log
+
+
+def put_log(msg):
+    """창에서 만든 안내를 서버 로그와 같은 모양으로 남긴다."""
+    LOG_Q.put(f"[{time.strftime('%H:%M:%S')}] {msg}")
+
+
+def run_console(name, *args):
+    """콘솔 명령을 **그대로** 실행하고 그 출력(print)을 로그로 옮긴다.
+    관리 동작을 창에서 다시 구현하지 않기 위한 통로다 — 동작도 문구도 콘솔과 같다."""
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            COMMANDS[name]([str(a) for a in args])
+    except Exception as e:
+        put_log(f"명령 실패: {name} — {e}")
+    for line in buf.getvalue().splitlines():
+        if line.strip():
+            put_log(line)
+    return buf.getvalue()
+
+
+# === [10-3. 서버 기동 · 정지] ===
+
+
+def port_busy(port):
+    """그 포트에서 이미 누가 응답하는지 본다(붙어 보고 바로 끊는다).
+
+    **bind 만으로는 못 걸러낸다(실측 함정):** Windows 에서는 `SO_REUSEADDR` 를
+    켠 소켓이 **이미 쓰이는 포트에도 그대로 bind 된다.** 그래서 콘솔판 서버가
+    떠 있는데 이 창을 또 띄우면 오류 없이 둘 다 올라가고, 들어오는 접속이
+    갈라져 "로그인은 되는데 관리 창에는 안 보이는" 상태가 된다(테스트 중 실제로
+    겪었다). 붙어 보는 것이 이 상황을 확실히 잡아내는 방법이다."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.4):
+            return True
+    except OSError:
+        return False
+
+
+def start_server():
+    """domiserver 부팅. `main()` 에서 콘솔(repl)만 뺀 것과 같다.
+    포트를 못 열면 OSError 를 그대로 올린다(호출자가 창으로 알린다)."""
+    load_config()
+    import_domiweb_config()
+    db_init()
+    if port_busy(CONFIG["port"]):
+        raise OSError(f"이미 무언가가 포트 {CONFIG['port']} 에서 응답하고 있습니다"
+                      " (콘솔판 domiserver.py 나 이 관리 창이 이미 떠 있지 않은지"
+                      " 확인하세요).")
+    setup_tls()
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", CONFIG["port"]))
+    srv.listen(32)
+
+    log(f"domiserver {APP_VERSION} 시작 — 포트 {CONFIG['port']}, run={RUN_ID}")
+    users = db_one("SELECT COUNT(*) AS n FROM users")["n"]
+    waiting = db_one("SELECT COUNT(*) AS n FROM user_pending")["n"]
+    rooms = db_one("SELECT COUNT(*) AS n FROM rooms")["n"]
+    log(f"계정 {users}명(가입 대기 {waiting}명), 채팅방 {rooms}개")
+    if waiting:
+        log("가입 대기가 있습니다 — '가입 대기' 목록에서 수락/거절하세요.")
+
+    threading.Thread(target=accept_loop, args=(srv,), daemon=True).start()
+    threading.Thread(target=maintenance_loop, daemon=True).start()
+    # 웹 중계도 같이 띄운다. 포트를 못 열면 None 을 돌려주고 **서버 본체는 그대로
+    # 돈다** — 채팅 중계가 웹 때문에 죽어서는 안 된다.
+    return srv, start_web_relay()
+
+
+def stop_server(srv):
+    """`main()` 의 finally 와 같은 순서로 정리한다.
+    srv 는 `start_server()` 가 돌려준 (채팅 소켓, 웹 소켓|None)."""
+    STOP.set()
+    for s in (srv if isinstance(srv, tuple) else (srv,)):
+        if s is None:
+            continue
+        try:
+            s.close()
+        except Exception:
+            pass
+    with STATE_LOCK:
+        conns = list(CONNS)
+    for c in conns:
+        close_conn(c, "서버 종료")
+    try:
+        with DB_LOCK:
+            DB.commit()
+            DB.close()
+    except Exception:
+        pass
+    log("domiserver 종료")
+
+
+def enable_dpi_awareness():
+    """고배율 모니터에서 글자가 뭉개지지 않게 한다(Windows 전용)."""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+# === [10-4. 공용 위젯 도우미] ===
+
+
+def _sort_key(v):
+    """숫자로 보이면 숫자로, 아니면 글자로 정렬한다('10' < '9' 를 막는다)."""
+    s = "" if v is None else str(v)
+    try:
+        return (0, float(s), "")
+    except ValueError:
+        return (1, 0.0, s)
+
+
+def make_tree(parent, columns, height=8, on_sort=None):
+    """columns = [(키, 제목, 폭, 정렬)] · (프레임, 트리) 반환.
+    제목을 누르면 그 열로 정렬한다(정렬 상태는 트리에 달아 두고 갱신 때 적용)."""
+    keys = [c[0] for c in columns]
+    frame = ttk.Frame(parent)
+    tree = ttk.Treeview(frame, columns=keys, show="headings", height=height,
+                        selectmode="browse")
+    vs = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=vs.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    vs.grid(row=0, column=1, sticky="ns")
+    frame.rowconfigure(0, weight=1)
+    frame.columnconfigure(0, weight=1)
+
+    def sorter(idx):
+        col, rev = tree.sort_by
+        tree.sort_by = (idx, (not rev) if col == idx else False)
+        if on_sort:
+            on_sort()
+
+    tree.sort_by = (0, False)
+    for i, (key, title, width, anchor) in enumerate(columns):
+        tree.heading(key, text=title, command=lambda i=i: sorter(i))
+        tree.column(key, width=width, anchor=anchor, stretch=(i == 0))
+    return frame, tree
+
+
+def sync_tree(tree, rows):
+    """rows = [(iid, (값,...))] 을 트리에 반영한다.
+    통째로 지웠다 다시 넣지 않는 이유: 1초마다 갱신하므로 그러면 선택과 스크롤이
+    매번 풀려 목록을 쓸 수가 없다. 그래서 없어진 것만 지우고 바뀐 것만 고친다."""
+    col, rev = tree.sort_by
+    rows = sorted(rows, key=lambda it: _sort_key(it[1][col]), reverse=rev)
+    want = {iid: tuple(str(v) for v in vals) for iid, vals in rows}
+    for iid in set(tree.get_children("")) - set(want):
+        tree.delete(iid)
+    for pos, (iid, _) in enumerate(rows):
+        vals = want[iid]
+        if tree.exists(iid):
+            if tuple(tree.item(iid, "values")) != vals:
+                tree.item(iid, values=vals)
+            if tree.index(iid) != pos:
+                tree.move(iid, "", pos)
+        else:
+            tree.insert("", pos, iid=iid, values=vals)
+
+
+def selected(tree):
+    sel = tree.selection()
+    return sel[0] if sel else None
+
+
+def append_text(widget, chunks, max_lines, follow=True):
+    """읽기 전용 Text 에 줄을 덧붙이고 오래된 줄을 버린다.
+    chunks = [(글자, 태그)] — 한 줄 안에서 색을 나누기 위해 조각으로 받는다."""
+    widget.configure(state="normal")
+    for text, tag in chunks:
+        widget.insert("end", text, (tag,) if tag else ())
+    widget.insert("end", "\n")
+    lines = int(widget.index("end-1c").split(".")[0])
+    if lines > max_lines:
+        widget.delete("1.0", f"{lines - max_lines + 1}.0")
+    widget.configure(state="disabled")
+    if follow:
+        widget.see("end")
+
+
+# === [10-5. 메인 창] ===
+
+
+class AdminApp:
+    """관리 창 하나. 주소·접속자·계정·채팅방을 **한 창에 상시** 띄운다."""
+
+    def __init__(self, root, srv):
+        self.root = root
+        self.srv = srv
+        self.ui_q = queue.Queue()        # 다른 스레드가 GUI 에 시킬 일(주소 조회 결과 등)
+        self.evt_q = queue.Queue()       # 방 관찰 이벤트 (room, obj)
+        self.room_windows = {}           # 방 이름 -> RoomWindow
+        self.ext_ip = None
+
+        root.title(f"domiserver 관리 — {APP_VERSION}")
+        root.geometry("1360x820")
+        root.minsize(1080, 620)
+        try:
+            root.iconbitmap(os.path.join(BASE_DIR, "domichat.ico"))
+        except Exception:
+            pass
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self._build()
+        # 서버의 팬아웃 훅을 잡는다. **global 이 없으면 지역 변수가 되어** 방 보기
+        # 창에 대화가 한 줄도 안 들어온다(ds. 접두어를 떼면서 실제로 겪었다).
+        global ROOM_OBSERVER
+        ROOM_OBSERVER = self._observe
+        self.refresh_addresses()
+        self.refresh_lists()
+        self._tick_fast()
+        self._tick_slow()
+
+    # ---------- 화면 구성 ----------
+
+    def _build(self):
+        r = self.root
+        r.rowconfigure(1, weight=1)
+        r.columnconfigure(0, weight=1)
+
+        self._build_header(r)
+
+        outer = ttk.PanedWindow(r, orient="vertical")
+        outer.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 4))
+        lists = ttk.PanedWindow(outer, orient="horizontal")
+        outer.add(lists, weight=3)
+        self._build_online(lists)
+        self._build_users(lists)
+        self._build_rooms(lists)
+        self._build_web(lists)
+        logf = ttk.Frame(outer)
+        outer.add(logf, weight=2)
+        self._build_log(logf)
+
+        self.var_status = tk.StringVar(value="시작하는 중…")
+        ttk.Label(r, textvariable=self.var_status, anchor="w",
+                  relief="sunken", padding=(6, 2)).grid(row=2, column=0,
+                                                        sticky="ew", padx=8, pady=(0, 6))
+
+    def _build_header(self, parent):
+        box = ttk.LabelFrame(parent, text="서버", padding=(8, 4))
+        box.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+        box.columnconfigure(1, weight=1)
+
+        self.var_server = tk.StringVar()
+        self.var_addr = tk.StringVar()
+        self.var_ext = tk.StringVar()
+        self.var_other = tk.StringVar()
+
+        ttk.Label(box, text="상태 :").grid(row=0, column=0, sticky="w")
+        ttk.Label(box, textvariable=self.var_server).grid(row=0, column=1, sticky="w")
+        ttk.Label(box, text="접속 주소 :").grid(row=1, column=0, sticky="w")
+        ttk.Label(box, textvariable=self.var_addr).grid(row=1, column=1, sticky="w")
+        ttk.Label(box, text="외부에서 :").grid(row=2, column=0, sticky="w")
+        ttk.Label(box, textvariable=self.var_ext).grid(row=2, column=1, sticky="w")
+        ttk.Label(box, text="그 밖의 :").grid(row=3, column=0, sticky="w")
+        ttk.Label(box, textvariable=self.var_other, foreground="#666").grid(
+            row=3, column=1, sticky="w")
+
+        btns = ttk.Frame(box)
+        btns.grid(row=0, column=2, rowspan=4, sticky="e", padx=(10, 0))
+        ttk.Button(btns, text="주소 새로고침", width=14,
+                   command=self.refresh_addresses).pack(fill="x", pady=1)
+        self.btn_cert = ttk.Button(btns, text="인증서 지문 복사", width=14,
+                                   command=self.act_copy_cert)
+        self.btn_cert.pack(fill="x", pady=1)
+        ttk.Button(btns, text="설정…", width=14,
+                   command=self.act_config).pack(fill="x", pady=1)
+
+    def _build_online(self, parent):
+        self.lf_online = ttk.LabelFrame(parent, text="접속 중", padding=(6, 4))
+        parent.add(self.lf_online, weight=2)
+        self.lf_online.rowconfigure(0, weight=1)
+        self.lf_online.columnconfigure(0, weight=1)
+        frame, self.tr_online = make_tree(self.lf_online, [
+            ("id", "ID", 105, "w"), ("ip", "주소", 95, "w"),
+            ("sec", "보안", 45, "center"), ("rooms", "들어가 있는 방", 130, "w"),
+        ], on_sort=self.refresh_lists)
+        frame.grid(row=0, column=0, sticky="nsew")
+        bar = ttk.Frame(self.lf_online)
+        bar.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(bar, text="연결 끊기", command=self.act_kick).pack(side="left")
+        ttk.Label(bar, text="계정은 그대로 남습니다", foreground="#666").pack(
+            side="left", padx=6)
+
+    def _build_users(self, parent):
+        box = ttk.Frame(parent)
+        parent.add(box, weight=2)
+        box.rowconfigure(0, weight=3)
+        box.rowconfigure(1, weight=2)
+        box.columnconfigure(0, weight=1)
+
+        self.lf_users = ttk.LabelFrame(box, text="계정", padding=(6, 4))
+        self.lf_users.grid(row=0, column=0, sticky="nsew")
+        self.lf_users.rowconfigure(0, weight=1)
+        self.lf_users.columnconfigure(0, weight=1)
+        frame, self.tr_users = make_tree(self.lf_users, [
+            ("id", "ID", 105, "w"), ("state", "상태", 50, "center"),
+            ("created", "가입", 80, "center"), ("last", "최근 로그인", 85, "center"),
+        ], on_sort=self.refresh_lists)
+        frame.grid(row=0, column=0, sticky="nsew")
+        bar = ttk.Frame(self.lf_users)
+        bar.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(bar, text="계정 삭제", command=self.act_deluser).pack(side="left")
+        ttk.Button(bar, text="정지", width=6,
+                   command=lambda: self.act_enable(False)).pack(side="left", padx=(4, 0))
+        ttk.Button(bar, text="해제", width=6,
+                   command=lambda: self.act_enable(True)).pack(side="left", padx=(4, 0))
+
+        self.lf_pending = ttk.LabelFrame(box, text="가입 대기", padding=(6, 4))
+        self.lf_pending.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        self.lf_pending.rowconfigure(0, weight=1)
+        self.lf_pending.columnconfigure(0, weight=1)
+        frame, self.tr_pending = make_tree(self.lf_pending, [
+            ("id", "ID", 105, "w"), ("ts", "요청 시각", 100, "center"),
+        ], height=4, on_sort=self.refresh_lists)
+        frame.grid(row=0, column=0, sticky="nsew")
+        bar = ttk.Frame(self.lf_pending)
+        bar.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(bar, text="수락", width=8, command=self.act_approve).pack(side="left")
+        ttk.Button(bar, text="거절", width=8,
+                   command=self.act_reject).pack(side="left", padx=(4, 0))
+        ttk.Label(bar, text="수락해야 로그인됩니다", foreground="#666").pack(
+            side="left", padx=6)
+
+    def _build_rooms(self, parent):
+        self.lf_rooms = ttk.LabelFrame(parent, text="채팅방", padding=(6, 4))
+        parent.add(self.lf_rooms, weight=3)
+        self.lf_rooms.rowconfigure(0, weight=1)
+        self.lf_rooms.columnconfigure(0, weight=1)
+        frame, self.tr_rooms = make_tree(self.lf_rooms, [
+            ("name", "이름", 155, "w"), ("kind", "유형", 65, "center"),
+            ("owner", "방장", 90, "w"), ("n", "인원", 40, "center"),
+            ("created", "생성", 80, "center"), ("last", "마지막 대화", 88, "center"),
+        ], on_sort=self.refresh_lists)
+        frame.grid(row=0, column=0, sticky="nsew")
+        self.tr_rooms.bind("<Double-1>", lambda _e: self.act_open_room())
+        bar = ttk.Frame(self.lf_rooms)
+        bar.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(bar, text="입장(보기)", command=self.act_open_room).pack(side="left")
+        ttk.Button(bar, text="방 정보", command=self.act_room_info).pack(
+            side="left", padx=(4, 0))
+        ttk.Button(bar, text="삭제", command=self.act_delroom).pack(side="left", padx=(4, 0))
+        ttk.Button(bar, text="일괄 삭제…", command=self.act_bulk_delete).pack(
+            side="left", padx=(4, 0))
+        ttk.Label(bar, text="제한방도 열어 볼 수 있습니다", foreground="#666").pack(
+            side="left", padx=6)
+
+    def _build_web(self, parent):
+        """웹 중계 칸 — 브라우저가 보는 피제어 PC 목록과 그 상태.
+        콘솔 `web` / `web add` / `web del` 과 **같은 것을 본다**(WEB_HUB 한 곳)."""
+        self.lf_web = ttk.LabelFrame(parent, text="웹 중계", padding=(6, 4))
+        parent.add(self.lf_web, weight=2)
+        self.lf_web.rowconfigure(1, weight=1)
+        self.lf_web.columnconfigure(0, weight=1)
+
+        self.var_web = tk.StringVar()
+        ttk.Label(self.lf_web, textvariable=self.var_web, foreground="#666",
+                  wraplength=260, justify="left").grid(row=0, column=0, sticky="ew")
+
+        frame, self.tr_web = make_tree(self.lf_web, [
+            ("pc", "피제어 PC", 105, "w"), ("joined", "입장", 40, "center"),
+            ("online", "상태", 55, "center"), ("watch", "보는 사람", 60, "center"),
+        ], on_sort=self.refresh_lists)
+        frame.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+
+        bar = ttk.Frame(self.lf_web)
+        bar.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(bar, text="PC 추가…", command=self.act_web_add).pack(side="left")
+        ttk.Button(bar, text="삭제", width=7,
+                   command=self.act_web_del).pack(side="left", padx=(4, 0))
+        ttk.Button(bar, text="브라우저 보기", command=self.act_web_clients).pack(
+            side="left", padx=(4, 0))
+
+    def act_web_add(self):
+        if WEB_HUB is None:
+            return messagebox.showinfo("웹 중계", "웹 중계가 꺼져 있습니다"
+                                       " (설정에서 web 을 켜고 재시작하세요).",
+                                       parent=self.root)
+        pc = simpledialog.askstring("PC 추가", "피제어 PC 이름(domichat ID)",
+                                    parent=self.root)
+        if not pc:
+            return
+        ok, msg = WEB_HUB.add_pc(pc.strip())
+        if not ok:
+            return messagebox.showerror("PC 추가", msg, parent=self.root)
+        log(f"[웹 목록] {msg} (관리 창)")
+        self.refresh_lists()
+
+    def act_web_del(self):
+        if WEB_HUB is None:
+            return
+        pc = self._pick(self.tr_web, "피제어 PC를")
+        if not pc:
+            return
+        if not messagebox.askyesno("PC 삭제", f"'{pc}' 를 웹 목록에서 뺄까요?\n\n"
+                                   "브라우저에서 그 PC가 사라집니다"
+                                   " (계정·채팅방은 그대로입니다).", parent=self.root):
+            return
+        ok, msg = WEB_HUB.del_pc(pc)
+        if ok:
+            log(f"[웹 목록] {msg} (관리 창)")
+        self.refresh_lists()
+
+    def act_web_clients(self):
+        """지금 붙어 있는 브라우저를 로그에 찍는다(콘솔 `web` 과 같은 내용)."""
+        run_console("web")
+
+    def _build_log(self, parent):
+        parent.rowconfigure(1, weight=1)
+        parent.columnconfigure(0, weight=1)
+
+        head = ttk.Frame(parent)
+        head.grid(row=0, column=0, sticky="ew", pady=(4, 2))
+        ttk.Label(head, text="서버 로그").pack(side="left")
+        ttk.Label(head, text="(대화 내용은 남기지 않습니다)",
+                  foreground="#666").pack(side="left", padx=6)
+        ttk.Button(head, text="지우기", width=8,
+                   command=self.act_clear_log).pack(side="right")
+        self.var_follow = tk.BooleanVar(value=True)
+        ttk.Checkbutton(head, text="자동 스크롤",
+                        variable=self.var_follow).pack(side="right", padx=6)
+
+        wrap = ttk.Frame(parent)
+        wrap.grid(row=1, column=0, sticky="nsew")
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+        self.txt_log = tk.Text(wrap, height=8, font=MONO, wrap="none",
+                               state="disabled", background="#fbfbfb")
+        vs = ttk.Scrollbar(wrap, orient="vertical", command=self.txt_log.yview)
+        self.txt_log.configure(yscrollcommand=vs.set)
+        self.txt_log.grid(row=0, column=0, sticky="nsew")
+        vs.grid(row=0, column=1, sticky="ns")
+
+        # 콘솔 명령줄 — 버튼으로 옮기지 않은 명령까지 그대로 쓸 수 있게 남겨 둔다
+        cmd = ttk.Frame(parent)
+        cmd.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        cmd.columnconfigure(1, weight=1)
+        ttk.Label(cmd, text="명령 :").grid(row=0, column=0)
+        self.ent_cmd = ttk.Entry(cmd, font=MONO)
+        self.ent_cmd.grid(row=0, column=1, sticky="ew", padx=4)
+        self.ent_cmd.bind("<Return>", lambda _e: self.act_run_cmd())
+        ttk.Button(cmd, text="실행", width=8,
+                   command=self.act_run_cmd).grid(row=0, column=2)
+        ttk.Button(cmd, text="도움말", width=8,
+                   command=self.act_help).grid(row=0, column=3, padx=(4, 0))
+
+    # ---------- 주기 작업 ----------
+
+    def _tick_fast(self):
+        """로그·방 이벤트·다른 스레드가 맡긴 일을 비운다."""
+        for _ in range(400):
+            try:
+                line = LOG_Q.get_nowait()
+            except queue.Empty:
+                break
+            append_text(self.txt_log, [(line, None)], LOG_MAX_LINES,
+                        follow=self.var_follow.get())
+        for _ in range(400):
+            try:
+                room, obj = self.evt_q.get_nowait()
+            except queue.Empty:
+                break
+            win = self.room_windows.get(room)
+            if win:
+                win.on_event(obj)
+        while True:
+            try:
+                fn = self.ui_q.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception as e:
+                put_log(f"[경고] 화면 갱신 실패: {e}")
+        self.root.after(DRAIN_MS, self._tick_fast)
+
+    def _tick_slow(self):
+        self.refresh_lists()
+        for win in list(self.room_windows.values()):
+            win.refresh_info()
+        self.root.after(REFRESH_MS, self._tick_slow)
+
+    # ---------- 목록 갱신 ----------
+
+    def refresh_lists(self):
+        with STATE_LOCK:
+            online = [(c.uid, c.addr[0], "TLS" if c.tls else "평문",
+                       ", ".join(sorted(c.rooms)) or "-")
+                      for c in CONNS if c.uid]
+            members = {}
+            for c in CONNS:
+                if c.uid:
+                    for name in c.rooms:
+                        members[name] = members.get(name, 0) + 1
+        on_ids = {row[0] for row in online}
+
+        sync_tree(self.tr_online, [(u[0], u) for u in online])
+        self.lf_online.configure(text=f"접속 중 ({len(online)}명)")
+
+        urows = []
+        for r in db_q("SELECT * FROM users"):
+            state = "접속중" if r["id"] in on_ids else ("정지" if not r["enabled"] else "-")
+            urows.append((r["id"], (r["id"], state, fmt_ts(r["created"]),
+                                    fmt_ts(r["last_login"]))))
+        sync_tree(self.tr_users, urows)
+        self.lf_users.configure(text=f"계정 ({len(urows)}명)")
+
+        prows = [(r["id"], (r["id"], fmt_ts(r["ts"])))
+                 for r in db_q("SELECT * FROM user_pending")]
+        sync_tree(self.tr_pending, prows)
+        self.lf_pending.configure(text=f"가입 대기 ({len(prows)}명)")
+
+        rrows = []
+        for r in db_q("SELECT * FROM rooms"):
+            rrows.append((r["name"], (
+                r["name"], KIND_KO.get(r["kind"], r["kind"]), r["owner"] or "-",
+                members.get(r["name"], 0), fmt_ts(r["created"]),
+                fmt_ts(r["last_msg"]))))
+        sync_tree(self.tr_rooms, rrows)
+        self.lf_rooms.configure(text=f"채팅방 ({len(rrows)}/{CONFIG['max_rooms']})")
+
+        self.refresh_web()
+
+        tls = "TLS" if SSL_CTX is not None else "평문"
+        self.var_status.set(
+            f"계정 {len(urows)}명 · 가입 대기 {len(prows)}명 · 접속 중 {len(online)}명"
+            f" · 채팅방 {len(rrows)}/{CONFIG['max_rooms']}"
+            f" · 포트 {CONFIG['port']} · {tls}"
+            f" · 방 보기 {len(self.room_windows)}개 열림")
+
+    def refresh_web(self):
+        """'웹 중계' 칸 갱신. 중계가 꺼져 있으면 목록을 비우고 그 사실만 적는다."""
+        if WEB_HUB is None:
+            self.var_web.set("꺼져 있음 — 설정에서 web 을 켜고 재시작하세요.")
+            sync_tree(self.tr_web, [])
+            self.lf_web.configure(text="웹 중계 (꺼짐)")
+            return
+        with WEB_HUB.lock:
+            watch = {}
+            for c in WEB_HUB.clients:
+                if c.pc:
+                    watch[c.pc] = watch.get(c.pc, 0) + 1
+            n_cli = len(WEB_HUB.clients)
+        scheme = "wss" if WEB_SSL_CTX is not None else "ws(평문)"
+        self.var_web.set(f"{scheme} · 포트 {CONFIG['web_port']} · 중계 이름"
+                         f" '{WEB_HUB.uid}' · 브라우저 {n_cli}명")
+        rows = []
+        for pc in CONFIG["web_pcs"]:
+            st = WEB_HUB.state.get(pc, {})
+            on = {True: "접속중", False: "꺼짐", None: "모름"}[st.get("online")]
+            rows.append((pc, (pc, "O" if st.get("joined") else "X", on,
+                              watch.get(pc, 0))))
+        sync_tree(self.tr_web, rows)
+        self.lf_web.configure(text=f"웹 중계 (브라우저 {n_cli}명)")
+
+    def refresh_addresses(self):
+        """주소 표시 갱신. 공인 IP 조회는 느릴 수 있어 스레드로 돌린다."""
+        port = CONFIG["port"]
+        if SSL_CTX is None:
+            sec = "TLS 미사용(평문)"
+        else:
+            sec = f"TLS 사용 · 지문 {(CERT_FP or '?')[:16]}…"
+            sec += " · 평문 거부" if CONFIG["require_tls"] else " · 평문도 허용"
+        web = (f"웹 중계 {CONFIG['web_port']}"
+               f"({'wss' if WEB_SSL_CTX is not None else 'ws 평문'})"
+               if WEB_HUB is not None else "웹 중계 꺼짐")
+        self.var_server.set(f"domiserver {APP_VERSION} 가동 중 · 포트 {port} · {sec}"
+                            f" · {web} · run={RUN_ID}")
+        self.btn_cert.configure(state=("normal" if CERT_FP else "disabled"))
+        self.var_ext.set("조회 중…")
+
+        def work():
+            ips = local_ips()
+            primary = ips[0] if ips else None
+            others = [ip for ip in ips[1:] if _ip_kind(ip) != "loopback"]
+            ext = external_ip()
+
+            def apply():
+                self.ext_ip = ext
+                tag = ""
+                if primary:
+                    tag = ("공인 IP — 밖에서도 이 주소"
+                           if _ip_kind(primary) == "public"
+                           else "사설 IP — 같은 네트워크 안에서만")
+                self.var_addr.set(f"같은 PC 127.0.0.1      |      다른 PC "
+                                  f"{primary or '?'}  ({tag})      |      포트 {port}")
+                if not ext:
+                    self.var_ext.set("조회하지 못했습니다 — 인터넷 연결을 확인하세요")
+                elif ext in ips:
+                    self.var_ext.set(f"{ext}   ← 밖에서도 이 주소로 바로 접속됩니다"
+                                     f" (공인 IP가 이 PC에 직접 할당 · 포워딩 불필요)")
+                else:
+                    self.var_ext.set(f"{ext}   ← NAT 안쪽입니다 · 공유기에서 포트 "
+                                     f"{port} 를 이 PC로 포워딩해야 밖에서 접속됩니다")
+                self.var_other.set((", ".join(others) + "   (가상 어댑터 등 — 보통 접속에"
+                                    " 쓰이지 않음)") if others else "없음")
+            self.ui_q.put(apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------- 방 관찰 ----------
+
+    def _observe(self, room, obj):
+        """`domiserver.ROOM_OBSERVER` — **서버 스레드에서 불린다.**
+        tkinter 는 건드리지 않고 큐에만 넣는다. 열어 둔 창이 없는 방은 그냥 버려
+        큐가 쌓이지 않게 한다."""
+        if room in self.room_windows:
+            self.evt_q.put((room, obj))
+
+    def open_room(self, name):
+        win = self.room_windows.get(name)
+        if win is not None:
+            win.lift()
+            win.focus_force()
+            return
+        self.room_windows[name] = RoomWindow(self, name)
+        self.refresh_lists()
+
+    def close_room(self, name):
+        self.room_windows.pop(name, None)
+
+    # ---------- 동작 (콘솔 명령과 1:1) ----------
+
+    def _pick(self, tree, what):
+        iid = selected(tree)
+        if iid is None:
+            messagebox.showinfo("선택 필요", f"먼저 목록에서 {what} 고르세요.",
+                                parent=self.root)
+        return iid
+
+    def act_kick(self):
+        """kick <ID> — 연결만 끊는다(계정은 그대로)."""
+        uid = self._pick(self.tr_online, "접속 중인 사용자를")
+        if not uid:
+            return
+        if messagebox.askyesno("연결 끊기", f"'{uid}' 의 연결을 끊을까요?\n\n"
+                               "계정은 그대로 남고, 상대는 다시 로그인할 수 있습니다.",
+                               parent=self.root):
+            run_console("kick", uid)
+            self.refresh_lists()
+
+    def act_deluser(self):
+        """deluser <ID> — ID와 비밀번호를 서버에서 지운다(수정 기능은 두지 않는다)."""
+        uid = self._pick(self.tr_users, "계정을")
+        if not uid:
+            return
+        if messagebox.askyesno(
+                "계정 삭제",
+                f"'{uid}' 계정을 삭제할까요?\n\n"
+                "· ID와 비밀번호가 서버에서 지워지며 되돌릴 수 없습니다.\n"
+                "· 접속 중이면 연결이 끊깁니다.\n"
+                "· 이 계정이 방장인 제한방은 그대로 남습니다(따로 삭제하세요).",
+                icon="warning", parent=self.root):
+            run_console("deluser", uid)
+            self.refresh_lists()
+
+    def act_enable(self, on):
+        """enable / disable <ID> — 계정을 살리거나 정지한다."""
+        uid = self._pick(self.tr_users, "계정을")
+        if not uid:
+            return
+        if not on and not messagebox.askyesno(
+                "계정 정지", f"'{uid}' 계정을 정지할까요?\n\n"
+                "접속 중이면 연결이 끊기고, 해제할 때까지 로그인할 수 없습니다.",
+                parent=self.root):
+            return
+        run_console("enable" if on else "disable", uid)
+        self.refresh_lists()
+
+    def act_approve(self):
+        """approve <ID> — 가입 수락(이때부터 로그인된다)."""
+        uid = self._pick(self.tr_pending, "가입 요청을")
+        if not uid:
+            return
+        run_console("approve", uid)
+        self.refresh_lists()
+
+    def act_reject(self):
+        """reject <ID> — 가입 요청 거절."""
+        uid = self._pick(self.tr_pending, "가입 요청을")
+        if not uid:
+            return
+        if messagebox.askyesno("가입 거절", f"'{uid}' 의 가입 요청을 거절할까요?",
+                               parent=self.root):
+            run_console("reject", uid)
+            self.refresh_lists()
+
+    def act_open_room(self):
+        name = self._pick(self.tr_rooms, "채팅방을")
+        if name:
+            self.open_room(name)
+
+    def act_room_info(self):
+        """room <이름> — 콘솔과 같은 상세 정보를 로그에 찍는다."""
+        name = self._pick(self.tr_rooms, "채팅방을")
+        if name:
+            run_console("room", name)
+
+    def act_delroom(self):
+        name = self._pick(self.tr_rooms, "채팅방을")
+        if not name:
+            return
+        if messagebox.askyesno(
+                "채팅방 삭제", f"'{name}' 채팅방을 삭제할까요?\n\n"
+                "참여자들의 대화 기록도 함께 삭제됩니다. 되돌릴 수 없습니다.",
+                icon="warning", parent=self.root):
+            run_console("delroom", name)
+            win = self.room_windows.get(name)
+            if win is not None:
+                win.refresh_info()
+            self.refresh_lists()
+
+    def act_bulk_delete(self):
+        BulkDeleteWindow(self)
+
+    def act_config(self):
+        ConfigWindow(self)
+
+    def act_copy_cert(self):
+        """cert — 클라이언트가 고정한 지문과 맞춰 볼 때 쓴다."""
+        if not CERT_FP:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(CERT_FP)
+        run_console("cert")
+        put_log("인증서 지문을 클립보드에 복사했습니다.")
+
+    def act_clear_log(self):
+        self.txt_log.configure(state="normal")
+        self.txt_log.delete("1.0", "end")
+        self.txt_log.configure(state="disabled")
+
+    def act_help(self):
+        for line in HELP.splitlines():
+            put_log(line)
+        put_log("창에서는 delrooms 를 치면 '일괄 삭제' 창이 대신 열립니다"
+                " (콘솔판은 되묻기에 입력이 필요해 창을 멈춥니다).")
+
+    def act_run_cmd(self):
+        """콘솔 명령줄 — 버튼으로 옮기지 않은 것까지 그대로 쓸 수 있게 남겨 둔 통로."""
+        line = self.ent_cmd.get().strip()
+        if not line:
+            return
+        self.ent_cmd.delete(0, "end")
+        put_log(f"> {line}")
+        parts = line.split()
+        cmd, args = parts[0].lower(), parts[1:]
+        if cmd in ("quit", "exit"):
+            self.on_close()
+        elif cmd == "help":
+            self.act_help()
+        elif cmd == "delrooms":
+            # 콘솔판은 input() 으로 되물어 GUI 스레드를 멈춘다 → 창으로 대신한다
+            self.act_bulk_delete()
+        elif cmd in COMMANDS:
+            run_console(cmd, *args)
+            self.refresh_lists()
+            if cmd in ("set", "config"):
+                self.refresh_addresses()
+        else:
+            put_log(f"모르는 명령: {cmd}  (도움말 버튼을 눌러 보세요)")
+
+    # ---------- 종료 ----------
+
+    def on_close(self):
+        with STATE_LOCK:
+            n = len([c for c in CONNS if c.uid])
+        msg = "관리 창을 닫으면 서버도 함께 멈춥니다."
+        if n:
+            msg += f"\n지금 접속 중인 {n}명의 연결이 끊깁니다."
+        if not messagebox.askokcancel("종료", msg + "\n\n종료할까요?", parent=self.root):
+            return
+        global ROOM_OBSERVER
+        ROOM_OBSERVER = None
+        stop_server(self.srv)
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        # DB는 위에서 이미 닫았다. 남은 스레드는 전부 데몬이지만 SSL 소켓에서
+        # 블로킹 중일 수 있어, 창이 사라진 뒤에도 프로세스가 남지 않게 끊는다.
+        os._exit(0)
+
+
+# === [10-6. 방 보기 창 — 제한방도 그대로 들여다본다] ===
+
+
+class RoomWindow(tk.Toplevel):
+    """방 하나를 들여다보는 창.
+
+    **입장 절차를 밟지 않는다** — 서버가 중계하는 프레임을 옆에서 받아 볼 뿐이라
+    비밀번호방·사전승인방·사후승인방도 그대로 열린다. 방 사람들에게는 아무도
+    들어온 것으로 보이지 않는다(member 알림이 나가지 않는다).
+
+    **서버는 대화를 저장하지 않으므로 창을 연 뒤의 대화만 보인다.** 이건 고장이
+    아니라 설계다(domichat.md — 서버는 순수 중계).
+    """
+
+    def __init__(self, app, room):
+        super().__init__(app.root)
+        self.app = app
+        self.room = room
+        self.gone = False               # 방이 삭제됐는지(한 번만 알린다)
+        self.title(f"방 보기 — {room}")
+        self.geometry("860x560")
+        self.minsize(640, 400)
+        try:
+            self.iconbitmap(os.path.join(BASE_DIR, "domichat.ico"))
+        except Exception:
+            pass
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._build()
+        self.refresh_info()
+        self._sys(f"'{room}' 방을 열었습니다 — 지금부터 오가는 대화가 여기 보입니다.")
+
+    def _build(self):
+        self.rowconfigure(1, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        top = ttk.Frame(self, padding=(8, 6, 8, 2))
+        top.grid(row=0, column=0, sticky="ew")
+        self.var_head = tk.StringVar()
+        ttk.Label(top, textvariable=self.var_head, font=("", 10, "bold")).pack(side="left")
+
+        pane = ttk.PanedWindow(self, orient="horizontal")
+        pane.grid(row=1, column=0, sticky="nsew", padx=8)
+
+        left = ttk.LabelFrame(pane, text="대화 (실시간 중계)", padding=(6, 4))
+        pane.add(left, weight=3)
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
+        self.txt = tk.Text(left, font=MONO, wrap="word", state="disabled",
+                           background="#ffffff")
+        vs = ttk.Scrollbar(left, orient="vertical", command=self.txt.yview)
+        self.txt.configure(yscrollcommand=vs.set)
+        self.txt.grid(row=0, column=0, sticky="nsew")
+        vs.grid(row=0, column=1, sticky="ns")
+        self.txt.tag_configure("ts", foreground="#999")
+        self.txt.tag_configure("who", foreground="#0b5", font=(MONO[0], MONO[1], "bold"))
+        self.txt.tag_configure("body", foreground="#111")
+        self.txt.tag_configure("sys", foreground="#888")
+        self.txt.tag_configure("img", foreground="#06c")
+
+        right = ttk.LabelFrame(pane, text="방 정보", padding=(6, 4))
+        pane.add(right, weight=1)
+        self.info_vars = {}
+        for i, label in enumerate(("유형", "방장", "생성", "마지막 대화", "접속 중",
+                                   "구독 중", "허용 ID", "승인 대기", "블랙리스트")):
+            ttk.Label(right, text=label, foreground="#666").grid(
+                row=i * 2, column=0, sticky="w", pady=(4, 0))
+            var = tk.StringVar(value="-")
+            ttk.Label(right, textvariable=var, wraplength=210, justify="left").grid(
+                row=i * 2 + 1, column=0, sticky="w")
+            self.info_vars[label] = var
+
+        bottom = ttk.Frame(self, padding=(8, 4))
+        bottom.grid(row=2, column=0, sticky="ew")
+        ttk.Label(bottom, foreground="#666",
+                  text="서버는 대화를 저장하지 않습니다 — 창을 연 뒤의 대화만 보입니다."
+                  ).pack(side="left")
+        ttk.Button(bottom, text="닫기", width=8, command=self.on_close).pack(side="right")
+        ttk.Button(bottom, text="기록 지우기", width=11,
+                   command=self.clear).pack(side="right", padx=4)
+        self.var_follow = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bottom, text="자동 스크롤",
+                        variable=self.var_follow).pack(side="right", padx=6)
+
+    # ---------- 표시 ----------
+
+    def _line(self, chunks):
+        append_text(self.txt, chunks, CHAT_MAX_LINES, follow=self.var_follow.get())
+
+    def _stamp(self, ts=None):
+        return time.strftime("%H:%M:%S", time.localtime(ts or time.time()))
+
+    def _sys(self, text, ts=None):
+        self._line([(f"[{self._stamp(ts)}] ", "ts"), (f"— {text} —", "sys")])
+
+    def on_event(self, obj):
+        """`fanout` 이 방에 흘려보낸 프레임 하나. GUI 스레드에서 불린다."""
+        t = obj.get("t")
+        if t == "msg":
+            self._line([(f"[{self._stamp(obj.get('ts'))}] ", "ts"),
+                        (f"{obj.get('from')}", "who"),
+                        (f" : {obj.get('body', '')}", "body")])
+        elif t == "member":
+            self._sys(f"{obj.get('id')} {'입장' if obj.get('in') else '나감'}")
+        elif t == "file_begin":
+            kb = (obj.get("size") or 0) / 1024.0
+            self._line([(f"[{self._stamp(obj.get('ts'))}] ", "ts"),
+                        (f"{obj.get('from')}", "who"),
+                        (f" : [이미지] {obj.get('name')} ({kb:,.0f} KB)", "img")])
+        elif t == "file_end" and not obj.get("ok"):
+            self._sys("이미지가 온전히 전달되지 않았습니다")
+        elif t == "file_abort":
+            self._sys("이미지 전송이 중단되었습니다")
+
+    def clear(self):
+        self.txt.configure(state="normal")
+        self.txt.delete("1.0", "end")
+        self.txt.configure(state="disabled")
+
+    def refresh_info(self):
+        """오른쪽 정보 칸 갱신 — 콘솔 `room <이름>` 이 보여주던 것과 같은 내용."""
+        r = room_row(self.room)
+        if not r:
+            if not self.gone:
+                self.gone = True
+                self._sys("이 채팅방은 삭제되었습니다")
+                self.var_head.set(f"{self.room}   (삭제됨)")
+                for var in self.info_vars.values():
+                    var.set("-")
+            return
+        with STATE_LOCK:
+            here = sorted(c.uid for c in CONNS if c.uid and self.room in c.rooms)
+            subs = sorted(c.uid for c in CONNS if c.uid and self.room in c.subs)
+        kind = KIND_KO.get(r["kind"], r["kind"])
+        self.var_head.set(f"{self.room}   ·   {kind}방   ·   접속 {len(here)}명")
+        info = {
+            "유형": kind,
+            "방장": r["owner"] or "없음(공개방)",
+            "생성": fmt_ts(r["created"]),
+            "마지막 대화": fmt_ts(r["last_msg"]),
+            "접속 중": ", ".join(here) or "-",
+            "구독 중": ", ".join(subs) or "-",
+            "허용 ID": ", ".join(sorted(room_ids("room_allow", self.room))) or "-",
+            "승인 대기": ", ".join(sorted(room_ids("room_pending", self.room))) or "-",
+            "블랙리스트": ", ".join(sorted(room_ids("room_block", self.room))) or "-",
+        }
+        for k, v in info.items():
+            if self.info_vars[k].get() != v:
+                self.info_vars[k].set(v)
+
+    def on_close(self):
+        self.app.close_room(self.room)
+        self.destroy()
+
+
+# === [10-7. 채팅방 일괄 삭제 창 (콘솔 delrooms)] ===
+
+
+class BulkDeleteWindow(tk.Toplevel):
+    """콘솔 `delrooms all|open|limited|owner <ID>` 를 창으로 옮긴 것.
+    콘솔판은 `input()` 으로 되묻는데 GUI 스레드에서 그걸 부르면 창이 멈추므로
+    **여기서만** 같은 일을 다시 구현했다(대상 선정 SQL·경고 문구는 콘솔과 같다)."""
+
+    MODES = (("all", "모든 채팅방"), ("open", "공개 채팅방만"),
+             ("limited", "제한 채팅방만"), ("owner", "특정 방장이 만든 방"))
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("채팅방 일괄 삭제")
+        self.geometry("460x420")
+        self.transient(app.root)
+        self.var_mode = tk.StringVar(value="all")
+        self.var_owner = tk.StringVar()
+        self.var_count = tk.StringVar()
+        self._build()
+        self.refresh()
+
+    def _build(self):
+        self.rowconfigure(2, weight=1)
+        self.columnconfigure(0, weight=1)
+        box = ttk.LabelFrame(self, text="지울 대상", padding=(8, 6))
+        box.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        for key, label in self.MODES:
+            ttk.Radiobutton(box, text=label, value=key, variable=self.var_mode,
+                            command=self.refresh).pack(anchor="w")
+        row = ttk.Frame(box)
+        row.pack(anchor="w", pady=(4, 0))
+        ttk.Label(row, text="방장 ID :").pack(side="left")
+        self.ent_owner = ttk.Entry(row, textvariable=self.var_owner, width=22)
+        self.ent_owner.pack(side="left", padx=4)
+        self.var_owner.trace_add("write", lambda *_a: self.refresh())
+
+        ttk.Label(self, textvariable=self.var_count).grid(row=1, column=0,
+                                                          sticky="w", padx=10)
+        wrap = ttk.Frame(self)
+        wrap.grid(row=2, column=0, sticky="nsew", padx=8)
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+        self.lst = tk.Listbox(wrap)
+        vs = ttk.Scrollbar(wrap, orient="vertical", command=self.lst.yview)
+        self.lst.configure(yscrollcommand=vs.set)
+        self.lst.grid(row=0, column=0, sticky="nsew")
+        vs.grid(row=0, column=1, sticky="ns")
+
+        bar = ttk.Frame(self, padding=8)
+        bar.grid(row=3, column=0, sticky="ew")
+        ttk.Button(bar, text="닫기", width=10, command=self.destroy).pack(side="right")
+        ttk.Button(bar, text="삭제", width=10,
+                   command=self.do_delete).pack(side="right", padx=4)
+
+    def _match(self):
+        """콘솔 cmd_delrooms 와 같은 조건으로 대상을 고른다."""
+        mode = self.var_mode.get()
+        if mode == "all":
+            rows = db_q("SELECT name FROM rooms")
+            return [r["name"] for r in rows], "모든 채팅방"
+        if mode == "open":
+            rows = db_q("SELECT name FROM rooms WHERE kind='open'")
+            return [r["name"] for r in rows], "공개 채팅방"
+        if mode == "limited":
+            rows = db_q("SELECT name FROM rooms WHERE kind!='open'")
+            return [r["name"] for r in rows], "제한 채팅방"
+        owner = self.var_owner.get().strip()
+        if not owner:
+            return [], "방장 ID를 입력하세요"
+        rows = db_q("SELECT name FROM rooms WHERE owner=?", (owner,))
+        return [r["name"] for r in rows], f"'{owner}' 이(가) 만든 채팅방"
+
+    def refresh(self):
+        self.ent_owner.configure(
+            state="normal" if self.var_mode.get() == "owner" else "disabled")
+        names, desc = self._match()
+        self.var_count.set(f"{desc} — {len(names)}개")
+        self.lst.delete(0, "end")
+        for n in names:
+            self.lst.insert("end", n)
+
+    def do_delete(self):
+        names, desc = self._match()
+        if not names:
+            messagebox.showinfo("일괄 삭제", f"{desc}이 없습니다.", parent=self)
+            return
+        shown = "\n".join(names[:20]) + ("\n…" if len(names) > 20 else "")
+        if not messagebox.askyesno(
+                "일괄 삭제", f"{desc} {len(names)}개를 삭제할까요?\n\n{shown}\n\n"
+                "참여자들의 대화 기록도 함께 삭제됩니다. 되돌릴 수 없습니다.",
+                icon="warning", parent=self):
+            return
+        for n in names:
+            purge_room(n)
+            win = self.app.room_windows.get(n)
+            if win is not None:
+                win.refresh_info()
+        log(f"[일괄 삭제] {desc} {len(names)}개 삭제")
+        self.app.refresh_lists()
+        self.refresh()
+
+
+# === [10-8. 설정 창 (콘솔 config / set)] ===
+
+
+class ConfigWindow(tk.Toplevel):
+    """`domiserver.json` 편집.
+
+    참·거짓 값은 **체크박스**로 받는다(함정): 콘솔 `set` 은 `type(기본값)(입력)`
+    으로 바꾸는데 `bool("false")` 는 True 라서, 콘솔에서 `set tls false` 를 치면
+    오히려 켜진다. 창에서는 그 길을 아예 막는다."""
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("서버 설정")
+        self.transient(app.root)
+        self.resizable(False, False)
+        self.vars = {}
+        self._build()
+
+    def _build(self):
+        box = ttk.Frame(self, padding=10)
+        box.pack(fill="both", expand=True)
+        # 목록형(web_pcs·web_origins)은 여기서 다루지 않는다 — `type(기본값)(문자열)`
+        # 이 `list("abc") -> ['a','b','c']` 로 망가진다. 피제어 PC 목록은 '웹 중계'
+        # 칸의 추가/삭제 버튼이 주인이다.
+        for i, key in enumerate(k for k in DEFAULT_CONFIG
+                                if not isinstance(DEFAULT_CONFIG[k], list)):
+            ttk.Label(box, text=key).grid(row=i, column=0, sticky="w", pady=2)
+            cur = CONFIG[key]
+            if isinstance(DEFAULT_CONFIG[key], bool):
+                var = tk.BooleanVar(value=bool(cur))
+                ttk.Checkbutton(box, variable=var).grid(row=i, column=1,
+                                                        sticky="w", padx=8)
+            else:
+                var = tk.StringVar(value=str(cur))
+                ttk.Entry(box, textvariable=var, width=12).grid(row=i, column=1,
+                                                                sticky="w", padx=8)
+            self.vars[key] = var
+            ttk.Label(box, text=CONFIG_HINT.get(key, ""), foreground="#666").grid(
+                row=i, column=2, sticky="w")
+
+        bar = ttk.Frame(self, padding=(10, 0, 10, 10))
+        bar.pack(fill="x")
+        ttk.Label(bar, foreground="#666",
+                  text="'재시작해야 적용' 항목은 저장만 되고 다음 실행부터 반영됩니다."
+                  ).pack(side="left")
+        ttk.Button(bar, text="닫기", width=10, command=self.destroy).pack(side="right")
+        ttk.Button(bar, text="저장", width=10,
+                   command=self.save).pack(side="right", padx=4)
+
+    def save(self):
+        changed = []
+        for key, var in self.vars.items():
+            default = DEFAULT_CONFIG[key]
+            if isinstance(default, bool):
+                value = bool(var.get())
+            else:
+                try:
+                    value = type(default)(var.get().strip())
+                except ValueError:
+                    messagebox.showerror(
+                        "설정", f"'{var.get()}' 는 {key} 에 넣을 수 없습니다.",
+                        parent=self)
+                    return
+            if CONFIG[key] != value:
+                CONFIG[key] = value
+                changed.append(f"{key} = {value}")
+        if not changed:
+            put_log("설정: 바뀐 값이 없습니다.")
+            self.destroy()
+            return
+        save_config()
+        for line in changed:
+            put_log(f"설정 저장: {line}")
+        self.app.refresh_addresses()
+        self.app.refresh_lists()
+        self.destroy()
+
+
+def gui_main():
+    enable_dpi_awareness()
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        srv = start_server()
+    except OSError as e:
+        messagebox.showerror(
+            "domiserver 시작 실패",
+            f"포트 {CONFIG['port']} 를 열 수 없습니다.\n\n{e}\n\n"
+            "이미 다른 domiserver 가 떠 있거나, 다른 프로그램이 그 포트를 쓰고"
+            " 있습니다.\ndomiserver.json 의 port 를 바꾼 뒤 다시 실행하세요.")
+        return 1
+    except Exception as e:
+        messagebox.showerror("domiserver 시작 실패",
+                             f"서버를 시작하지 못했습니다.\n\n{e}")
+        return 1
+    root.deiconify()
+    AdminApp(root, srv)
+    root.mainloop()
+    return 0
+
+
+# === [11. 진입점] ===
+
+
+def console_main():
     load_config()
     import_domiweb_config()
     db_init()
@@ -2519,6 +3761,14 @@ def main():
             DB.close()
         log("domiserver 종료")
     return 0
+
+
+def main():
+    """기본은 **관리 창**이다. 창을 띄울 수 없는 환경(원격 세션·헤드리스)이나
+    예전처럼 콘솔로 쓰고 싶을 때 `--console` 을 준다."""
+    if "--console" in sys.argv[1:]:
+        return console_main()
+    return gui_main()
 
 
 if __name__ == "__main__":
