@@ -4,6 +4,7 @@ import {
   CMD, PENDING_TIMEOUT_MS, STATUS_TEXT, Status, Tank, dispatch, isWatchMode,
 } from "./lib/protocol";
 import { ScreenshotView } from "./ui/Screenshot";
+import { ChatMsg, ChatRoomView, RoomListView, useChat } from "./ui/Chat";
 
 type LogLine = { t: string; s: string };
 type Pending = { kind: string; at: number };
@@ -66,12 +67,24 @@ export function App() {
   const [shotWait, setShotWait] = useState(0);
   const [shot, setShot] = useState<{ name: string; url: string } | null>(null);
 
+  // ---------- 화면 ----------
+  // 채팅은 **창이 아니라 화면 전환**이다(휴대폰에서 더 많이 쓴다). 낚시 제어 화면은
+  // 사라져도 상태는 계속 갱신된다 — 중계는 여전히 그 PC의 방을 보고 있다.
+  const [screen, setScreen] = useState<"fishing" | "chat">("fishing");
+  const [chatShot, setChatShot] = useState<{ name: string; url: string } | null>(null);
+
   const relayRef = useRef<Relay | null>(null);
   const logBox = useRef<HTMLDivElement | null>(null);
 
   const addLog = useCallback((s: string) => {
     setLog((prev) => [...prev, { t: now(), s }].slice(-LOG_MAX));
   }, []);
+
+  const chat = useChat(relayRef, myId);
+  // **onEvent는 절대 다시 만들어지면 안 된다** — 연결 수립 effect가 그것을 의존해
+  // 소켓을 새로 연다. 그래서 채팅 쪽 처리기는 ref로 들고 부른다.
+  const chatHandle = useRef(chat.handle);
+  chatHandle.current = chat.handle;
 
   // ---------- 테마 ----------
   useEffect(() => {
@@ -154,6 +167,7 @@ export function App() {
   }, [addLog]);
 
   const onEvent = useCallback((e: RelayEvent) => {
+    chatHandle.current(e);
     switch (e.t) {
       case "link":
         setLink(e.state);
@@ -344,6 +358,27 @@ export function App() {
     : shotWait ? STATUS_TEXT.loading && "강태공이 사진을 찍고 있습니다."
     : (STATUS_TEXT[statusKey] ?? "");
 
+  const shotView = chatShot && (
+    <ScreenshotView name={chatShot.name} blobUrl={chatShot.url} onLog={addLog}
+                    onClose={() => setChatShot(null)} />
+    // **여기서 revokeObjectURL 하지 않는다** — 이 Blob은 말풍선이 계속 쓰고 있고,
+    // 방을 닫을 때 한꺼번에 되돌린다(useChat의 dropUrls).
+  );
+
+  // 채팅은 화면을 통째로 바꾼다(모바일에서 창은 다루기 나쁘다). 낚시 제어 상태는
+  // 그대로 살아 있어 돌아오면 최신 값이 보인다.
+  if (screen === "chat") {
+    return (
+      <div className="wrap chat">
+        {chat.view === "room"
+          ? <ChatRoomView chat={chat} myId={myId}
+                          onImage={(m: ChatMsg) => m.img && setChatShot(m.img)} />
+          : <RoomListView chat={chat} myId={myId} onBack={() => setScreen("fishing")} />}
+        {shotView}
+      </div>
+    );
+  }
+
   return (
     <div className="wrap">
       <div className="top">
@@ -351,6 +386,11 @@ export function App() {
         <h1>DOMIMAN</h1>
         <span className="value">{linkText}</span>
         <span className="spacer" />
+        {chat.enabled && (
+          <button className="tank chatbtn" onClick={() => setScreen("chat")}>
+            채팅방 목록
+          </button>
+        )}
         <span className={`tank ${tankFail ? "fail" : ""}`}>
           {tank ? `살림망 ${tank[0]}/${tank[1]}` : tankFail ? "살림망 판독 실패" : "살림망 –"}
         </span>

@@ -38,6 +38,31 @@ domiserver 쪽은 기존 domichat 프로토콜로 말한다.
            {"t":"shot","pc":..,"ok":bool,"name":..,"b64":..,"reason":..}
            {"t":"err","msg":..}
 
+■ 채팅(260913a) — 같은 연결에 얹은 두 번째 기능
+  받는 것: {"t":"rooms"}                        — 방 목록 요청
+           {"t":"room_open","room":..,"pw":?}   / {"t":"room_close","room":..}
+           {"t":"chat","room":..,"body":..,"cid":..}
+           {"t":"img_begin","room":..,"fid":32hex,"name":..,"size":n,"sha256":..}
+           {"t":"img_chunk","fid":..,"seq":n,"b64":..} / {"t":"img_end","fid":..}
+  주는 것: {"t":"rooms","list":[{name,kind,owner,created,allowed,blocked,waiting}]}
+           {"t":"room","room":..,"state":"joined|denied|closed|deleted|kicked|
+                                          approve_res",...}
+           {"t":"chat","room":..,"from":..,"body":..,"mid":..,"ts":..,"cid":?}
+           {"t":"chat_img","room":..,"from":..,"fid":..,"name":..,"b64":..,"ts":..}
+           {"t":"chat_hist","room":..,"items":[{"t":"chat",...}]}
+           {"t":"chat_err","room":..,"msg":..}
+
+  - **브라우저는 모두 domiweb의 한 계정(`web`)을 공유한다.** 그래서 방 입장 자격도
+    그 ID 기준이고(사후 승인 방은 `web`을 승인해야 한다), 다른 브라우저가 보낸 말도
+    서로에게 '내 말'로 보인다. 웹앱에 계정을 두지 않기로 한 대가이며, 제어 기능과
+    같은 구조다.
+  - **구독·알림은 웹에 없다.** 방을 보고 있는 브라우저가 하나도 없으면 그 방에서
+    나온다(제어 방의 `_maybe_leave`와 같은 규칙). 서버가 대화를 저장하지 않으므로
+    그동안의 대화는 공백으로 남는다.
+  - **제어용 방(`domi_fishing_*`)은 채팅 목록에서 감춘다.** 사이클마다 오는 수량
+    방송이 대화창을 뒤덮고, 아무 문자열이나 그 방에 흘리면 명령 화이트리스트
+    (`CMD_RE`)를 우회하는 통로가 된다.
+
 ■ 지키는 함정 (domichat.md에서 이미 값을 치른 것들)
   - 접속 직후 `settimeout(READ_TIMEOUT)` — create_connection의 타임아웃이 남으면
     조용할 때마다 끊긴다.
@@ -66,7 +91,7 @@ import threading
 import time
 from collections import deque
 
-APP_VERSION = "260902a"
+APP_VERSION = "260913a"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "domiweb.json")
@@ -84,6 +109,7 @@ DEFAULT_CONFIG = {
     "keyfile": "",                 # 그 개인키(PEM). 비우면 평문 ws(개발용)
     "allow_origins": [],           # 빈 배열이면 Origin 검사 없음(오픈 방침)
     "server_fp": {},               # "ip:port" -> 상류 인증서 지문(TOFU)
+    "chat": True,                  # 브라우저 채팅 중계(끄면 목록·입장·발신 전부 거절)
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -106,8 +132,20 @@ SHOT_MAX_BYTES = 16 * 1024 * 1024   # 스크린샷 상한(실제 2MB 남짓). �
 SHOT_WAIT_SEC = 40.0                # 브라우저의 사진 대기 유효시간
 ROOM_RETRY_SEC = 60.0               # 방이 없던 PC를 다시 찾아보는 주기
 WS_PING_SEC = 20.0
-WS_MAX_RX = 64 * 1024               # 브라우저가 보내는 프레임 상한(명령뿐이다)
+WS_MAX_RX = 64 * 1024               # 브라우저가 보내는 프레임 상한(이미지 청크 포함)
 LOG_BACKLOG = 30                    # PC별로 보관하는 최근 원문 수(새 브라우저용)
+
+# --- 채팅 ---
+IMG_CHUNK = 64 * 1024               # 상류 'B' 청크 크기(domichat.md 상한과 같음)
+CHAT_IMG_MAX = 16 * 1024 * 1024     # 중계할 이미지 상한. 서버 기본값은 32MB지만
+                                    # base64로 브라우저 여러 대에 밀어넣는 구조라
+                                    # 절반으로 조인다(스크린샷 상한과 같은 값)
+CHAT_MSG_MAX = 4000                 # domiserver msg_max_len 기본값과 같음
+CHAT_BACKLOG = 80                   # 방마다 보관하는 최근 대화 수(재입장·다중 접속용)
+CHAT_BURST, CHAT_WINDOW = 8, 10.0   # 브라우저 **한 대**의 발신 상한(상류 스로틀과 별개)
+CHAT_UPLOAD_MAX = 2                 # 브라우저 한 대가 동시에 올릴 수 있는 이미지 수
+ROOMS_REFRESH_SEC = 2.0             # 방 목록 재조회 최소 간격(room_new 연타 방지)
+FID_RE = re.compile(r"[0-9a-f]{32}")
 
 ID_RE = re.compile(r"[A-Za-z0-9_\-]{1,20}")
 # 명령 화이트리스트. 누구나 붙을 수 있는 공개 중계이므로, 방에 흘려보낼 수 있는
@@ -220,12 +258,19 @@ class ChatClient:
         self.port = 47821
         self.pinned = None
         self.want = False
+        self.server_ver = 1       # welcome의 ver (1=텍스트만, 2=이미지 지원)
         self.logged_in = threading.Event()
         self._send_lock = threading.Lock()
         self._wake = threading.Event()
 
     # ---------- 저수준 ----------
     def _raw_send(self, sock, obj):
+        if isinstance(obj, tuple):          # ("B", fid, 프레임바이트) = 이미지 청크
+            obj = obj[2]
+        if isinstance(obj, bytes):          # 이미 프레임으로 만들어진 것
+            with self._send_lock:
+                sock.sendall(obj)
+            return
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         with self._send_lock:
             sock.sendall(FRAME_HEAD.pack(len(data), ord("T")) + data)
@@ -308,6 +353,10 @@ class ChatClient:
                         self._raw_send(sock, {"t": "pong"})
                         continue
                     if t == "welcome":
+                        try:
+                            self.server_ver = int(d.get("ver") or 1)
+                        except (TypeError, ValueError):
+                            self.server_ver = 1
                         self.logged_in.set()
                         logged = True
                     self.q.put(d)
@@ -352,6 +401,15 @@ class ChatClient:
     def send(self, obj):
         self.txq.put(obj)
         return True
+
+    def send_chunk(self, fid_hex, seq, data):
+        """이미지 청크를 프레임으로 만들어 송신 큐에 넣는다(순서 보장).
+
+        **끊기면 이 청크들은 `drop_queued()`가 버린다** — 이어 보낼 수 없고(서버 쪽
+        전송 상태가 사라진다), 이미지를 모르는 옛 서버는 'B'를 받는 즉시 연결을
+        끊어 재접속마다 같은 청크가 다시 나가는 고리에 빠진다(domichat.md의 사고)."""
+        body = FILE_HEAD.pack(bytes.fromhex(fid_hex), seq) + data
+        self.txq.put(("B", fid_hex, FRAME_HEAD.pack(len(body), ord("B")) + body))
 
     def send_now(self, obj):
         """지금 소켓으로 바로 보낸다(순서가 중요한 것)."""
@@ -510,6 +568,9 @@ class WebConn:
         self.alive = True
         self.pc = ""                 # 지금 보고 있는 PC
         self.shot_wait = 0.0         # 스크린샷을 기다리기 시작한 시각
+        self.rooms = set()           # 지금 열어 둔 채팅방(UI 기준)
+        self.chat_times = deque()    # 채팅 발신 시각(브라우저 한 대의 스로틀)
+        self.uploads = set()         # 올리는 중인 이미지 fid
         threading.Thread(target=self._tx_loop, daemon=True, name="web-tx").start()
 
     def who(self):
@@ -586,16 +647,21 @@ class Hub:
         self.state = {}          # pc -> dict
         self.rooms_known = set()
         self.files = {}          # fid -> 조립 중인 이미지
-        self.txq = queue.Queue()  # (pc, body) — 스로틀 통과 대기
+        self.txq = queue.Queue()  # 상류로 나갈 프레임 — 스로틀 통과 대기
         self.last_query = {}     # pc -> 마지막 S 질의 시각(중복 억제)
         self.connected = False
+        # --- 채팅 ---
+        self.chat_rooms = {}     # room -> {joined, kind, owner, pw, log, joining}
+        self.room_list = []      # 마지막 방 목록(새 브라우저에게 바로 그려주기 위함)
+        self.rooms_at = 0.0      # 마지막 목록 재조회 시각(room_new 연타 방지)
+        self.uploads = {}        # fid -> 브라우저가 올리는 중인 이미지
         for pc in CONFIG["pcs"]:
             self._ensure_state(pc)
 
     # ---------- 상태 ----------
     def _ensure_state(self, pc):
         return self.state.setdefault(pc, {
-            "joined": False, "online": None, "reason": "",
+            "joined": False, "online": None, "reason": "", "join_at": 0.0,
             "status": None, "tank": None, "reports": deque(maxlen=LOG_BACKLOG),
         })
 
@@ -625,37 +691,72 @@ class Hub:
             n = len(self.clients)
         log(f"[웹] 해제 {conn.who()} (총 {n}명)")
         self._maybe_leave(conn.pc)      # 마지막 사람이 나가면 그 방도 뜬다
+        for room in list(conn.rooms):   # 채팅방도 같은 규칙으로 정리한다
+            conn.rooms.discard(room)
+            self._maybe_leave_room(room)
+        for fid in list(conn.uploads):
+            self._img_drop(fid, "연결이 끊겼습니다.")
 
     # ---------- 브라우저 → 상류 ----------
+    # 큐에 담기는 것은 (종류, 내용, 로그문구)이다. 종류가 "msg"인 것만 스로틀을
+    # 거친다 — domiserver의 MSG_BURST는 `msg` 프레임만 센다. 입장·퇴장·이미지
+    # 프레임까지 같은 큐로 보내는 이유는 **순서**다(file_begin → 청크 → file_end).
     def queue_cmd(self, pc, body):
-        self.txq.put((pc, body))
+        self.txq.put(("msg", {"t": "msg", "room": room_of(pc), "body": f"{pc},{body}"},
+                      f"{pc},{body}"))
+
+    def queue_chat(self, room, body, cid):
+        obj = {"t": "msg", "room": room, "body": body}
+        if cid:
+            obj["cid"] = cid
+        self.txq.put(("msg", obj, f"[{room}] 대화 {len(body)}자"))
+
+    def queue_up(self, obj):
+        self.txq.put(("raw", obj, None))
+
+    def queue_chunk(self, fid, seq, data):
+        self.txq.put(("chunk", (fid, seq, data), None))
+
+    def drop_chunks(self):
+        """상류가 끊기면 아직 안 나간 이미지 청크를 버린다(ChatClient.drop_queued와
+        같은 이유 — 이어 보낼 수 없고, 재접속마다 다시 나가면 고리가 된다)."""
+        with self.txq.mutex:
+            keep = [it for it in self.txq.queue if it[0] != "chunk"]
+            self.txq.queue.clear()
+            self.txq.queue.extend(keep)
 
     def _sender_loop(self):
         """발신 스로틀. domiserver는 한 연결에 10초 SEND_BURST건까지만 받아주고,
         여기서는 브라우저 여러 대의 명령이 한 연결로 합쳐진다."""
         times = deque()
         while True:
-            pc, body = self.txq.get()
-            while True:
-                now = time.time()
-                while times and now - times[0] > SEND_WINDOW:
-                    times.popleft()
-                if len(times) < SEND_BURST:
-                    break
-                time.sleep(min(1.0, SEND_WINDOW - (now - times[0]) + 0.05))
+            kind, payload, note = self.txq.get()
+            if kind == "msg":
+                while True:
+                    now = time.time()
+                    while times and now - times[0] > SEND_WINDOW:
+                        times.popleft()
+                    if len(times) < SEND_BURST:
+                        break
+                    time.sleep(min(1.0, SEND_WINDOW - (now - times[0]) + 0.05))
             if not self.chat.logged_in.is_set():
                 self.broadcast({"t": "err", "msg": "서버에 연결되어 있지 않습니다."})
                 continue
-            self.chat.send({"t": "msg", "room": room_of(pc), "body": f"{pc},{body}"})
-            times.append(time.time())
-            log(f"[발신] {pc},{body}")
+            if kind == "chunk":
+                fid, seq, data = payload
+                self.chat.send_chunk(fid, seq, data)
+                continue
+            self.chat.send(payload)
+            if kind == "msg":
+                times.append(time.time())
+                log(f"[발신] {note}")
 
     def on_web(self, conn, d):
         t = d.get("t")
         if t == "hello":
             conn.send({"t": "ready", "my_id": CONFIG["id"], "pcs": list(CONFIG["pcs"]),
                        "connected": self.chat.logged_in.is_set(),
-                       "version": APP_VERSION})
+                       "chat": bool(CONFIG["chat"]), "version": APP_VERSION})
             return
         if t == "select":
             pc = (d.get("pc") or "").strip()
@@ -693,6 +794,207 @@ class Hub:
             return self._edit_pcs(conn, t, (d.get("pc") or "").strip())
         if t == "pong":
             return
+        if t in ("rooms", "room_open", "room_close", "chat",
+                 "img_begin", "img_chunk", "img_end"):
+            return self._on_web_chat(conn, t, d)
+
+    # ---------- 브라우저 → 채팅 ----------
+    def _on_web_chat(self, conn, t, d):
+        if not CONFIG["chat"]:
+            return conn.send({"t": "err", "msg": "이 중계는 채팅을 중계하지 않습니다."})
+        if t == "rooms":
+            conn.send({"t": "rooms", "list": self.room_list})
+            return self.refresh_rooms()
+        if t == "room_open":
+            return self._chat_open(conn, (d.get("room") or "").strip(), d.get("pw"))
+        if t == "room_close":
+            return self._chat_close(conn, (d.get("room") or "").strip())
+        if t == "chat":
+            return self._chat_say(conn, d)
+        if t == "img_begin":
+            return self._img_begin(conn, d)
+        if t == "img_chunk":
+            return self._img_chunk(conn, d)
+        if t == "img_end":
+            return self._img_end(conn, d)
+
+    def _chat_state(self, room):
+        return self.chat_rooms.setdefault(room, {
+            "joined": False, "joining": False, "join_at": 0.0, "kind": "",
+            "owner": None, "pw": None, "log": deque(maxlen=CHAT_BACKLOG)})
+
+    def _chat_viewers(self, room):
+        with self.lock:
+            return [c for c in self.clients if room in c.rooms]
+
+    def _to_room(self, room, obj):
+        for c in self._chat_viewers(room):
+            c.send(obj)
+
+    @staticmethod
+    def _room_err(conn, room, msg):
+        conn.send({"t": "chat_err", "room": room, "msg": msg})
+
+    def refresh_rooms(self, force=False):
+        """상류에 방 목록을 다시 청한다. `room_new`가 연달아 와도 서버를 때리지
+        않도록 최소 간격을 둔다(응답이 오면 모든 브라우저에게 뿌려진다)."""
+        now = time.time()
+        if not force and now - self.rooms_at < ROOMS_REFRESH_SEC:
+            return
+        self.rooms_at = now
+        if self.chat.logged_in.is_set():
+            self.chat.send({"t": "rooms"})
+
+    def _chat_open(self, conn, room, pw):
+        """방 하나를 연다. 상류 연결은 하나뿐이라 **이미 들어가 있는 방이면 바로
+        열어주고**(그동안 받아 둔 대화까지 함께), 아니면 입장을 청한다."""
+        if not room or len(room) > 30:
+            return self._room_err(conn, room, "방 이름이 규격에 맞지 않습니다.")
+        if room.startswith(ROOM_PREFIX):
+            # 제어용 방은 채팅으로 열지 않는다 — 수량 방송이 대화창을 뒤덮고,
+            # 아무 문자열이나 흘리면 명령 화이트리스트를 우회하는 통로가 된다.
+            return self._room_err(conn, room, "제어용 방은 채팅으로 열 수 없습니다.")
+        if not self.chat.logged_in.is_set():
+            return self._room_err(conn, room, "서버에 연결되어 있지 않습니다.")
+        st = self._chat_state(room)
+        conn.rooms.add(room)
+        if st["joined"]:
+            conn.send({"t": "room", "room": room, "state": "joined",
+                       "kind": st["kind"], "owner": st["owner"]})
+            if st["log"]:
+                conn.send({"t": "chat_hist", "room": room, "items": list(st["log"])})
+            return
+        if isinstance(pw, str) and pw:
+            # 방 비밀번호는 **메모리에만** 둔다(디스크에 남기지 않는다 —
+            # domichat.md '비밀번호를 기억하는 범위'). 마지막 사람이 방을 닫으면
+            # 방 상태와 함께 사라진다. 상류가 끊겼다 붙을 때 재입장에 쓴다.
+            st["pw"] = pw[:64]
+        if st["joining"] and time.time() - st["join_at"] < 5.0:
+            return                      # 이미 청해 둔 상태 — joined/denied를 같이 받는다
+        # 5초가 지나도 답이 없으면 다시 청한다 — 상류가 그 사이에 끊겨 요청이
+        # 버려졌을 수 있고, 그때 `joining`을 영영 세워 두면 그 방에 못 들어간다.
+        st["joining"], st["join_at"] = True, time.time()
+        obj = {"t": "join", "room": room}
+        if st["pw"]:
+            obj["pw"] = st["pw"]
+        self.queue_up(obj)
+
+    def _chat_close(self, conn, room, tell=True):
+        if room not in conn.rooms:
+            return
+        conn.rooms.discard(room)
+        if tell:
+            conn.send({"t": "room", "room": room, "state": "closed"})
+        self._maybe_leave_room(room)
+
+    def _maybe_leave_room(self, room):
+        """보는 사람이 아무도 없으면 그 방에서 나온다(제어 방의 `_maybe_leave`와
+        같은 규칙). 웹에는 **구독이 없으므로** 나간 동안의 대화는 공백으로 남는다 —
+        서버가 대화를 저장하지 않기 때문이다."""
+        st = self.chat_rooms.get(room)
+        if st is None or self._chat_viewers(room):
+            return
+        if st["joined"] or st["joining"]:
+            self.queue_up({"t": "leave", "room": room})
+            log(f"[채팅] '{room}' 방에서 나왔습니다(보는 사람 없음).")
+        self.chat_rooms.pop(room, None)
+
+    def _chat_allow(self, conn):
+        """브라우저 **한 대**의 발신 상한. 상류 스로틀(SEND_BURST)은 연결 전체를
+        보호하는 것이라, 한 대가 그 몫을 다 먹어 제어 명령이 밀리는 것을 막는다."""
+        now = time.time()
+        while conn.chat_times and now - conn.chat_times[0] > CHAT_WINDOW:
+            conn.chat_times.popleft()
+        if len(conn.chat_times) >= CHAT_BURST:
+            return False
+        conn.chat_times.append(now)
+        return True
+
+    def _chat_say(self, conn, d):
+        room = (d.get("room") or "").strip()
+        body = d.get("body")
+        st = self.chat_rooms.get(room)
+        if room not in conn.rooms or st is None or not st["joined"]:
+            return self._room_err(conn, room, "입장한 방이 아닙니다.")
+        if not isinstance(body, str) or not body.strip():
+            return
+        if len(body) > CHAT_MSG_MAX:
+            return self._room_err(conn, room, f"메시지는 {CHAT_MSG_MAX}자까지 보낼 수 있습니다.")
+        if not self._chat_allow(conn):
+            return self._room_err(conn, room, "너무 빠르게 보내고 있습니다.")
+        cid = d.get("cid")
+        self.queue_chat(room, body, cid if isinstance(cid, str) else None)
+
+    # ---------- 브라우저가 올리는 이미지 ----------
+    def _img_begin(self, conn, d):
+        room = (d.get("room") or "").strip()
+        fid = d.get("fid")
+        name = (d.get("name") or "image.png")[:100]
+        size = d.get("size")
+        st = self.chat_rooms.get(room)
+        if room not in conn.rooms or st is None or not st["joined"]:
+            return self._room_err(conn, room, "입장한 방이 아닙니다.")
+        if not isinstance(fid, str) or not FID_RE.fullmatch(fid) or fid in self.uploads:
+            return self._room_err(conn, room, "이미지 식별자가 규격에 맞지 않습니다.")
+        if not isinstance(size, int) or not (0 < size <= CHAT_IMG_MAX):
+            return self._room_err(
+                conn, room, f"이미지는 {CHAT_IMG_MAX // 1048576}MB까지 보낼 수 있습니다.")
+        if self.chat.server_ver < 2:
+            # 옛 서버는 'B' 프레임을 받는 즉시 연결을 끊는다(domichat.md의 사고).
+            return self._room_err(conn, room, "이 서버는 이미지 전송을 지원하지 않습니다.")
+        if len(conn.uploads) >= CHAT_UPLOAD_MAX:
+            return self._room_err(conn, room, "이미지를 너무 많이 동시에 올리고 있습니다.")
+        self.uploads[fid] = {"conn": conn, "room": room, "size": size, "name": name,
+                             "sha256": d.get("sha256"), "buf": bytearray(),
+                             "t0": time.time()}
+        conn.uploads.add(fid)
+        self.queue_up({"t": "file_begin", "room": room, "fid": fid, "name": name,
+                       "size": size, "sha256": d.get("sha256"),
+                       "w": d.get("w"), "h": d.get("h")})
+
+    def _img_chunk(self, conn, d):
+        u = self.uploads.get(d.get("fid"))
+        if u is None or u["conn"] is not conn:
+            return
+        try:
+            data = base64.b64decode(d.get("b64") or "", validate=True)
+        except Exception:
+            return self._img_drop(d.get("fid"), "청크를 해석할 수 없습니다.")
+        u["buf"] += data
+        if len(u["buf"]) > u["size"]:
+            return self._img_drop(d.get("fid"), "선언한 크기보다 많이 보냈습니다.")
+        seq = d.get("seq")
+        self.queue_chunk(d["fid"], seq if isinstance(seq, int) else 0, data)
+
+    def _img_end(self, conn, d):
+        fid = d.get("fid")
+        u = self.uploads.get(fid)
+        if u is None or u["conn"] is not conn:
+            return
+        self.uploads.pop(fid, None)
+        conn.uploads.discard(fid)
+        png = bytes(u["buf"])
+        if len(png) != u["size"]:
+            return self._room_err(conn, u["room"], "이미지를 다 받지 못했습니다.")
+        self.queue_up({"t": "file_end", "room": u["room"], "fid": fid})
+        # **서버는 보낸 연결을 팬아웃에서 제외한다**(exclude=conn). 즉 이 이미지는
+        # 상류에서 되돌아오지 않으므로, 우리 브라우저들에게는 여기서 직접 준다 —
+        # 올린 본인은 물론 **같은 방을 보고 있는 다른 브라우저**도 봐야 한다.
+        self._chat_image_out(u["room"], CONFIG["id"], fid, u["name"], png)
+        log(f"[채팅] '{u['room']}' 이미지 발신 {len(png) // 1024}KB ({conn.who()})")
+
+    def _img_drop(self, fid, msg):
+        u = self.uploads.pop(fid, None)
+        if u is None:
+            return
+        u["conn"].uploads.discard(fid)
+        self.queue_up({"t": "file_abort", "room": u["room"], "fid": fid})
+        self._room_err(u["conn"], u["room"], msg)
+
+    def _chat_image_out(self, room, frm, fid, name, png):
+        self._to_room(room, {"t": "chat_img", "room": room, "from": frm, "fid": fid,
+                             "name": name, "ts": round(time.time(), 3),
+                             "b64": base64.b64encode(png).decode("ascii")})
 
     def _edit_pcs(self, conn, t, pc):
         if not ID_RE.fullmatch(pc):
@@ -746,8 +1048,15 @@ class Hub:
         st = self._ensure_state(pc)
         if st["joined"] or not self.chat.logged_in.is_set():
             return
+        # 방금 보낸 join의 답을 기다리는 중이면 또 보내지 않는다 — 브라우저가 PC를
+        # 고른 직후에 방 목록 응답이 오면 `_rejoin_watched`가 같은 방에 한 번 더
+        # 들어가 **`S` 질의가 두 번** 나갔다(실측). 5초가 지나면 다시 시도한다
+        # (답을 못 받은 경우까지 영영 막으면 그 PC를 영영 못 본다).
+        if time.time() - st["join_at"] < 5.0:
+            return
         room = room_of(pc)
         if room in self.rooms_known:
+            st["join_at"] = time.time()
             self.chat.send({"t": "join", "room": room, "pw": ROOM_PW})
             return
         # 그 PC가 domichat에 접속한 적이 없어 방이 아직 없다. 방금 켰을 수도 있으니
@@ -766,7 +1075,7 @@ class Hub:
             return
         self.chat.send({"t": "sub", "room": room_of(pc), "on": False})
         self.chat.send({"t": "leave", "room": room_of(pc)})
-        st.update({"joined": False, "online": None, "reason": "",
+        st.update({"joined": False, "online": None, "reason": "", "join_at": 0.0,
                    "status": None, "tank": None})
         st["reports"].clear()
         self.last_query.pop(pc, None)
@@ -798,7 +1107,16 @@ class Hub:
             elif ev == "disconnected":
                 self.connected = False
                 for st in self.state.values():
-                    st["joined"] = False
+                    st["joined"], st["join_at"] = False, 0.0
+                for room, cst in self.chat_rooms.items():
+                    cst["joined"] = cst["joining"] = False
+                    cst["join_at"] = 0.0
+                    self._to_room(room, {"t": "room", "room": room, "state": "denied",
+                                         "reason": "offline",
+                                         "msg": "서버 연결이 끊겼습니다."})
+                self.drop_chunks()
+                for fid in list(self.uploads):
+                    self._img_drop(fid, "서버 연결이 끊겨 이미지를 보내지 못했습니다.")
                 log(f"[상류] {d.get('msg')}")
                 self.broadcast({"t": "up", "connected": False, "msg": d.get("msg")})
             elif ev == "note":
@@ -811,17 +1129,25 @@ class Hub:
             self.rooms_known = {r.get("name") for r in (d.get("rooms") or [])}
             log(f"[상류] '{d.get('id')}'로 로그인했습니다. (방 {len(self.rooms_known)}개)")
             self.broadcast({"t": "up", "connected": True, "msg": "연결됨"})
+            self._set_room_list(d.get("rooms") or [])
             self._rejoin_watched()
+            self._rejoin_chat()
             return
         if t == "rooms":
             self.rooms_known = {r.get("name") for r in (d.get("list") or [])}
+            self._set_room_list(d.get("list") or [])
             self._rejoin_watched()
             return
+        if t == "room_new":
+            self.rooms_known.add(d.get("room"))
+            return self.refresh_rooms()
         if t == "joined":
             pc = self._pc_of_room(d.get("room"))
+            if pc is None:
+                return self._on_chat_joined(d)
             if pc:
                 st = self._ensure_state(pc)
-                st["joined"], st["reason"] = True, ""
+                st["joined"], st["reason"], st["join_at"] = True, "", 0.0
                 self.chat.send({"t": "sub", "room": d.get("room"), "on": True})
                 log(f"[상류] '{pc}' 방에 입장했습니다.")
                 self.broadcast({"t": "pc", "pc": pc, "joined": True,
@@ -831,15 +1157,24 @@ class Hub:
             return
         if t == "denied":
             pc = self._pc_of_room(d.get("room"))
+            if pc is None:
+                return self._on_chat_denied(d)
             if pc:
                 st = self._ensure_state(pc)
-                st["joined"], st["reason"] = False, d.get("reason") or "denied"
+                st["joined"], st["join_at"] = False, 0.0
+                st["reason"] = d.get("reason") or "denied"
                 log(f"[상류] '{pc}' 방 입장 거절: {d.get('reason')} {d.get('msg') or ''}")
                 self.broadcast({"t": "pc", "pc": pc, "joined": False,
                                 "online": None, "reason": st["reason"]})
             return
         if t == "member":
             pc = self._pc_of_room(d.get("room"))
+            if pc is None:
+                room = d.get("room")
+                if room in self.chat_rooms:
+                    self._to_room(room, {"t": "room", "room": room, "state": "member",
+                                         "id": d.get("id"), "in": bool(d.get("in"))})
+                return
             if pc and d.get("id") == pc:
                 st = self._ensure_state(pc)
                 st["online"] = bool(d.get("in"))
@@ -849,6 +1184,14 @@ class Hub:
             return
         if t == "room_deleted":
             pc = self._pc_of_room(d.get("room"))
+            if pc is None:
+                room = d.get("room")
+                self.rooms_known.discard(room)
+                self.chat_rooms.pop(room, None)
+                self._to_room(room, {"t": "room", "room": room, "state": "deleted",
+                                     "msg": "채팅방이 삭제되었습니다."})
+                self._forget_room(room)
+                return self.refresh_rooms(force=True)
             if pc:
                 st = self._ensure_state(pc)
                 st["joined"], st["online"] = False, None
@@ -857,6 +1200,20 @@ class Hub:
                 self.broadcast({"t": "pc", "pc": pc, "joined": False, "online": None,
                                 "reason": "room_deleted"})
             return
+        if t == "kicked":
+            room = d.get("room")
+            self.chat_rooms.pop(room, None)
+            self._to_room(room, {"t": "room", "room": room, "state": "kicked",
+                                 "msg": d.get("msg") or "강제 퇴장되었습니다."})
+            self._forget_room(room)
+            return
+        if t == "approve_res":
+            # 승인 결과는 **요청한 브라우저가 누구였는지 모른다**(요청은 domiweb의
+            # 계정으로 나갔다). 전원에게 알리고, 승인됐으면 그 방을 보고 있던
+            # 브라우저가 바로 다시 열 수 있게 목록도 새로 받는다.
+            self.broadcast({"t": "room", "room": d.get("room"), "state": "approve_res",
+                            "ok": bool(d.get("ok")), "msg": d.get("msg") or ""})
+            return self.refresh_rooms(force=True)
         if t == "msg":
             return self._on_room_msg(d)
         if t in ("file_begin", "bin", "file_end", "file_abort"):
@@ -864,6 +1221,11 @@ class Hub:
         if t == "error":
             code = d.get("code")
             log(f"[상류 오류] {code}: {d.get('msg')}")
+            if code in ("too_long", "rate_limited", "file_too_big", "file_busy",
+                        "not_joined", "bad_frame"):
+                # 채팅 발신이 서버에서 막힌 것 — 조용히 삼키면 브라우저는 보낸 줄
+                # 안다(말풍선이 '전송 중…'에 영원히 머문다).
+                self.broadcast({"t": "err", "msg": d.get("msg") or code})
             if code == "room_missing":
                 self.chat.send({"t": "rooms"})
             elif code in ("bad_login", "already_online", "disabled"):
@@ -879,9 +1241,90 @@ class Hub:
             return pc or None
         return None
 
+    # ---------- 채팅방 상태 ----------
+    def _set_room_list(self, rows):
+        """방 목록을 갈무리해 브라우저에 뿌린다. **제어용 방은 빼고 준다** —
+        채팅 화면에 뜰 이유가 없고, 열려고 해도 `_chat_open`이 막는다."""
+        self.room_list = [r for r in rows
+                          if isinstance(r, dict)
+                          and not str(r.get("name") or "").startswith(ROOM_PREFIX)]
+        if CONFIG["chat"]:
+            self.broadcast({"t": "rooms", "list": self.room_list})
+
+    def _rejoin_chat(self):
+        """상류가 다시 붙었을 때, 지금 누군가 열어 둔 방에만 다시 들어간다.
+        비밀번호 방은 **메모리에 남은 비번**으로 자동 재입장한다(없으면 거절이
+        오고 브라우저가 다시 묻는다)."""
+        for room, st in list(self.chat_rooms.items()):
+            if not self._chat_viewers(room):
+                self.chat_rooms.pop(room, None)
+                continue
+            st["joined"], st["joining"], st["join_at"] = False, True, time.time()
+            obj = {"t": "join", "room": room}
+            if st["pw"]:
+                obj["pw"] = st["pw"]
+            self.queue_up(obj)
+
+    def _forget_room(self, room):
+        """쫓겨났거나 방이 사라졌을 때 — 브라우저의 '열어 둔 방' 표시도 지운다.
+        안 지우면 재접속 때 없는 방에 계속 다시 들어가려 한다."""
+        with self.lock:
+            for c in self.clients:
+                c.rooms.discard(room)
+
+    def _on_chat_joined(self, d):
+        room = d.get("room")
+        viewers = self._chat_viewers(room)
+        if not viewers:
+            # 입장을 청해 놓고 그 사이에 브라우저가 다 떠났다 — 바로 나온다.
+            self.chat_rooms.pop(room, None)
+            self.queue_up({"t": "leave", "room": room})
+            return
+        st = self._chat_state(room)
+        st.update({"joined": True, "joining": False, "join_at": 0.0,
+                   "kind": d.get("kind") or "", "owner": d.get("owner")})
+        log(f"[채팅] '{room}' 방에 입장했습니다. ({len(viewers)}명이 보는 중)")
+        for c in viewers:
+            c.send({"t": "room", "room": room, "state": "joined",
+                    "kind": st["kind"], "owner": st["owner"]})
+            if st["log"]:
+                c.send({"t": "chat_hist", "room": room, "items": list(st["log"])})
+
+    def _on_chat_denied(self, d):
+        room, reason = d.get("room"), d.get("reason") or "denied"
+        st = self.chat_rooms.get(room)
+        if st is not None:
+            st["joining"] = False
+            if reason == "bad_pw_room":
+                st["pw"] = None          # 틀린 비번은 들고 있지 않는다
+        viewers = self._chat_viewers(room)
+        log(f"[채팅] '{room}' 입장 거절: {reason}")
+        for c in viewers:
+            c.rooms.discard(room)        # 못 들어갔으니 '열어 둔 방'이 아니다
+            c.send({"t": "room", "room": room, "state": "denied",
+                    "reason": reason, "msg": d.get("msg") or ""})
+        self.chat_rooms.pop(room, None)
+
+    def _on_chat_msg(self, d):
+        room = d.get("room")
+        st = self.chat_rooms.get(room)
+        if st is None:
+            return
+        out = {"t": "chat", "room": room, "from": d.get("from"),
+               "body": d.get("body") or "", "mid": d.get("mid"),
+               "ts": d.get("ts") or round(time.time(), 3)}
+        st["log"].append(out)
+        if d.get("cid"):
+            # cid는 보낸 브라우저가 '전송됨(✓)'을 켜는 열쇠다. 어느 브라우저가
+            # 보냈는지는 모르지만 cid는 그쪽이 만든 난수라 남의 것과 겹치지 않는다.
+            out = dict(out, cid=d.get("cid"))
+        self._to_room(room, out)
+
     def _on_room_msg(self, d):
         frm, body = d.get("from"), (d.get("body") or "").strip()
         pc = self._pc_of_room(d.get("room"))
+        if pc is None:
+            return self._on_chat_msg(d)
         if not pc or frm != pc:
             return              # 그 방의 주인(피제어 PC)이 보낸 것만 의미가 있다
         st = self._ensure_state(pc)
@@ -903,21 +1346,15 @@ class Hub:
                 log(f"[보고] {pc}: {body}")
         self.broadcast({"t": "msg", "pc": pc, "body": body}, pc=pc)
 
-    # ---------- 스크린샷 조립 ----------
+    # ---------- 이미지 조립 (스크린샷 · 채팅) ----------
+    # 이진 청크를 조립하는 곳은 여기 하나뿐이다 — 브라우저에 같은 로직을 또 두지
+    # 않는다. 조립이 끝나면 **완성된 PNG**를 base64로 넘긴다. 스크린샷이냐 채팅
+    # 이미지냐는 `file_begin`의 방 이름으로 갈리며, 그 판정을 `mode`에 적어 둔다
+    # (뒤따르는 청크·file_end 프레임에는 방 이름이 없다).
     def _on_file(self, t, d):
         fid = d.get("fid")
         if t == "file_begin":
-            pc = self._pc_of_room(d.get("room"))
-            if not pc or d.get("from") != pc:
-                return
-            size = int(d.get("size") or 0)
-            if size <= 0 or size > SHOT_MAX_BYTES:
-                return log(f"[사진] {pc}: 크기가 규격 밖({size})이라 버립니다.")
-            self.files[fid] = {"pc": pc, "size": size, "sha256": d.get("sha256"),
-                               "name": d.get("name") or "screenshot.png",
-                               "buf": bytearray(), "t0": time.time()}
-            log(f"[사진] {pc}: 수신 시작 ({size/1048576:.2f}MB)")
-            return
+            return self._file_begin(d)
         f = self.files.get(fid)
         if f is None:
             return
@@ -925,24 +1362,62 @@ class Hub:
             f["buf"] += d.get("data", b"")
             if len(f["buf"]) > f["size"]:
                 self.files.pop(fid, None)
-                self._shot_fail(f["pc"], "too_big")
+                self._file_fail(f, "too_big")
             return
         if t == "file_abort":
             self.files.pop(fid, None)
-            return self._shot_fail(f["pc"], "aborted")
+            return self._file_fail(f, "aborted")
 
-        # file_end — 크기·해시를 확인한 뒤 완성된 PNG를 base64로 넘긴다.
+        # file_end — 크기·해시를 확인한 뒤 완성된 PNG를 넘긴다.
         self.files.pop(fid, None)
         png = bytes(f["buf"])
         ok = len(png) == f["size"]
         if ok and f["sha256"]:
             ok = hashlib.sha256(png).hexdigest() == f["sha256"]
         if not ok:
-            return self._shot_fail(f["pc"], "corrupt")
+            return self._file_fail(f, "corrupt")
+        if f["mode"] == "chat":
+            self._chat_image_out(f["room"], f["from"], fid, f["name"], png)
+            log(f"[채팅] '{f['room']}' 이미지 수신 {len(png)//1024}KB ({f['from']})")
+            return
         b64 = base64.b64encode(png).decode("ascii")
         sent = self._to_waiters(f["pc"], {"t": "shot", "pc": f["pc"], "ok": True,
                                           "name": f["name"], "b64": b64})
         log(f"[사진] {f['pc']}: {len(png)/1048576:.2f}MB 전달 ({sent}명)")
+
+    def _file_begin(self, d):
+        room = d.get("room")
+        name = d.get("name") or "image.png"
+        size = int(d.get("size") or 0)
+        pc = self._pc_of_room(room)
+        if pc is None:                       # 채팅방 이미지
+            st = self.chat_rooms.get(room)
+            if st is None or not CONFIG["chat"]:
+                return
+            if size <= 0 or size > CHAT_IMG_MAX:
+                return log(f"[채팅] '{room}' 이미지 크기가 규격 밖({size})이라 버립니다.")
+            self.files[d.get("fid")] = {
+                "mode": "chat", "room": room, "from": d.get("from"), "pc": None,
+                "size": size, "sha256": d.get("sha256"), "name": name,
+                "buf": bytearray(), "t0": time.time()}
+            return
+        if not pc or d.get("from") != pc:
+            return
+        if size <= 0 or size > SHOT_MAX_BYTES:
+            return log(f"[사진] {pc}: 크기가 규격 밖({size})이라 버립니다.")
+        self.files[d.get("fid")] = {"mode": "shot", "room": room, "from": pc, "pc": pc,
+                                    "size": size, "sha256": d.get("sha256"),
+                                    "name": name or "screenshot.png",
+                                    "buf": bytearray(), "t0": time.time()}
+        log(f"[사진] {pc}: 수신 시작 ({size/1048576:.2f}MB)")
+
+    def _file_fail(self, f, reason):
+        if f["mode"] == "chat":
+            log(f"[채팅] '{f['room']}' 이미지 실패({reason})")
+            self._to_room(f["room"], {"t": "chat_err", "room": f["room"],
+                                      "msg": f"이미지를 받지 못했습니다. ({reason})"})
+            return
+        self._shot_fail(f["pc"], reason)
 
     def _shot_fail(self, pc, reason):
         log(f"[사진] {pc}: 실패({reason})")
@@ -969,7 +1444,10 @@ class Hub:
             for fid, f in list(self.files.items()):
                 if now - f["t0"] > 120:
                     self.files.pop(fid, None)
-                    self._shot_fail(f["pc"], "timeout")
+                    self._file_fail(f, "timeout")
+            for fid, u in list(self.uploads.items()):
+                if now - u["t0"] > 120:
+                    self._img_drop(fid, "이미지 전송이 너무 오래 걸립니다.")
             if now - last_retry >= ROOM_RETRY_SEC:
                 last_retry = now
                 # 보고 있는 PC 중 아직 못 들어간 방이 있으면 목록을 새로 받아 본다
@@ -1064,7 +1542,8 @@ def serve_web(sock, addr):
         conn = WebConn(HUB, sock, addr)
         HUB.add_client(conn)
         conn.send({"t": "ready", "my_id": CONFIG["id"], "pcs": list(CONFIG["pcs"]),
-                   "connected": HUB.chat.logged_in.is_set(), "version": APP_VERSION})
+                   "connected": HUB.chat.logged_in.is_set(),
+                   "chat": bool(CONFIG["chat"]), "version": APP_VERSION})
         conn.serve(reader)
     except (WSClosed, OSError, ssl.SSLError) as e:
         if conn is not None:
@@ -1126,8 +1605,16 @@ def repl():
         elif cmd == "who":
             with HUB.lock:
                 for c in HUB.clients:
-                    print(f"  {c.who()}  보는 PC={c.pc or '-'}")
+                    print(f"  {c.who()}  보는 PC={c.pc or '-'}"
+                          f"  방={','.join(sorted(c.rooms)) or '-'}")
                 print(f"  총 {len(HUB.clients)}명")
+        elif cmd == "rooms":
+            for room, st in HUB.chat_rooms.items():
+                print(f"  {room:<24} 입장={'O' if st['joined'] else 'X'}"
+                      f"  보는 중={len(HUB._chat_viewers(room))}명"
+                      f"  대화 {len(st['log'])}줄")
+            print(f"  서버 목록 {len(HUB.room_list)}개"
+                  f"  (채팅 중계 {'켜짐' if CONFIG['chat'] else '꺼짐'})")
         elif cmd == "up":
             print(f"  상류 {'연결됨' if HUB.chat.logged_in.is_set() else '끊김'}"
                   f"  ({CONFIG['server']}, ID={CONFIG['id']})")
@@ -1139,7 +1626,7 @@ def repl():
             HUB.broadcast({"t": "pcs", "pcs": list(CONFIG["pcs"])})
             print(f"  목록: {', '.join(CONFIG['pcs'])}")
         elif cmd == "help":
-            print("  pcs | who | up | add <ID> | quit")
+            print("  pcs | who | up | rooms | add <ID> | quit")
         else:
             print("  ? help")
 
