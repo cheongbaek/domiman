@@ -6,15 +6,34 @@ Kotlin)의 메인 화면과 같은 기능**을 PC·휴대폰 한 화면으로 �
 
 | 파일 | 역할 |
 |---|---|
-| `domiweb.py` | BGOD에서 상시 구동되는 **중계 서버**(브라우저 ↔ domiserver) |
+| `domiserver.py` [8. 웹 중계] | 중계가 **서버 안에** 들어 있다(260914a 통합. 옛 `domiweb.py`) |
 | `web/` | 정적 웹앱(Vite + React + TS). GitHub Pages로 배포 |
 | `.github/workflows/deploy-pages.yml` | `web/**` 변경 시 Pages 배포(`BASE_PATH=/domiman/`) |
 
 ```
-브라우저 ──wss://domiman.duckdns.org:47822/ws──▶ domiweb.py ──TLS 47821──▶ domiserver
-  (GitHub Pages에서 받은 정적 파일)                                            ▲
-                                              피제어 PC(seoul·chungju·domi) ──┘
+브라우저 ──wss://domiman.duckdns.org:47822/ws──▶ domiserver.py (중계 + 채팅 서버)
+  (GitHub Pages에서 받은 정적 파일)                     │  HubConn(가상 연결)
+                                                        ▼
+                                    방 domi_fishing_{PC} ◀── 피제어 PC (TLS 47821)
 ```
+
+## 260914a — 따로 돌던 프로세스를 서버 안으로 넣었다
+
+예전에는 `domiweb.py`가 옆에서 따로 떠서 **도로 이 서버에 127.0.0.1로 TLS 소켓을
+열고** `web` 계정으로 로그인했다. 한 프로그램이 되면서 그 왕복이 통째로 사라진다.
+
+중계는 소켓 대신 **`HubConn`(가상 연결)** 으로 서버 안에 자리를 잡는다 — 큐 하나를
+달고 있을 뿐, 서버가 보기에는 평범한 로그인된 연결이라 입장 자격·방 비밀번호·
+팬아웃·도배 제한·이미지 중계를 **기존 `handle_*` 가 그대로 처리한다.** 웹 전용
+경로를 따로 만들지 않는 것이 요점이다(방 규칙의 주인을 둘로 늘리지 않는다).
+
+없어진 것: 상류 접속·재접속 백오프·지문 고정(TOFU)·`web` 계정과 비밀번호·
+`domiweb.json`·`already_online` 충돌. 브라우저 ↔ 중계 규격은 **한 글자도 바뀌지
+않았다**(웹앱은 GitHub Pages에 이미 배포돼 있어 서버만 고칠 수 있다).
+
+설정은 `domiserver.json` 의 `web`·`web_port`·`web_certfile`… 로 옮겼고, 옆에 옛
+`domiweb.json` 이 남아 있으면 **첫 실행에 한 번 자동으로 옮겨 온다**
+(`import_domiweb_config` — 손으로 적은 인증서 경로를 잃지 않기 위해서다).
 
 ## 왜 중계인가 (설계 결정 — 되돌리지 말 것)
 
@@ -25,40 +44,44 @@ Kotlin)의 메인 화면과 같은 기능**을 PC·휴대폰 한 화면으로 �
    그래서 domiweb만 **브라우저가 신뢰하는 인증서**(Let's Encrypt)를 든다.
    GitHub Pages는 항상 https이므로 `ws://` 평문은 혼합 콘텐츠로 차단된다.
 3. **domiserver는 같은 ID 동시 접속을 불허한다.** 브라우저마다 로그인시키면 기기
-   하나만 쓸 수 있다 → domiweb 하나가 `web` 계정으로 붙고 브라우저 여러 대를
-   그 세션에 **다중화**한다. 덕분에 **웹앱에는 계정도 비밀번호도 없다**(공개
-   정적 사이트에 자격을 박는 문제가 구조적으로 사라진다).
-4. domiserver·domiman.py는 **한 줄도 고치지 않는다.** 피제어 PC는 `{sender},Z,...`로
-   답하고 sender는 서버가 찍는 `from`이므로, 웹 계정이 끼어도 규격이 그대로다.
+   하나만 쓸 수 있다 → 중계가 **연결 하나**(`HubConn`)로 자리를 잡고 브라우저
+   여러 대를 그 하나에 **다중화**한다. 덕분에 **웹앱에는 계정도 비밀번호도
+   없다**(공개 정적 사이트에 자격을 박는 문제가 구조적으로 사라진다).
+   그 이름(`web_id`, 기본 `web`)은 `ONLINE`에 올려 두므로 **바깥에서 같은 ID로
+   로그인하는 것도 막힌다** — 중계를 사칭할 통로를 남기지 않는다.
+4. **domiman.py는 한 줄도 고치지 않는다.** 피제어 PC는 `{sender},Z,...`로 답하고
+   sender는 서버가 찍는 `from`이므로, 중계가 끼어도 규격이 그대로다.
 
 ## 프로토콜
 
-- domiweb ↔ domiserver: `domichat.md` 규격 그대로(방 `domi_fishing_{PC}`, 고정 비번).
-- 브라우저 ↔ domiweb: JSON over WebSocket.
+- 중계 ↔ 방: `domichat.md` 규격 그대로(방 `domi_fishing_{PC}`, 고정 비번).
+  같은 프로세스 안이지만 **프레임은 그대로 흐른다** — `HubConn` 이 `handle_join`·
+  `handle_msg` 를 그대로 통과하고, 팬아웃이 돌려주는 프레임을 큐로 받는다.
+- 브라우저 ↔ 중계: JSON over WebSocket.
   - 받는 것: `hello` / `select{pc}` / `cmd{pc,body}` / `add_pc{pc}` / `del_pc{pc}`
   - 주는 것: `ready` / `snap` / `msg{pc,body}` / `pcs` / `pc` / `up` / `shot` / `err`
 - **방에서 온 원문(`web,Z,...` 등)은 해석하지 않고 그대로 넘긴다.** 파싱은
   `web/src/lib/protocol.ts`가 한다 — 규격의 소유자를 늘리지 않기 위해서다.
-  domiweb가 구분하는 것은 캐시를 위한 접두어 셋(상태 응답·수량 방송·보고)뿐이다.
-- 예외는 **스크린샷**이다: `'B'` 이진 청크를 domiweb가 조립해 크기·sha256을 확인한
+  중계가 구분하는 것은 캐시를 위한 접두어 셋(상태 응답·수량 방송·보고)뿐이다.
+- 예외는 **스크린샷**이다: `'B'` 이진 청크를 중계가 조립해 크기·sha256을 확인한
   뒤 완성된 PNG를 base64로 넘긴다(브라우저에 청크 조립 로직을 또 두지 않는다).
   사진은 **요청한 브라우저에게만** 준다(남이 찍은 3MB가 갑자기 뜨지 않게).
 
-## domiweb.py의 함정 (이미 값을 치른 것들)
+## 웹 중계의 함정 (이미 값을 치른 것들)
 
 | 항목 | 이유 |
 |---|---|
-| 접속 직후 `settimeout(READ_TIMEOUT=60)` | `create_connection`의 타임아웃이 소켓에 남으면 조용할 때마다 끊긴다(domichat.md '최대 함정') |
-| **TLS 1.2 고정**(상류·하류 모두) | 연결마다 수신 스레드와 송신 스레드가 한 소켓을 나눠 쓴다 — 1.3의 NewSessionTicket/KeyUpdate가 record layer를 깬다 |
-| 발신 스로틀 `12건/10초` | domiserver는 한 연결에 `MSG_BURST=20/10초`. 브라우저 여러 대의 명령이 **한 연결로 합쳐지므로** 쉽게 넘긴다 |
-| 상류 끊김 시 대기 큐 폐기 | 재접속 뒤 늦게 나가는 `G`(낚시 시작)는 사용자가 이미 포기한 명령이라 위험하다 |
-| 명령 화이트리스트(`CMD_RE`) | 누구나 붙는 공개 중계다. 방에 흘려보낼 문자열을 domiman 명령 규격으로만 제한해 채팅방 스팸 통로가 되지 않게 한다 |
-| 콘솔 없이 떠도 종료하지 않음 | `input()`이 EOF를 받으면 그대로 죽었다 — 작업 스케줄러로 띄우면 즉시 종료된다 |
-| 설정을 `utf-8-sig`로 읽음 | PowerShell `Set-Content -Encoding UTF8`은 **BOM을 붙인다.** 그냥 utf-8로 읽으면 설정이 조용히 기본값으로 돌아가 인증서 경로가 비고 평문 ws로 열린다 |
+| **브라우저용 TLS도 1.2 고정** | 연결마다 수신 스레드와 송신 스레드가 한 소켓을 나눠 쓴다 — 1.3의 NewSessionTicket/KeyUpdate가 record layer를 깬다(`_pin_tls12` 와 같은 이유, 같은 구조) |
+| 발신 스로틀 `12건/10초` | 서버의 `MSG_BURST=20/10초`는 **연결 하나당** 걸리는데, 브라우저 여러 대의 명령이 중계 연결 **하나로 합쳐진다.** 한 프로그램이 되어도 `handle_msg` 를 그대로 통과하므로 이 여유는 그대로 필요하다 |
+| 중계 연결도 `last_rx` 를 갱신한다 | `maintenance_loop` 가 15초마다 `ping` 을 보내고 45초 무응답이면 연결을 회수한다. `_pump_loop` 가 프레임을 받을 때마다 `last_rx` 를 갱신하지 않으면 **중계가 스스로 회수당한다**(실제 연결이 `serve_conn` 에서 하는 일과 같다) |
+| 중계 프레임은 **한 스레드**(`_uplink_loop`)에서만 내보낸다 | `handle_msg` 의 도배 카운터(`conn.msg_times`)는 연결 하나를 자기 스레드만 건드린다고 보고 짜여 있다 |
+| 명령 화이트리스트(`WEB_CMD_RE`) | 누구나 붙는 공개 중계다. 방에 흘려보낼 문자열을 domiman 명령 규격으로만 제한해 채팅방 스팸 통로가 되지 않게 한다 |
+| 설정을 `utf-8-sig`로 읽음(승계) | PowerShell `Set-Content -Encoding UTF8`은 **BOM을 붙인다.** 그냥 utf-8로 읽으면 옛 `domiweb.json` 이 조용히 안 읽혀 인증서 경로가 비고 평문 ws로 열린다 |
 | 인증서 mtime 감시 → 자동 재적재 | Let's Encrypt는 60~90일마다 갱신된다. 재시작이 필요한 구조면 어느 날 조용히 만료된다 |
+| 포트를 못 열어도 **서버는 계속 돈다** | 채팅 중계가 웹 때문에 죽어서는 안 된다. `start_web_relay()` 는 `None` 을 돌려주고 로그만 남긴다 |
 | **지목한 PC의 방에만 입장** | 시작할 때 목록의 방을 전부 잡아 두면 보지도 않는 PC의 수량 방송을 사이클마다 받고, 그 방 참가자 목록에도 `web`이 늘 떠 있게 된다. 동시에 여러 PC를 돌릴 일이 없다 |
 | 마지막 사람이 떠나면 퇴장 + 캐시 폐기 | 다시 들어갈 때 옛 상태를 잠깐 보여주면 '지금 값'으로 오해한다(입장 직후 `S` 질의로 새로 받는다). 대신 **수량은 다음 방송까지 `–`로 보인다**(최대 한 폴링 사이클) — 바로 보려면 '실시간 수량확인'을 쓴다 |
-| 방이 없는 PC는 60초마다 재조회 | 그 PC가 domichat에 접속한 적이 없으면 방이 없다. 보고 있는 PC에 한해 다시 찾아본다 |
+| 방이 생기면 `room_new` 로 바로 붙는다 | 그 PC가 domichat에 접속한 적이 없으면 방이 없다. 예전에는 60초마다 목록을 다시 받아야 알 수 있었는데, 한 프로그램이 되면서 **방 생성 통지가 그대로 들어온다.** 60초 재시도는 그 통지를 놓쳤을 때의 안전망으로 남겼다 |
 
 ## 웹앱 쪽 함정
 
@@ -79,20 +102,51 @@ Kotlin)의 메인 화면과 같은 기능**을 PC·휴대폰 한 화면으로 �
 
 ## BGOD 설치 절차
 
-1. **domichat 계정 `web`** 생성 후 서버 콘솔 `approve web`. 그 계정으로 다른
-   클라이언트가 접속해 있으면 domiweb가 붙지 못한다(`online` → `kick web`).
-2. **호스트명·인증서**: DuckDNS(`domiman.duckdns.org` → 211.196.44.3) +
+**계정을 만들 필요가 없다**(260914a). 중계가 서버 자신의 일부라 로그인을 하지
+않는다 — 옛 `web` 계정은 그냥 두어도 되고 `deluser web` 해도 된다.
+
+1. **호스트명·인증서**: DuckDNS(`domiman.duckdns.org` → 211.196.44.3) +
    Posh-ACME(DNS-01, `-UseSerialValidation` 필수 — DuckDNS는 TXT를 하나만 둔다).
    `Submit-Renewal`을 매일 도는 작업으로 걸어 둔다.
-3. `domiweb.py`를 아무 폴더에 두고 그 옆에 `domiweb.json`을 만든다
-   (`certfile`은 **`fullchain.cer`**, `keyfile`은 `cert.key`).
-4. **domiserver를 띄운 것과 같은 `python.exe`로 실행**한다 — 방화벽이 프로그램
-   이름으로 열려 있어 그래야 포트 규칙이 필요 없다.
-5. 브라우저로 `https://domiman.duckdns.org:47822/` → `domiweb ... 살아 있습니다`와
-   **경고 없는 자물쇠**가 보이면 인증서가 먹은 것이다. 여기서 실패하면 웹앱도 못 붙는다.
-6. GitHub: `Settings → Pages → Source = GitHub Actions`.
+2. `domiserver.json` 에 인증서 경로를 적는다
+   (`web_certfile` 은 **`fullchain.cer`**, `web_keyfile` 은 `cert.key`).
+   옛 `domiweb.json` 이 옆에 있으면 첫 실행에 자동으로 옮겨 오므로 손댈 것이 없다.
+3. `domiserver.py` 를 평소처럼 띄운다 — **중계는 같이 뜬다**(끄려면 `set web 0`).
+   콘솔 `web` 으로 수신 주소·브라우저 수·피제어 PC 상태를 볼 수 있고,
+   `web add/del <PC ID>` 로 목록을 고친다.
+4. 브라우저로 `https://domiman.duckdns.org:47822/` → `domiserver ... 웹 중계 —
+   살아 있습니다`와 **경고 없는 자물쇠**가 보이면 인증서가 먹은 것이다.
+   여기서 실패하면 웹앱도 못 붙는다.
+5. GitHub: `Settings → Pages → Source = GitHub Actions`.
 
-## 검증 기록 (260902a)
+※ 관리 창(`domiserver_gui.py`)으로 띄워도 중계가 같이 뜬다(`start_server` 가
+`start_web_relay()` 를 부른다). **둘을 동시에 띄우지 말 것** — 47821·47822 를
+두 번 열 수 없다.
+
+## 검증 기록 (260914a — 통합 후 e2e, 41항목 전부 통과)
+
+격리 폴더에 `domiserver.py` 사본을 두고(실서버 DB를 건드리지 않는다) 평문 47899 /
+웹 47898로 띄워, 피제어 PC 역할의 domichat 클라이언트와 브라우저 역할의 WebSocket
+클라이언트를 실제로 붙여 확인했다:
+- 방 개설 → 중계 자동 입장 → **입장 직후 `S` 자동 질의**까지 왕복
+- 명령 `N` 전달, 상태 응답·수량 방송·보고 **원문 그대로** 전달 + 캐시
+- 규격 밖 명령·목록에 없는 PC 차단
+- 스크린샷 300KB: `file_begin` → `'B'` 청크 → `file_end` 조립, **바이트 완전 일치**
+- 명령 16건 연속: 스로틀이 10초 창을 넘겨 내보내 **`rate_limited` 0건**
+- 피제어 PC 종료 → `online=false` 통지 / 마지막 브라우저 퇴장 → 방 퇴장 + 캐시 폐기
+- `ping_sec=3`·`pong_timeout_sec=9` 로 줄인 채 12초 방치 — **중계 연결이 회수되지
+  않음**(`last_rx` 갱신이 듣는다)
+- 방이 없는 PC는 `no_room`, 그 PC가 뒤늦게 켜지면 `room_new` 로 **즉시 입장**
+- 바깥에서 같은 ID(`web`)로 로그인 시도 → `already_online` 거절
+- 평범한 GET → 안내 페이지 200
+- `domiweb.json` 승계: 포트·이름·PC 목록·인증서 경로가 옮겨오고 상류 전용 키
+  (`server`/`pw`)는 안 옮겨오며, **두 번째 실행에서는 다시 덮어쓰지 않는다**
+
+※ 이 검증은 전부 **loopback(127.0.0.1) 한 프로세스 안**이라 공인 IP·포트포워딩·
+공인 인증서가 필요 없다. `wss` 실제 핸드셰이크는 아래 260902a 기록을 승계한다
+(브라우저용 TLS 경로는 그대로 옮겨왔고 `_pin_tls12` 로 합쳐졌을 뿐이다).
+
+## 검증 기록 (260902a — 통합 전, domiweb.py 시절)
 
 격리 서버(`domiserver.py` 사본, 포트 47899 평문) + 피제어 PC 흉내로:
 - 명령 왕복(S/G/P/W/N/V/C/T/Y/I), 상태·수량 방송·보고 전달

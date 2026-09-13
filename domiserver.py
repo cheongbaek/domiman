@@ -13,9 +13,16 @@
   못하는 사고를 막기 위해, 같은 ID 로그인이 오면 기존 연결을 즉시 찔러보고
   응답이 없으면 회수한다.
 
-콘솔은 계정·채팅방 관리용이며, 채팅 내용은 출력하지 않는다.
+**브라우저용 웹 중계가 이 안에 들어 있다(옛 domiweb.py).** 예전에는 옆에서 따로
+돌던 프로세스가 도로 이 서버에 127.0.0.1 로 붙어 'web' 계정으로 로그인했는데,
+한 프로그램이 되면서 그 왕복이 사라졌다 — 중계는 소켓 대신 `HubConn`(가상 연결)로
+서버 안에 자리를 잡고, 입장·비밀번호·팬아웃·도배 제한·이미지 중계를 기존 handle_*
+그대로 통과한다. 자세한 것은 아래 [8. 웹 중계] 절 머리말.
+
+콘솔은 계정·채팅방·웹 중계 관리용이며, 채팅 내용은 출력하지 않는다.
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -40,8 +47,9 @@ from collections import deque
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "domiserver.json")
 DB_PATH = os.path.join(BASE_DIR, "domiserver.db")
+DOMIWEB_CONFIG_PATH = os.path.join(BASE_DIR, "domiweb.json")   # 옛 설정 승계용
 
-APP_VERSION = "260815f"
+APP_VERSION = "260914a"
 # 프로토콜 버전 — welcome 으로 알려준다. 클라이언트는 이 값으로 기능 유무를 판단한다.
 #   1 = 텍스트 채팅  /  2 = 이미지 첨부('B' 프레임) 지원
 # 옛 서버는 'B' 프레임을 '지원하지 않는 프레임'으로 보고 **연결을 끊으므로**,
@@ -74,6 +82,24 @@ DEFAULT_CONFIG = {
     "require_tls": False,       # True면 평문 접속을 거부한다(전환이 끝난 뒤 켤 것)
     "file_max_mb": 32,          # 한 이미지 최대 크기(변환 후 PNG 기준)
     "file_max_concurrent": 3,   # 한 연결이 동시에 보낼 수 있는 전송 수
+
+    # --- 웹 중계(옛 domiweb.json). 아래 [8. 웹 중계] 절 참고 ---
+    "web": True,                # 브라우저 중계를 열지 여부
+    "web_host": "0.0.0.0",
+    "web_port": 47822,          # 브라우저(WSS)용. 채팅 포트 47821 옆자리
+    "web_id": "web",            # 중계가 방에서 쓰는 이름(계정은 필요 없다)
+    "web_pcs": ["seoul", "chungju", "domi"],   # 피제어 PC 목록(웹에서 추가 가능)
+    "web_certfile": "",         # 브라우저가 신뢰하는 인증서(fullchain PEM)
+    "web_keyfile": "",          # 그 개인키(PEM). 비우면 평문 ws(개발용)
+    "web_origins": [],          # 빈 배열이면 Origin 검사 없음(오픈 방침)
+}
+
+# domiweb.json -> domiserver.json 키 이름 대응(따로 돌던 시절의 설정 승계용).
+# server/pw/server_fp 는 상류 접속용이던 것이라 한 프로그램이 되면서 없어졌다.
+DOMIWEB_KEYMAP = {
+    "listen_host": "web_host", "listen_port": "web_port", "id": "web_id",
+    "pcs": "web_pcs", "certfile": "web_certfile", "keyfile": "web_keyfile",
+    "allow_origins": "web_origins",
 }
 
 FILE_CHUNK_MAX = 65536          # 'B' 프레임 한 개의 데이터 상한
@@ -87,13 +113,18 @@ CERT_FP = None                  # 인증서 SHA-256 지문(클라이언트가 �
 CONFIG = dict(DEFAULT_CONFIG)
 
 
+CONFIG_HAD_WEB_KEYS = False       # 설정 파일에 web_* 가 이미 있었는가(승계 판정용)
+
+
 def load_config():
     """설정 파일 로드(없거나 깨졌으면 기본값). 모르는 키는 무시한다."""
-    global CONFIG
+    global CONFIG, CONFIG_HAD_WEB_KEYS
     CONFIG = dict(DEFAULT_CONFIG)
+    CONFIG_HAD_WEB_KEYS = False
     try:
         with open(CONFIG_PATH, encoding="utf-8") as fp:
             data = json.load(fp)
+        CONFIG_HAD_WEB_KEYS = any(k.startswith("web") for k in data)
         for k, v in data.items():
             if k in DEFAULT_CONFIG and isinstance(v, type(DEFAULT_CONFIG[k])):
                 CONFIG[k] = v
@@ -109,6 +140,35 @@ def save_config():
             json.dump(CONFIG, fp, ensure_ascii=False, indent=2)
     except Exception as e:
         log(f"[경고] 설정 저장 실패: {e}")
+
+
+def import_domiweb_config():
+    """옆에 옛 `domiweb.json` 이 있고 이 설정에 web_* 가 아직 없으면 한 번 옮겨 온다.
+
+    **인증서 경로를 잃지 않으려는 것이 요점이다** — 공인 인증서·키 경로는 사람이
+    손으로 적어 넣은 값이고, 비어 있으면 평문 ws 로 열려 **브라우저가 조용히 못
+    붙는다**(오류도 안 난다). 피제어 PC 목록도 마찬가지로 손으로 쌓인 값이다.
+    한 번 옮기고 나면 domiserver.json 에 web_* 가 생겨 다시 보지 않는다."""
+    if CONFIG_HAD_WEB_KEYS:
+        return
+    try:
+        # utf-8-sig: PowerShell 의 `Set-Content -Encoding UTF8` 은 **BOM 을 붙인다.**
+        # 그냥 utf-8 로 읽으면 json 이 BOM 에서 깨져 조용히 건너뛰게 된다.
+        with open(DOMIWEB_CONFIG_PATH, encoding="utf-8-sig") as fp:
+            old = json.load(fp)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        return log(f"[웹] 옛 domiweb.json 을 읽지 못했습니다: {e}")
+    moved = []
+    for src, dst in DOMIWEB_KEYMAP.items():
+        v = old.get(src)
+        if v is not None and isinstance(v, type(DEFAULT_CONFIG[dst])):
+            CONFIG[dst] = v
+            moved.append(dst)
+    if moved:
+        save_config()
+        log(f"[웹] 옛 domiweb.json 설정을 옮겨 왔습니다: {', '.join(moved)}")
 
 
 # === [2. 유틸 — 로그 · 검증 · 비밀번호] ===
@@ -214,16 +274,22 @@ def print_addresses(port):
     threading.Thread(target=_report_external, args=(port,), daemon=True).start()
 
 
-def _report_external(port):
-    """'밖에서 본 내 주소'를 조회해, 포트포워딩이 필요한 환경인지 알려준다."""
-    ip = None
+def external_ip():
+    """'밖에서 본 내 주소'(공인 IP). 조회 실패면 None.
+    **조회처를 한 곳에만 둔다** — 콘솔 안내(_report_external)와 관리 창
+    (domiserver_gui.py 의 주소 표시)이 이 함수를 같이 쓴다."""
     for url in ("https://api64.ipify.org", "https://ifconfig.me/ip"):
         try:
             with urllib.request.urlopen(url, timeout=3) as r:
-                ip = r.read().decode("utf-8", "replace").strip()
-                break
+                return r.read().decode("utf-8", "replace").strip()
         except Exception:
             continue
+    return None
+
+
+def _report_external(port):
+    """'밖에서 본 내 주소'를 조회해, 포트포워딩이 필요한 환경인지 알려준다."""
+    ip = external_ip()
     if not ip:
         log("   (외부에서 본 주소는 조회하지 못했습니다 — 인터넷 연결 확인)")
         return
@@ -539,6 +605,12 @@ SEQS = {}                         # room -> 방별 단조 증가 번호
 RUN_ID = secrets.token_hex(3)     # 서버 실행 식별자. mid = "{RUN_ID}-{seq}"
 STOP = threading.Event()
 
+# 관리 창(domiserver_gui.py)이 방 안을 들여다보는 **유일한 통로**. 콘솔로 돌리면
+# None 이라 아무 일도 하지 않는다(기존 동작 그대로).
+#   서버가 대화를 저장하지 않는다는 원칙은 그대로다 — 지나가는 프레임을 그때
+#   넘겨줄 뿐이고, 남는 곳은 관리 창을 열어 둔 동안의 화면뿐이다.
+ROOM_OBSERVER = None
+
 
 class Conn:
     def __init__(self, sock, addr):
@@ -604,6 +676,11 @@ def fanout(room, obj, sender=None, cid=None, exclude=None):
     exclude 로 지정한 연결은 건너뛴다(이미지는 보낸 쪽이 이미 화면에 그려뒀다)."""
     with STATE_LOCK:
         targets = [c for c in CONNS if c.uid and room in c.rooms and c is not exclude]
+    if ROOM_OBSERVER is not None:
+        try:
+            ROOM_OBSERVER(room, obj)
+        except Exception:
+            pass                  # 보는 쪽 사고가 중계를 막아서는 안 된다
     for c in targets:
         if c is sender and cid is not None:
             o = dict(obj)
@@ -1219,13 +1296,880 @@ def sweep_public_rooms():
         log(f"[자동 삭제] 공개방 '{r['name']}' — {days}일 이상 대화 없음")
 
 
-# === [8. 콘솔 — 계정 · 채팅방 관리] ===
+# === [8. 웹 중계 — 브라우저(WSS) ↔ 이 서버] ===
+# `https://cheongbaek.github.io/domiman/` 에서 받은 정적 웹앱을 받아주는 부분.
+# 예전에는 옆에서 따로 돌던 프로세스(domiweb.py)였고, 그 프로세스는 도로 이 서버에
+# 127.0.0.1 로 **TLS 소켓을 열어** 'web' 계정으로 로그인했다. 한 프로그램이 되었으니
+# 그 왕복이 통째로 사라진다 — 접속·재접속·지문 고정·계정·비밀번호가 전부 필요 없다.
+#
+# ■ 왜 '바이트 파이프'가 아니라 '중계'인가 (설계 결정, 그대로 유효)
+#   이 서버는 **같은 ID 동시 접속을 불허**한다. 브라우저마다 domichat 로그인을 시키면
+#   기기 하나만 쓸 수 있다. 그래서 중계가 연결 **하나**로 자리를 잡고 브라우저 여러
+#   대를 그 하나에 다중화한다. 덕분에 **브라우저에는 계정·비밀번호가 아예 실리지
+#   않는다**(공개 정적 사이트에 자격을 박는 문제가 구조적으로 없어진다).
+#
+# ■ 흐름
+#   브라우저 ──wss://<호스트>:47822/ws── [웹 중계] ── HubConn ── 이 서버의 방
+#                                                                    ▲
+#                                              피제어 PC(seoul 등) ──┘
+#   - **브라우저가 지목한 PC의 방에만 들어간다**(마지막 사람이 그 PC를 떠나면 방에서
+#     나온다). 동시에 여러 PC를 돌릴 일이 없고, 보지도 않는 방의 수량 방송을 계속
+#     받을 이유도 없다.
+#   - 방 이름·비번·명령 문자열은 domichat.md / domiman.py 규격 그대로다. 중계는
+#     `web,Z,...` 응답과 `,Z,F,*`·`,Z,N,*` 방송을 **해석하지 않고 그대로 넘긴다**
+#     (파싱은 브라우저가 한다 — 규격의 단일 소유자를 늘리지 않기 위해서).
+#   - 예외는 스크린샷뿐이다: 'B' 프레임(이미지 청크)은 여기서 조립해 완성된 PNG를
+#     base64로 넘긴다(브라우저에 이진 프레임 조립 로직을 또 두지 않는다).
+#
+# ■ 브라우저 ↔ 중계 프레임 (WebSocket, JSON 텍스트) — **웹앱과 맞춰진 규격이라
+#   한 글자도 바꾸지 않는다.** 웹앱은 GitHub Pages에 이미 배포돼 있어 서버만 고칠 수
+#   있는 처지이므로, 여기를 손대면 옛 페이지가 조용히 깨진다.
+#   받는 것: {"t":"hello"} / {"t":"select","pc":..} / {"t":"cmd","pc":..,"body":"S"}
+#            {"t":"add_pc","pc":..} / {"t":"del_pc","pc":..} / {"t":"pong"}
+#   주는 것: {"t":"ready","my_id":..,"pcs":[..],"connected":bool,"version":..}
+#            {"t":"snap","pc":..,...}              — 그 PC의 마지막 상태
+#            {"t":"msg","pc":..,"body":..}         — 방에서 온 원문 그대로
+#            {"t":"pcs","pcs":[..]}                — 목록 변경
+#            {"t":"pc","pc":..,"online":bool|null,"joined":bool,"reason":..}
+#            {"t":"up","connected":bool,"msg":..}  — 중계 가동 상태
+#            {"t":"shot","pc":..,"ok":bool,"name":..,"b64":..,"reason":..}
+#            {"t":"err","msg":..}
+
+FISHING_ROOM_PREFIX = "domi_fishing_"     # domichat.md / domiman.py 규격
+FISHING_ROOM_PW = "domi_fishing_9714"
+
+# 발신 스로틀 — 서버의 도배 제한(MSG_BURST=20 / MSG_WINDOW=10초)은 **연결 하나당**
+# 걸리는데, 브라우저 여러 대의 명령이 이 중계 연결 하나로 합쳐진다. 한 프로그램이
+# 되었어도 handle_msg 를 그대로 통과하므로 이 여유는 그대로 필요하다.
+WEB_SEND_BURST, WEB_SEND_WINDOW = 12, 10.0
+
+WEB_SHOT_MAX_BYTES = 16 * 1024 * 1024   # 스크린샷 상한(실제 2MB 남짓). 메모리 보호
+WEB_SHOT_WAIT_SEC = 40.0                # 브라우저의 사진 대기 유효시간
+WEB_ROOM_RETRY_SEC = 60.0               # 방이 없던 PC를 다시 찾아보는 주기
+WEB_PING_SEC = 20.0
+WEB_MAX_RX = 64 * 1024                  # 브라우저가 보내는 프레임 상한(명령뿐이다)
+WEB_LOG_BACKLOG = 30                    # PC별로 보관하는 최근 원문 수(새 브라우저용)
+WEB_CONN_ADDR = "내장 웹중계"           # 관리 화면의 주소 칸에 뜨는 이름
+
+# 명령 화이트리스트. 누구나 붙을 수 있는 공개 중계이므로, 방에 흘려보낼 수 있는
+# 문자열을 **domiman 명령 규격으로만** 제한한다(채팅방 스팸 통로가 되지 않게).
+WEB_CMD_RE = re.compile(r"[SGPYWQVTCNI](,[A-Za-z0-9.\-]{1,12}){0,3}")
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+WEB_HUB = None                  # 가동 중이면 WebHub
+WEB_SSL_CTX = None              # 브라우저용 SSLContext(공인 인증서). 없으면 평문 ws
+_web_cert_lock = threading.Lock()
+_web_cert_sig_seen = None       # (인증서 mtime, 키 mtime) — 갱신 감지용
+
+
+def fishing_room_of(uid):
+    return f"{FISHING_ROOM_PREFIX}{uid}"
+
+
+def pc_of_fishing_room(room):
+    if isinstance(room, str) and room.startswith(FISHING_ROOM_PREFIX):
+        return room[len(FISHING_ROOM_PREFIX):] or None
+    return None
+
+
+# --- [8-1. 내부 연결 — 중계가 서버 안에서 쓰는 가상 Conn] ---
+
+
+class HubConn(Conn):
+    """웹 중계의 **가상 연결**. 소켓 대신 큐 하나를 달고 있을 뿐, 서버가 보기에는
+    평범한 로그인된 연결이다.
+
+    **웹 전용 경로를 만들지 않으려고 이렇게 했다.** 입장 자격·방 비밀번호·팬아웃·
+    도배 제한·이미지 중계를 handle_* 가 그대로 처리하므로, 방 규칙이 바뀌어도 중계가
+    따라 바뀐다(규칙이 두 곳에 생기지 않는다).
+
+    `handle_login` 을 거치지 않는 이유는 계정이 필요 없기 때문이다 — 이 연결은
+    비밀번호로 자신을 증명할 상대가 아니라 서버 자신의 일부다. 대신 ONLINE 에 이름을
+    올려 **바깥에서 같은 ID로 로그인하는 것을 막는다**(중계를 사칭할 통로를 남기지
+    않는다)."""
+
+    def __init__(self, uid, q):
+        super().__init__(None, (WEB_CONN_ADDR, 0))
+        self.uid = uid
+        self.q = q
+        self.ready = True
+
+    def who(self):
+        return f"{self.uid}(웹 중계)"
+
+    def send(self, obj):
+        if not self.alive:
+            return False
+        self.q.put(obj)
+        return True
+
+    def send_bytes(self, data):
+        """팬아웃이 흘려보내는 'B' 프레임(이미지 청크)을 풀어서 큐에 넣는다 —
+        바깥 클라이언트가 소켓에서 하던 일을 그대로 여기서 한다."""
+        if not self.alive:
+            return False
+        if len(data) < FRAME_HEAD.size + FILE_HEAD.size:
+            return False
+        body = data[FRAME_HEAD.size:]
+        raw_fid, seq = FILE_HEAD.unpack(body[:FILE_HEAD.size])
+        self.q.put({"t": "bin", "fid": raw_fid.hex(), "seq": seq,
+                    "data": body[FILE_HEAD.size:]})
+        return True
+
+
+# --- [8-2. WebSocket — 핸드셰이크 · 프레임 코덱 (RFC 6455, 표준 라이브러리만)] ---
+
+
+class WSClosed(Exception):
+    pass
+
+
+class SockReader:
+    """소켓 위의 버퍼 리더. WS 프레임 경계와 HTTP 헤더 경계를 여기서 자른다."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.buf = bytearray()
+
+    def _fill(self):
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            raise WSClosed("상대가 연결을 닫음")
+        self.buf += chunk
+
+    def take(self, n):
+        while len(self.buf) < n:
+            self._fill()
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
+
+    def read_until(self, sep, limit):
+        while True:
+            i = self.buf.find(sep)
+            if i >= 0:
+                out = bytes(self.buf[:i])
+                del self.buf[:i + len(sep)]
+                return out
+            if len(self.buf) > limit:
+                raise WSClosed("헤더가 너무 깁니다")
+            self._fill()
+
+
+def ws_frame(opcode, payload=b""):
+    n = len(payload)
+    head = bytearray([0x80 | opcode])
+    if n < 126:
+        head.append(n)
+    elif n < 65536:
+        head.append(126)
+        head += struct.pack(">H", n)
+    else:
+        head.append(127)
+        head += struct.pack(">Q", n)
+    return bytes(head) + payload
+
+
+def ws_read_frame(reader):
+    """(opcode, payload). 클라이언트 프레임은 반드시 마스킹돼 있어야 한다."""
+    b0, b1 = reader.take(2)
+    opcode = b0 & 0x0F
+    masked = bool(b1 & 0x80)
+    ln = b1 & 0x7F
+    if ln == 126:
+        ln = struct.unpack(">H", reader.take(2))[0]
+    elif ln == 127:
+        ln = struct.unpack(">Q", reader.take(8))[0]
+    if ln > WEB_MAX_RX:
+        raise WSClosed(f"프레임 과대({ln})")
+    if not masked:
+        raise WSClosed("마스킹되지 않은 클라이언트 프레임")
+    key = reader.take(4)
+    data = bytearray(reader.take(ln))
+    for i in range(ln):
+        data[i] ^= key[i & 3]
+    return opcode, bytes(data)
+
+
+WEB_HTTP_INFO = (
+    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
+    "Connection: close\r\nContent-Length: {n}\r\n\r\n{body}"
+)
+
+
+def ws_handshake(reader, sock):
+    """WebSocket 업그레이드. 업그레이드가 아니면 짧은 안내 페이지를 주고 False.
+    (브라우저로 https://호스트:47822/ 를 열어 인증서·생존을 눈으로 볼 수 있게)"""
+    raw = reader.read_until(b"\r\n\r\n", 16384).decode("latin-1")
+    lines = raw.split("\r\n")
+    headers = {}
+    for ln in lines[1:]:
+        if ":" in ln:
+            k, _, v = ln.partition(":")
+            headers[k.strip().lower()] = v.strip()
+
+    if "websocket" not in headers.get("upgrade", "").lower():
+        body = (f"domiserver {APP_VERSION} 웹 중계 — 살아 있습니다."
+                f" 웹앱에서 /ws 로 접속하세요.\n")
+        sock.sendall(WEB_HTTP_INFO.format(
+            n=len(body.encode()), body=body).encode("utf-8"))
+        return False
+
+    origins = CONFIG["web_origins"]
+    origin = headers.get("origin", "")
+    if origins and origin not in origins:
+        sock.sendall(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+        raise WSClosed(f"허용되지 않은 Origin({origin})")
+
+    key = headers.get("sec-websocket-key", "")
+    if not key:
+        sock.sendall(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+        raise WSClosed("Sec-WebSocket-Key 없음")
+    accept = base64.b64encode(
+        hashlib.sha1((key + WS_GUID).encode("ascii")).digest()).decode("ascii")
+    sock.sendall(
+        ("HTTP/1.1 101 Switching Protocols\r\n"
+         "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+         f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode("ascii"))
+    return True
+
+
+# --- [8-3. 브라우저 연결] ---
+
+
+class BrowserConn:
+    """브라우저 하나. 수신은 이 객체를 만든 스레드가, 송신은 전용 스레드가 한다
+    (한 TLS 소켓에 쓰는 스레드는 하나뿐이어야 한다)."""
+
+    def __init__(self, hub, sock, addr):
+        self.hub = hub
+        self.sock = sock
+        self.addr = addr
+        self.txq = queue.Queue()
+        self.alive = True
+        self.pc = ""                 # 지금 보고 있는 PC
+        self.shot_wait = 0.0         # 스크린샷을 기다리기 시작한 시각
+        threading.Thread(target=self._tx_loop, daemon=True, name="web-tx").start()
+
+    def who(self):
+        return f"{self.addr[0]}:{self.addr[1]}"
+
+    def send(self, obj):
+        if self.alive:
+            self.txq.put(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+    def _tx_loop(self):
+        last_ping = now()
+        while self.alive:
+            try:
+                data = self.txq.get(timeout=0.5)
+            except queue.Empty:
+                data = None
+            try:
+                if data is not None:
+                    self.sock.sendall(ws_frame(0x1, data))
+                if now() - last_ping >= WEB_PING_SEC:
+                    self.sock.sendall(ws_frame(0x9))    # ping — 브라우저가 자동 pong
+                    last_ping = now()
+            except Exception:
+                self.close()
+                return
+
+    def close(self):
+        if not self.alive:
+            return
+        self.alive = False
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+    # ---------- 수신 ----------
+    def serve(self, reader):
+        while self.alive:
+            opcode, data = ws_read_frame(reader)
+            if opcode == 0x8:                       # close
+                raise WSClosed("브라우저가 닫음")
+            if opcode in (0x9, 0xA):                # ping/pong — 브라우저 JS는
+                continue                            # ping을 보낼 수 없다(무시)
+            if opcode not in (0x1, 0x2, 0x0):
+                continue
+            try:
+                d = json.loads(data.decode("utf-8"))
+            except Exception:
+                self.send({"t": "err", "msg": "JSON을 해석할 수 없습니다."})
+                continue
+            if isinstance(d, dict):
+                self.hub.on_web(self, d)
+
+
+# --- [8-4. 중계 허브] ---
+
+
+class WebHub:
+    """가상 연결 하나(HubConn) + 브라우저 여러 대. 모든 상태 변경은 이 객체를 거친다.
+
+    서버에서 올라온 메시지는 **해석하지 않고 그대로** 브라우저에 넘기는 것이
+    원칙이다. 다만 나중에 접속한 브라우저에게 '지금 상태'를 즉시 그려주려면 마지막
+    값이 필요하므로, 접두어 세 가지(상태 응답 / 수량 방송 / 보고)만 구분해 캐시한다.
+    파싱은 브라우저가 한다 — 규격의 소유자를 늘리지 않는다."""
+
+    def __init__(self, uid):
+        self.uid = uid
+        self.q = queue.Queue()          # HubConn 이 받은 프레임
+        self.conn = HubConn(uid, self.q)
+        self.lock = threading.RLock()
+        self.clients = set()
+        self.state = {}          # pc -> dict
+        self.files = {}          # fid -> 조립 중인 이미지
+        self.txq = queue.Queue()  # (프레임, 로그라벨|None) — 스로틀 통과 대기
+        self.last_query = {}     # pc -> 마지막 S 질의 시각(중복 억제)
+        for pc in CONFIG["web_pcs"]:
+            self._ensure_state(pc)
+
+    # ---------- 상태 ----------
+    def _ensure_state(self, pc):
+        return self.state.setdefault(pc, {
+            "joined": False, "online": None, "reason": "",
+            "status": None, "tank": None,
+            "reports": deque(maxlen=WEB_LOG_BACKLOG),
+        })
+
+    def snapshot(self, pc):
+        st = self._ensure_state(pc)
+        return {"t": "snap", "pc": pc, "joined": st["joined"], "online": st["online"],
+                "reason": st["reason"], "status": st["status"], "tank": st["tank"],
+                "reports": list(st["reports"])}
+
+    # ---------- 브라우저 팬아웃 ----------
+    def broadcast(self, obj, pc=None):
+        """pc를 주면 그 PC를 보고 있는 브라우저에게만 보낸다."""
+        with self.lock:
+            targets = [c for c in self.clients if pc is None or c.pc == pc]
+        for c in targets:
+            c.send(obj)
+
+    def add_client(self, conn):
+        with self.lock:
+            self.clients.add(conn)
+            n = len(self.clients)
+        log(f"[웹] 접속 {conn.who()} (총 {n}명)")
+
+    def drop_client(self, conn):
+        with self.lock:
+            self.clients.discard(conn)
+            n = len(self.clients)
+        log(f"[웹] 해제 {conn.who()} (총 {n}명)")
+        self._maybe_leave(conn.pc)      # 마지막 사람이 나가면 그 방도 뜬다
+
+    # ---------- 브라우저 → 서버 ----------
+    def submit(self, obj, label=None):
+        """서버 프레임을 중계 연결로 내보낸다. label 이 있으면 도배 제한을 거치고
+        그 문구를 로그에 남긴다(= 사람이 누른 명령)."""
+        self.txq.put((obj, label))
+
+    def queue_cmd(self, pc, body):
+        self.submit({"t": "msg", "room": fishing_room_of(pc), "body": f"{pc},{body}"},
+                    label=f"{pc},{body}")
+
+    def _uplink_loop(self):
+        """중계 연결로 나가는 프레임을 **한 줄로 세워** 처리한다.
+
+        스레드를 하나로 묶는 이유는 handle_msg 의 도배 카운터(conn.msg_times)가
+        연결 하나를 자기 스레드만 건드린다고 보고 짜여 있기 때문이다 — 실제 연결이
+        그렇듯 여기도 한 스레드만 그 연결을 쓴다."""
+        times = deque()
+        while not STOP.is_set():
+            try:
+                obj, label = self.txq.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if label is not None:
+                while not STOP.is_set():
+                    t = now()
+                    while times and t - times[0] > WEB_SEND_WINDOW:
+                        times.popleft()
+                    if len(times) < WEB_SEND_BURST:
+                        break
+                    STOP.wait(min(1.0, WEB_SEND_WINDOW - (t - times[0]) + 0.05))
+                times.append(now())
+            if not self.conn.alive:
+                self.broadcast({"t": "err", "msg": "서버가 종료되는 중입니다."})
+                continue
+            t = obj.get("t")
+            try:
+                HANDLERS[t](self.conn, obj)
+            except Exception as e:
+                log(f"[웹] '{t}' 처리 실패: {e}")
+                continue
+            if label is not None:
+                log(f"[발신] {label}")
+
+    def on_web(self, conn, d):
+        t = d.get("t")
+        if t == "hello":
+            conn.send(self.ready_frame())
+            return
+        if t == "select":
+            pc = (d.get("pc") or "").strip()
+            if pc and pc not in CONFIG["web_pcs"]:
+                return conn.send({"t": "err", "msg": "목록에 없는 PC입니다."})
+            old_pc, conn.pc = conn.pc, pc
+            if old_pc and old_pc != pc:
+                self._maybe_leave(old_pc)
+            if not pc:
+                return
+            conn.send(self.snapshot(pc))
+            if not self._ensure_state(pc)["joined"]:
+                self._ensure_join(pc)
+            elif now() - self.last_query.get(pc, 0) > 5.0:
+                # 이미 들어가 있는 방이면 상태만 한 번 맞춘다(5초 내 중복은 생략).
+                self.last_query[pc] = now()
+                self.queue_cmd(pc, "S")
+            return
+        if t == "cmd":
+            pc = (d.get("pc") or "").strip()
+            body = (d.get("body") or "").strip()
+            if pc not in CONFIG["web_pcs"]:
+                return conn.send({"t": "err", "msg": "목록에 없는 PC입니다."})
+            if not WEB_CMD_RE.fullmatch(body):
+                return conn.send({"t": "err", "msg": f"규격 밖 명령입니다: {body}"})
+            if not self._ensure_state(pc)["joined"]:
+                # 방에 못 들어간 상태로 보내면 서버가 not_joined로 되돌려준다.
+                self._ensure_join(pc)
+                return conn.send(
+                    {"t": "err", "msg": f"'{pc}'의 방에 아직 들어가지 못했습니다."})
+            if body == "I":
+                conn.shot_wait = now()
+            self.queue_cmd(pc, body)
+            return
+        if t in ("add_pc", "del_pc"):
+            return self._edit_pcs(conn, t, (d.get("pc") or "").strip())
+        if t == "pong":
+            return
+
+    def ready_frame(self):
+        return {"t": "ready", "my_id": self.uid, "pcs": list(CONFIG["web_pcs"]),
+                "connected": self.conn.alive, "version": APP_VERSION}
+
+    # 목록 편집은 브라우저(add_pc/del_pc 프레임)와 콘솔(web add/del)이 **같은 두
+    # 메서드**를 쓴다 — 목록을 고치는 규칙의 주인을 둘로 늘리지 않는다.
+    def add_pc(self, pc):
+        """(성공 여부, 안내문). 실패해도 목록은 손대지 않는다."""
+        if not valid_id(pc):
+            return False, "PC 이름 형식이 아닙니다."
+        if pc in CONFIG["web_pcs"]:
+            return False, "이미 목록에 있습니다."
+        CONFIG["web_pcs"] = list(CONFIG["web_pcs"]) + [pc]
+        save_config()
+        self._ensure_state(pc)     # 입장은 브라우저가 그 PC를 고를 때 한다
+        self.broadcast({"t": "pcs", "pcs": list(CONFIG["web_pcs"])})
+        return True, f"'{pc}' 추가"
+
+    def del_pc(self, pc):
+        if pc not in CONFIG["web_pcs"]:
+            return False, "목록에 없습니다."
+        CONFIG["web_pcs"] = [x for x in CONFIG["web_pcs"] if x != pc]
+        save_config()
+        with self.lock:
+            for c in self.clients:
+                if c.pc == pc:
+                    c.pc = ""
+        st = self.state.pop(pc, None)
+        if st and st["joined"]:
+            self.submit({"t": "sub", "room": fishing_room_of(pc), "on": False})
+            self.submit({"t": "leave", "room": fishing_room_of(pc)})
+        self.broadcast({"t": "pcs", "pcs": list(CONFIG["web_pcs"])})
+        return True, f"'{pc}' 삭제"
+
+    def _edit_pcs(self, conn, t, pc):
+        ok, msg = (self.add_pc if t == "add_pc" else self.del_pc)(pc)
+        if not ok:
+            return conn.send({"t": "err", "msg": msg})
+        log(f"[웹 목록] {msg} ({conn.who()})")
+
+    # ---------- 방 입장 · 퇴장 ----------
+    def _watchers(self, pc):
+        with self.lock:
+            return [c for c in self.clients if c.pc == pc]
+
+    def _watched_pcs(self):
+        with self.lock:
+            return {c.pc for c in self.clients if c.pc}
+
+    def _notify_pc(self, pc):
+        st = self._ensure_state(pc)
+        self.broadcast({"t": "pc", "pc": pc, "joined": st["joined"],
+                        "online": st["online"], "reason": st["reason"]})
+
+    def _ensure_join(self, pc):
+        """**지목된 PC의 방에만** 들어간다.
+
+        예전에는 시작할 때 목록의 방을 전부 잡아 두었다. 그러면 보지도 않는 PC의
+        수량 방송(사이클마다)을 계속 받고, 그 방 참가자 목록에도 중계가 늘 떠
+        있게 된다. 동시에 여러 PC를 돌릴 일이 없으므로 필요할 때만 붙는다."""
+        st = self._ensure_state(pc)
+        if st["joined"]:
+            return
+        room = fishing_room_of(pc)
+        if not room_row(room):
+            # 그 PC가 아직 domichat 에 붙은 적이 없어 방이 없다. 방이 생기면
+            # room_new 통지가 이 연결에도 오므로 그때 다시 시도한다(아래 _handle_up).
+            if st["reason"] != "no_room":
+                st["reason"] = "no_room"
+                self._notify_pc(pc)
+            return
+        self.submit({"t": "join", "room": room, "pw": FISHING_ROOM_PW})
+
+    def _maybe_leave(self, pc):
+        """보는 사람이 아무도 없으면 그 방에서 나온다. 캐시도 버린다 — 다시 들어갈
+        때 옛 상태를 잠깐 보여주면 '지금 값'으로 오해하게 된다(입장 직후 S 질의로
+        새로 받는다)."""
+        st = self.state.get(pc) if pc else None
+        if st is None or not st["joined"] or self._watchers(pc):
+            return
+        self.submit({"t": "sub", "room": fishing_room_of(pc), "on": False})
+        self.submit({"t": "leave", "room": fishing_room_of(pc)})
+        st.update({"joined": False, "online": None, "reason": "",
+                   "status": None, "tank": None})
+        st["reports"].clear()
+        self.last_query.pop(pc, None)
+        log(f"[웹] '{pc}' 방에서 나왔습니다(보는 사람 없음).")
+
+    def _rejoin_watched(self):
+        """지금 누군가 보고 있는 PC 중 아직 못 들어간 방에 다시 붙어 본다."""
+        for pc in self._watched_pcs():
+            self._ensure_join(pc)
+
+    # ---------- 서버 → 브라우저 ----------
+    def _pump_loop(self):
+        while not STOP.is_set():
+            try:
+                d = self.q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            # 서버의 생존 확인(maintenance_loop)에 답하는 자리. 실제 연결이
+            # serve_conn 에서 하는 일과 같다 — 안 하면 45초 뒤 회수당한다.
+            self.conn.last_rx = now()
+            try:
+                self._handle_up(d)
+            except Exception as e:
+                log(f"[웹] 서버 프레임 처리 실패: {e}")
+
+    def _handle_up(self, d):
+        t = d.get("t")
+        if t == "joined":
+            pc = pc_of_fishing_room(d.get("room"))
+            if pc:
+                st = self._ensure_state(pc)
+                st["joined"], st["reason"] = True, ""
+                self.submit({"t": "sub", "room": d.get("room"), "on": True})
+                log(f"[웹] '{pc}' 방에 입장했습니다.")
+                self.broadcast({"t": "pc", "pc": pc, "joined": True,
+                                "online": st["online"], "reason": ""})
+                self.queue_cmd(pc, "S")
+                self.last_query[pc] = now()
+            return
+        if t == "denied":
+            pc = pc_of_fishing_room(d.get("room"))
+            if pc:
+                st = self._ensure_state(pc)
+                st["joined"], st["reason"] = False, d.get("reason") or "denied"
+                log(f"[웹] '{pc}' 방 입장 거절: {d.get('reason')} {d.get('msg') or ''}")
+                self.broadcast({"t": "pc", "pc": pc, "joined": False,
+                                "online": None, "reason": st["reason"]})
+            return
+        if t == "member":
+            pc = pc_of_fishing_room(d.get("room"))
+            if pc and d.get("id") == pc:
+                st = self._ensure_state(pc)
+                st["online"] = bool(d.get("in"))
+                log(f"[웹] '{pc}' {'접속' if st['online'] else '접속 종료'}")
+                self.broadcast({"t": "pc", "pc": pc, "joined": st["joined"],
+                                "online": st["online"], "reason": st["reason"]})
+            return
+        if t == "room_new":
+            # 피제어 PC가 이제 막 켜져 자기 방을 만들었다. 예전에는 목록을 주기적으로
+            # 다시 받아 봐야 알 수 있었는데, 한 프로그램이 되면서 이 통지가 그대로
+            # 들어온다 — 기다리지 않고 바로 붙는다(주기 재시도는 안전망으로 남긴다).
+            if pc_of_fishing_room(d.get("room")):
+                self._rejoin_watched()
+            return
+        if t == "room_deleted":
+            pc = pc_of_fishing_room(d.get("room"))
+            if pc:
+                st = self._ensure_state(pc)
+                st["joined"], st["online"] = False, None
+                st["reason"] = "room_deleted"
+                self.broadcast({"t": "pc", "pc": pc, "joined": False, "online": None,
+                                "reason": "room_deleted"})
+            return
+        if t == "msg":
+            return self._on_room_msg(d)
+        if t in ("file_begin", "bin", "file_end", "file_abort"):
+            return self._on_file(t, d)
+        if t == "error":
+            code = d.get("code")
+            log(f"[웹 오류] {code}: {d.get('msg')}")
+            if code in ("room_missing", "not_joined"):
+                # 방이 사라졌거나 입장이 풀렸다. 다음 select/재시도에서 다시 붙는다.
+                for pc in list(self.state):
+                    st = self.state[pc]
+                    if st["joined"]:
+                        st["joined"] = False
+                        self._notify_pc(pc)
+            return
+
+    def _on_room_msg(self, d):
+        frm, body = d.get("from"), (d.get("body") or "").strip()
+        pc = pc_of_fishing_room(d.get("room"))
+        if not pc or frm != pc:
+            return              # 그 방의 주인(피제어 PC)이 보낸 것만 의미가 있다
+        st = self._ensure_state(pc)
+        if st["online"] is not True:
+            st["online"] = True
+            self.broadcast({"t": "pc", "pc": pc, "joined": st["joined"],
+                            "online": True, "reason": st["reason"]})
+
+        # 캐시용 최소 분류(접두어 셋만 본다 — 파싱은 브라우저 몫)
+        parts = [p.strip() for p in body.split(",")]
+        if len(parts) >= 3 and parts[1] == "Z":
+            if parts[0] == self.uid and parts[2] not in (
+                    "N", "F", "G", "P", "W", "Q", "Y", "I"):
+                st["status"] = body
+            elif parts[0] == "" and parts[2] == "N":
+                st["tank"] = body
+            elif parts[0] == "" and parts[2] == "F":
+                st["reports"].append([round(now(), 3), body])
+                log(f"[웹 보고] {pc}: {body}")
+        self.broadcast({"t": "msg", "pc": pc, "body": body}, pc=pc)
+
+    # ---------- 스크린샷 조립 ----------
+    def _on_file(self, t, d):
+        fid = d.get("fid")
+        if t == "file_begin":
+            pc = pc_of_fishing_room(d.get("room"))
+            if not pc or d.get("from") != pc:
+                return
+            size = int(d.get("size") or 0)
+            if size <= 0 or size > WEB_SHOT_MAX_BYTES:
+                return log(f"[사진] {pc}: 크기가 규격 밖({size})이라 버립니다.")
+            self.files[fid] = {"pc": pc, "size": size, "sha256": d.get("sha256"),
+                               "name": d.get("name") or "screenshot.png",
+                               "buf": bytearray(), "t0": now()}
+            log(f"[사진] {pc}: 수신 시작 ({size/1048576:.2f}MB)")
+            return
+        f = self.files.get(fid)
+        if f is None:
+            return
+        if t == "bin":
+            f["buf"] += d.get("data", b"")
+            if len(f["buf"]) > f["size"]:
+                self.files.pop(fid, None)
+                self._shot_fail(f["pc"], "too_big")
+            return
+        if t == "file_abort":
+            self.files.pop(fid, None)
+            return self._shot_fail(f["pc"], "aborted")
+
+        # file_end — 크기·해시를 확인한 뒤 완성된 PNG를 base64로 넘긴다.
+        self.files.pop(fid, None)
+        png = bytes(f["buf"])
+        ok = len(png) == f["size"]
+        if ok and f["sha256"]:
+            ok = hashlib.sha256(png).hexdigest() == f["sha256"]
+        if not ok:
+            return self._shot_fail(f["pc"], "corrupt")
+        b64 = base64.b64encode(png).decode("ascii")
+        sent = self._to_waiters(f["pc"], {"t": "shot", "pc": f["pc"], "ok": True,
+                                          "name": f["name"], "b64": b64})
+        log(f"[사진] {f['pc']}: {len(png)/1048576:.2f}MB 전달 ({sent}명)")
+
+    def _shot_fail(self, pc, reason):
+        log(f"[사진] {pc}: 실패({reason})")
+        self._to_waiters(pc, {"t": "shot", "pc": pc, "ok": False, "reason": reason})
+
+    def _to_waiters(self, pc, obj):
+        """사진은 **요청한 브라우저에게만** 준다 — 남이 찍은 사진이 갑자기 뜨면
+        안 되고, 3MB짜리를 안 기다리는 브라우저에 밀어넣을 이유도 없다."""
+        t = now()
+        with self.lock:
+            waiters = [c for c in self.clients
+                       if c.pc == pc and 0 < t - c.shot_wait <= WEB_SHOT_WAIT_SEC]
+        for c in waiters:
+            c.shot_wait = 0.0
+            c.send(obj)
+        return len(waiters)
+
+    # ---------- 유지보수 ----------
+    def _maint_loop(self):
+        last_retry = 0.0
+        while not STOP.wait(1.0):
+            t = now()
+            for fid, f in list(self.files.items()):
+                if t - f["t0"] > 120:
+                    self.files.pop(fid, None)
+                    self._shot_fail(f["pc"], "timeout")
+            if t - last_retry >= WEB_ROOM_RETRY_SEC:
+                last_retry = t
+                # 보고 있는 PC 중 아직 못 들어간 방이 있으면 다시 붙어 본다(그 PC가
+                # 뒤늦게 켜지면 방이 생긴다). room_new 통지를 놓쳤을 때의 안전망.
+                self._rejoin_watched()
+
+    # ---------- 가동 ----------
+    def start(self):
+        with STATE_LOCK:
+            CONNS.add(self.conn)
+            ONLINE[self.uid] = self.conn
+        for fn, name in ((self._pump_loop, "web-pump"),
+                         (self._uplink_loop, "web-uplink"),
+                         (self._maint_loop, "web-maint")):
+            threading.Thread(target=fn, daemon=True, name=name).start()
+        self.broadcast({"t": "up", "connected": True, "msg": "연결됨"})
+
+
+# --- [8-5. 브라우저용 TLS · 수신 대기] ---
+
+
+def web_build_tls():
+    """브라우저용 TLS 컨텍스트를 만든다(공인 인증서 — 자체 서명으로는 브라우저가
+    붙지 않는다). **1.2로 고정한다** — 연결마다 수신 스레드와 송신 스레드가 한
+    소켓을 나눠 쓰므로, 1.3의 핸드셰이크 후 메시지가 record layer를 깨는 문제를
+    이미 겪었다(_pin_tls12 의 설명과 같은 이유, 같은 구조)."""
+    cert, key = CONFIG["web_certfile"], CONFIG["web_keyfile"]
+    if not cert or not key:
+        return None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+    except Exception as e:
+        log(f"[웹 TLS] 인증서를 읽지 못했습니다: {e}")
+        return None
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    _pin_tls12(ctx)
+    log(f"[웹 TLS] 인증서 적재: {cert}")
+    return ctx
+
+
+def _web_cert_sig_now():
+    try:
+        return (os.path.getmtime(CONFIG["web_certfile"]),
+                os.path.getmtime(CONFIG["web_keyfile"]))
+    except OSError:
+        return None
+
+
+def web_tls_ctx():
+    """새 연결마다 인증서 파일의 mtime을 보고 **바뀌었으면 다시 적재한다.**
+    Let's Encrypt 인증서는 60~90일마다 갱신되고(Posh-ACME가 같은 경로에 덮어쓴다),
+    그때 사람이 서버를 재시작해야 하는 구조라면 어느 날 조용히 만료된다.
+    적재에 실패하면 **직전 컨텍스트를 그대로 쓴다** — 갱신 도중의 반쪽 파일을
+    읽었다고 서비스를 멈출 이유가 없다."""
+    global WEB_SSL_CTX, _web_cert_sig_seen
+    if not CONFIG["web_certfile"] or not CONFIG["web_keyfile"]:
+        return None
+    with _web_cert_lock:
+        sig = _web_cert_sig_now()
+        if WEB_SSL_CTX is None or (sig is not None and sig != _web_cert_sig_seen):
+            ctx = web_build_tls()
+            if ctx is not None:
+                WEB_SSL_CTX, _web_cert_sig_seen = ctx, sig
+        return WEB_SSL_CTX
+
+
+def serve_web(sock, addr):
+    """브라우저 연결 하나. TLS 감싸기를 **여기서** 한다(accept 루프에서 하면
+    불량 클라이언트 하나가 새 접속 수락을 막는다 — serve_conn 과 같은 이유)."""
+    conn = None
+    try:
+        ctx = web_tls_ctx()
+        if ctx is not None:
+            sock.settimeout(15)
+            sock = ctx.wrap_socket(sock, server_side=True)
+        sock.settimeout(None)
+        reader = SockReader(sock)
+        if not ws_handshake(reader, sock):
+            # WebSocket 업그레이드가 아닌 평범한 GET — 안내 페이지를 돌려줬다.
+            # 사람이 주소를 열어 인증서·도달 여부를 확인하는 경로이므로 로그를
+            # 남긴다(안 남기면 "브라우저는 뜨는데 서버 창은 조용하다"가 된다).
+            log(f"[웹] 안내 페이지 응답 {addr[0]}:{addr[1]}")
+            return
+        conn = BrowserConn(WEB_HUB, sock, addr)
+        WEB_HUB.add_client(conn)
+        conn.send(WEB_HUB.ready_frame())
+        conn.serve(reader)
+    except (WSClosed, OSError, ssl.SSLError) as e:
+        if conn is not None:
+            log(f"[웹] {conn.who()} 종료 — {e}")
+    except Exception as e:
+        log(f"[웹] 처리 중 오류: {e}")
+    finally:
+        if conn is not None:
+            WEB_HUB.drop_client(conn)
+            conn.close()
+        else:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+def web_accept_loop(srv):
+    while not STOP.is_set():
+        try:
+            sock, addr = srv.accept()
+        except OSError:
+            return
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        threading.Thread(target=serve_web, args=(sock, addr), daemon=True,
+                         name="web-conn").start()
+
+
+def start_web_relay():
+    """웹 중계를 켠다. 켜지 않기로 돼 있거나 포트를 못 열면 None을 돌려주고
+    **서버 본체는 그대로 계속 돈다** — 채팅 중계가 웹 때문에 죽어서는 안 된다.
+    (관리 창 domiserver_gui.py 도 이 함수 하나만 부르면 된다.)"""
+    global WEB_HUB
+    if not CONFIG["web"]:
+        log("[웹] 설정에서 꺼져 있습니다 — 브라우저 중계를 열지 않습니다.")
+        return None
+    uid = CONFIG["web_id"] if valid_id(CONFIG["web_id"]) else "web"
+    try:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((CONFIG["web_host"], CONFIG["web_port"]))
+        srv.listen(16)
+    except OSError as e:
+        log(f"[웹] 포트 {CONFIG['web_port']} 를 열 수 없어 중계를 건너뜁니다: {e}")
+        return None
+
+    WEB_HUB = WebHub(uid)
+    WEB_HUB.start()
+    threading.Thread(target=web_accept_loop, args=(srv,), daemon=True,
+                     name="web-accept").start()
+    scheme = "wss" if web_tls_ctx() is not None else "ws"
+    if scheme == "ws":
+        log("[웹 TLS] 인증서가 없어 **평문 ws**로 엽니다 — 로컬 개발용이며 "
+            "https 페이지(GitHub Pages)에서는 접속되지 않습니다.")
+    log(f"[웹] {scheme}://<호스트>:{CONFIG['web_port']}/ws 로 브라우저를 받습니다"
+        f" (중계 ID '{uid}').")
+    log(f"[웹] 피제어 PC: {', '.join(CONFIG['web_pcs']) or '(없음)'}   (콘솔: web)")
+    return srv
+
+
+# === [9. 콘솔 — 계정 · 채팅방 · 웹 중계 관리] ===
 
 HELP = """\
 계정   users | pending | approve <ID> | reject <ID> | deluser <ID>
        disable <ID> | enable <ID> | online | kick <ID>
 채팅방 rooms | room <이름> | delroom <이름>
        delrooms all|open|limited|owner <ID>   (일괄 삭제, 확인 후 진행)
+웹중계 web | web add <PC ID> | web del <PC ID>
 기타   addr | cert | set <키> <값> | config | help | quit"""
 
 
@@ -1456,13 +2400,44 @@ def cmd_addr(_):
     print_addresses(CONFIG["port"])
 
 
+def cmd_web(args):
+    """웹 중계 상태 보기와 피제어 PC 목록 편집.
+    목록 편집은 브라우저가 쓰는 것과 **같은 메서드**(add_pc/del_pc)를 부른다."""
+    if WEB_HUB is None:
+        return print("  웹 중계가 꺼져 있습니다 (set web 1 후 재시작).")
+    if not args:
+        scheme = "wss" if WEB_SSL_CTX is not None else "ws"
+        with WEB_HUB.lock:
+            clients = sorted((c.who(), c.pc) for c in WEB_HUB.clients)
+        print(f"  수신     : {scheme}://<호스트>:{CONFIG['web_port']}/ws"
+              f"   중계 이름 '{WEB_HUB.uid}'")
+        print(f"  브라우저 : {len(clients)}명")
+        for who, pc in clients:
+            print(f"     {who}  보는 PC={pc or '-'}")
+        print("  피제어 PC:")
+        for pc in CONFIG["web_pcs"]:
+            st = WEB_HUB.state.get(pc, {})
+            on = {True: "접속중", False: "꺼짐", None: "모름"}[st.get("online")]
+            print(f"     {pc:<14} 입장={'O' if st.get('joined') else 'X'}  {on}"
+                  f"  {st.get('reason') or ''}")
+        return
+    op, pc = args[0].lower(), (args[1] if len(args) > 1 else "")
+    if op not in ("add", "del") or not pc:
+        return print("사용법: web | web add <PC ID> | web del <PC ID>")
+    ok, msg = (WEB_HUB.add_pc if op == "add" else WEB_HUB.del_pc)(pc)
+    if not ok:
+        return print(f"  {msg}")
+    log(f"[웹 목록] {msg} (콘솔)")
+    print(f"  목록: {', '.join(CONFIG['web_pcs']) or '(없음)'}")
+
+
 COMMANDS = {
     "addr": cmd_addr, "cert": cmd_cert,
     "users": cmd_users, "pending": cmd_pending, "approve": cmd_approve,
     "reject": cmd_reject, "deluser": cmd_deluser, "disable": cmd_disable,
     "enable": cmd_enable, "online": cmd_online, "kick": cmd_kick,
     "rooms": cmd_rooms, "room": cmd_room, "delroom": cmd_delroom,
-    "delrooms": cmd_delrooms,
+    "delrooms": cmd_delrooms, "web": cmd_web,
     "config": cmd_config, "set": cmd_set,
 }
 
@@ -1493,11 +2468,12 @@ def repl():
             print(f"명령 실패: {e}")
 
 
-# === [9. 진입점] ===
+# === [10. 진입점] ===
 
 
 def main():
     load_config()
+    import_domiweb_config()
     db_init()
     setup_tls()
 
@@ -1521,15 +2497,19 @@ def main():
 
     threading.Thread(target=accept_loop, args=(srv,), daemon=True).start()
     threading.Thread(target=maintenance_loop, daemon=True).start()
+    web_srv = start_web_relay()
 
     try:
         repl()
     finally:
         STOP.set()
-        try:
-            srv.close()
-        except Exception:
-            pass
+        for s in (srv, web_srv):
+            if s is None:
+                continue
+            try:
+                s.close()
+            except Exception:
+                pass
         with STATE_LOCK:
             conns = list(CONNS)
         for c in conns:
