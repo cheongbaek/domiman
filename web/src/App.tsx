@@ -367,13 +367,27 @@ export function App() {
 
   // 채팅은 화면을 통째로 바꾼다(모바일에서 창은 다루기 나쁘다). 낚시 제어 상태는
   // 그대로 살아 있어 돌아오면 최신 값이 보인다.
+  //
+  // **폭이 넓으면 목록과 대화를 나란히 둔다**(휴대폰에서는 한 번에 하나만).
+  // 화면 전환이라는 성격은 그대로지만, PC에서 휴대폰 폭으로 눌러 둘 이유는 없다 —
+  // 어느 쪽을 보여줄지는 CSS가 정하고(`.hide`), 두 화면은 항상 붙어 있다.
   if (screen === "chat") {
+    const inRoom = chat.view === "room" && !!chat.room;
     return (
       <div className="wrap chat">
-        {chat.view === "room"
-          ? <ChatRoomView chat={chat} myId={myId}
-                          onImage={(m: ChatMsg) => m.img && setChatShot(m.img)} />
-          : <RoomListView chat={chat} myId={myId} onBack={() => setScreen("fishing")} />}
+        <div className="chatpage">
+          <div className={`pane list ${inRoom ? "hide" : ""}`}>
+            <RoomListView chat={chat} myId={myId} onBack={() => setScreen("fishing")} />
+          </div>
+          <div className={`pane room ${inRoom ? "" : "hide"}`}>
+            {inRoom
+              ? <ChatRoomView chat={chat} myId={myId}
+                              onImage={(m: ChatMsg) => m.img && setChatShot(m.img)} />
+              : <div className="screen center">
+                  <div className="empty">왼쪽에서 채팅방을 고르세요.</div>
+                </div>}
+          </div>
+        </div>
         {shotView}
       </div>
     );

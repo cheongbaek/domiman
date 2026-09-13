@@ -187,8 +187,26 @@ button.big {
    그래서 화면 높이를 꽉 채우고(대화 영역만 스크롤) 입력줄은 아래에 고정한다.
    `dvh`를 쓰는 이유: 모바일 브라우저의 주소창이 접혔다 펴질 때 `vh`는 따라오지
    않아 입력줄이 화면 밖으로 밀린다. */
-.wrap.chat { padding-bottom: 12px; }
-.screen { display: flex; flex-direction: column; height: calc(100dvh - 24px); }
+.wrap.chat { padding-bottom: 12px; max-width: 1280px; }
+/* 좁으면 한 쪽만 보이고(`.hide`), 넓으면 목록과 대화가 나란히 선다.
+   어느 쪽을 보여줄지는 여기서 정하고 React는 둘 다 그려 둔다 — 그래야 넓은
+   화면에서 방을 옮겨도 목록이 다시 그려지지 않는다. */
+.chatpage { display: flex; gap: 16px; height: calc(100dvh - 24px); }
+.pane { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
+.screen { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.screen.center { align-items: center; justify-content: center; }
+.icon.wide { display: none; }
+@media (max-width: 899px) {
+  .pane.hide { display: none; }
+}
+@media (min-width: 900px) {
+  .pane.list { flex: 0 0 300px; }
+  /* 두 칸이 한 화면에 서니 경계가 있어야 대화 쪽이 떠 보이지 않는다. */
+  .pane.room { border-left: 1px solid var(--line); padding-left: 16px; }
+  .icon.narrow { display: none; }        /* 목록이 바로 옆에 있다 */
+  .icon.wide { display: inline-block; }  /* 대신 '나가기'를 오른쪽에 둔다 */
+  .bubbleWrap { max-width: 70%; }
+}
 .bar { display: flex; align-items: center; gap: 8px; margin: 4px 0 10px; }
 .bar h1 {
   font-size: 17px; margin: 0; letter-spacing: -.2px;
@@ -219,6 +237,7 @@ button.tank.chatbtn { font-weight: 700; padding: 3px 10px; box-shadow: none; }
 .roomrow + .roomrow { border-top: 1px solid var(--line); border-radius: 0; }
 .roomrow:hover:not(:disabled) { background: var(--panel2); }
 .roomrow.off { opacity: .5; }
+.roomrow.on { background: var(--panel2); box-shadow: inset 3px 0 0 var(--accent); }
 .rname { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rhint { color: var(--muted); font-size: 13px; flex: none; }
 .empty { color: var(--muted); padding: 10px; }
@@ -258,5 +277,3 @@ button.tank.chatbtn { font-weight: 700; padding: 3px 10px; box-shadow: none; }
   background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
   padding: 10px 12px; font: inherit; color: inherit;
 }
-/* 넓은 화면에서 대화가 가로로 늘어지지 않게 — 말풍선은 읽는 폭이 중요하다. */
-@media (min-width: 900px) { .wrap.chat { max-width: 820px; } }

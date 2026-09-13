@@ -299,8 +299,8 @@ export function RoomListView(
       </div>
 
       <div className="note">
-        내 ID <b>{myId}</b> — 사후 승인 방은 방장이 이 ID를 승인해야 들어갈 수 있고,
-        비밀번호 방은 비밀번호를 넣으면 바로 들어갑니다. (구독·알림은 웹에 없습니다)
+        내 ID <b>{myId}</b> — 사후 승인 방은 방장이 이 ID를 승인해야 들어갑니다.
+        (구독·알림은 웹에 없습니다)
       </div>
 
       <div className="row tight">
@@ -314,7 +314,9 @@ export function RoomListView(
         {rows.length === 0
           ? <div className="empty">{chat.rooms.length === 0 ? "(방 없음)" : "(찾는 방이 없습니다)"}</div>
           : rows.map((r) => (
-              <button key={r.name} className={`roomrow ${r.blocked ? "off" : ""}`}
+              <button key={r.name}
+                      className={`roomrow ${r.blocked ? "off" : ""}`
+                                 + (r.name === chat.room ? " on" : "")}
                       disabled={chat.busy === r.name}
                       onClick={() => enter(r)}>
                 <span className={`badge k-${r.kind}`}>{KIND_TEXT[r.kind] ?? r.kind}</span>
@@ -395,13 +397,16 @@ export function ChatRoomView(
   return (
     <div className="screen">
       <div className="bar">
-        <button className="icon" onClick={chat.close} title="목록으로">←</button>
+        <button className="icon narrow" onClick={chat.close} title="목록으로">←</button>
         <h1>{chat.room}</h1>
         <span className={`badge k-${chat.meta.kind}`}>
           {KIND_TEXT[chat.meta.kind] ?? chat.meta.kind}
         </span>
         <span className="spacer" />
         <span className="value">{myId}</span>
+        <button className="icon wide" onClick={chat.close} title="이 방에서 나가기">
+          나가기
+        </button>
       </div>
 
       {chat.notice && <div className="status warn">{chat.notice}</div>}
