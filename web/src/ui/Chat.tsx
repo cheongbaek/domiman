@@ -69,7 +69,10 @@ export function useChat(relayRef: React.MutableRefObject<Relay | null>, myId: st
 
   const handle = useCallback((e: RelayEvent) => {
     if (e.t === "ready") {
-      setEnabled(e.chat !== false);
+      // **중계가 채팅을 중계한다고 말할 때만** 칸을 보여준다. 웹앱은 GitHub Pages로
+      // 먼저 배포되고 서버(중계)는 나중에 올라갈 수 있는데, 그 사이에 버튼만 떠
+      // 있으면 눌러도 아무 방도 안 나오는 죽은 칸이 된다.
+      setEnabled(e.chat === true);
       return;
     }
     if (e.t === "link" && e.state !== "open") {
