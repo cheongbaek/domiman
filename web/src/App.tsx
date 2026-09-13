@@ -400,11 +400,11 @@ export function App() {
         <h1>DOMIMAN</h1>
         <span className="value">{linkText}</span>
         <span className="spacer" />
-        {chat.enabled && (
-          <button className="tank chatbtn" onClick={() => setScreen("chat")}>
-            채팅방 목록
-          </button>
-        )}
+        {/* **칸은 조건 없이 항상 있다.** 서버가 아직 채팅을 모르면 들어가서 그렇게
+            적어 준다 — 상태에 따라 칸이 생겼다 없어지면 UI가 고장 난 것처럼 보인다. */}
+        <button className="tank chatbtn" onClick={() => setScreen("chat")}>
+          채팅방 목록
+        </button>
         <span className={`tank ${tankFail ? "fail" : ""}`}>
           {tank ? `살림망 ${tank[0]}/${tank[1]}` : tankFail ? "살림망 판독 실패" : "살림망 –"}
         </span>

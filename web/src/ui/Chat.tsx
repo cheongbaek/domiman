@@ -32,7 +32,10 @@ export type ChatMsg = {
 const SEND_TIMEOUT_MS = 15000;   // 명령 응답 대기와 같은 값
 
 export function useChat(relayRef: React.MutableRefObject<Relay | null>, myId: string) {
-  const [enabled, setEnabled] = useState(true);
+  // null = 아직 ready 를 못 받음. **이 값으로 칸을 숨기지 않는다** — 화면에서 칸이
+  // 나타났다 사라지면 쓰는 사람에게는 그냥 UI가 없어진 것으로 보인다. 들어가서
+  // 글로 알려주는 편이 낫다.
+  const [supported, setSupported] = useState<boolean | null>(null);
   const [view, setView] = useState<"list" | "room">("list");
   const [rooms, setRooms] = useState<RoomRow[]>([]);
   const [room, setRoom] = useState("");
@@ -69,10 +72,9 @@ export function useChat(relayRef: React.MutableRefObject<Relay | null>, myId: st
 
   const handle = useCallback((e: RelayEvent) => {
     if (e.t === "ready") {
-      // **중계가 채팅을 중계한다고 말할 때만** 칸을 보여준다. 웹앱은 GitHub Pages로
-      // 먼저 배포되고 서버(중계)는 나중에 올라갈 수 있는데, 그 사이에 버튼만 떠
-      // 있으면 눌러도 아무 방도 안 나오는 죽은 칸이 된다.
-      setEnabled(e.chat === true);
+      // 웹앱은 GitHub Pages로 먼저 배포되고 서버(중계)는 나중에 올라갈 수 있다.
+      // 그 사이에도 칸은 그대로 두고, 목록 화면에서 '아직 준비 안 됐다'고 말한다.
+      setSupported(e.chat === true);
       return;
     }
     if (e.t === "link" && e.state !== "open") {
@@ -264,7 +266,7 @@ export function useChat(relayRef: React.MutableRefObject<Relay | null>, myId: st
   const refresh = useCallback(() => relayRef.current?.roomsAsk(), [relayRef]);
 
   return {
-    enabled, view, rooms, room, meta, msgs, notice, pwAsk, busy,
+    supported, view, rooms, room, meta, msgs, notice, pwAsk, busy,
     setNotice, setPwAsk, setView, handle, open, close, send, sendImage, refresh,
   };
 }
@@ -276,12 +278,9 @@ export type Chat = ReturnType<typeof useChat>;
 export function RoomListView(
   { chat, myId, onBack }: { chat: Chat; myId: string; onBack: () => void },
 ) {
-  const [q, setQ] = useState("");
   const [pw, setPw] = useState("");
 
   useEffect(() => { chat.refresh(); }, []);   // 화면에 들어올 때 한 번 새로 받는다
-
-  const rows = chat.rooms.filter((r) => !q || r.name.toLowerCase().includes(q.toLowerCase()));
 
   function enter(r: RoomRow) {
     if (r.blocked) return chat.setNotice(`${r.name}: ${DENY_TEXT.blocked}`);
@@ -298,7 +297,8 @@ export function RoomListView(
         <button className="icon" onClick={onBack} title="낚시 제어로 돌아가기">←</button>
         <h1>채팅방 목록</h1>
         <span className="spacer" />
-        <button className="icon" onClick={chat.refresh} title="목록 새로 받기">⟳</button>
+        <button className="icon" onClick={chat.refresh} disabled={chat.supported !== true}
+                title="목록 새로 받기">⟳</button>
       </div>
 
       <div className="note">
@@ -306,17 +306,20 @@ export function RoomListView(
         (구독·알림은 웹에 없습니다)
       </div>
 
-      <div className="row tight">
-        <input type="text" placeholder="방 이름으로 찾기" value={q} style={{ flex: 1 }}
-               onChange={(e) => setQ(e.target.value)} />
-      </div>
-
       {chat.notice && <div className="status warn">{chat.notice}</div>}
 
       <div className="rooms">
-        {rows.length === 0
-          ? <div className="empty">{chat.rooms.length === 0 ? "(방 없음)" : "(찾는 방이 없습니다)"}</div>
-          : rows.map((r) => (
+        {chat.supported === false
+          ? <div className="empty">
+              서버(domiserver)에 <b>웹 채팅 배선</b>이 아직 없습니다.<br />
+              방은 이미 서버에 다 있고, 그것을 브라우저로 넘겨주는 부분만 빠져
+              있습니다. 서버를 새 버전으로 올리면 여기에 목록이 그대로 뜹니다.
+            </div>
+          : chat.supported === null
+          ? <div className="empty">(중계에 연결하는 중…)</div>
+          : chat.rooms.length === 0
+          ? <div className="empty">(방 없음)</div>
+          : chat.rooms.map((r) => (
               <button key={r.name}
                       className={`roomrow ${r.blocked ? "off" : ""}`
                                  + (r.name === chat.room ? " on" : "")}
@@ -330,7 +333,9 @@ export function RoomListView(
               </button>
             ))}
       </div>
-      <div className="note">채팅방 {chat.rooms.length}개</div>
+      <div className="note">
+        {chat.supported === true ? `채팅방 ${chat.rooms.length}개` : "\u00a0"}
+      </div>
 
       {chat.pwAsk && (
         <div className="veil" onClick={() => chat.setPwAsk("")}>
