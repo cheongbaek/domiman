@@ -32,10 +32,12 @@ export type ChatMsg = {
 const SEND_TIMEOUT_MS = 15000;   // 명령 응답 대기와 같은 값
 
 export function useChat(relayRef: React.MutableRefObject<Relay | null>, myId: string) {
-  // null = 아직 ready 를 못 받음. **이 값으로 칸을 숨기지 않는다** — 화면에서 칸이
-  // 나타났다 사라지면 쓰는 사람에게는 그냥 UI가 없어진 것으로 보인다. 들어가서
-  // 글로 알려주는 편이 낫다.
-  const [supported, setSupported] = useState<boolean | null>(null);
+  // **중계가 알려주는 깃발(`ready.chat`)에 매달리지 않는다.** 그 한 글자가 빠진
+  // 중계(옛 버전)에서는 멀쩡히 목록을 줄 수 있는데도 화면이 '안 된다'고 우긴다.
+  // 그래서 목록을 **그냥 청하고, 실제로 오는지**로 판단한다.
+  const [asked, setAsked] = useState(0);        // 목록을 청한 시각
+  const [got, setGot] = useState(false);        // 목록이 한 번이라도 왔는가
+  const [relay, setRelay] = useState("");       // 중계 버전(안 올 때 원인을 짚으려고)
   const [view, setView] = useState<"list" | "room">("list");
   const [rooms, setRooms] = useState<RoomRow[]>([]);
   const [room, setRoom] = useState("");
@@ -72,9 +74,7 @@ export function useChat(relayRef: React.MutableRefObject<Relay | null>, myId: st
 
   const handle = useCallback((e: RelayEvent) => {
     if (e.t === "ready") {
-      // 웹앱은 GitHub Pages로 먼저 배포되고 서버(중계)는 나중에 올라갈 수 있다.
-      // 그 사이에도 칸은 그대로 두고, 목록 화면에서 '아직 준비 안 됐다'고 말한다.
-      setSupported(e.chat === true);
+      setRelay(e.version || "");
       return;
     }
     if (e.t === "link" && e.state !== "open") {
@@ -83,6 +83,7 @@ export function useChat(relayRef: React.MutableRefObject<Relay | null>, myId: st
     }
     if (e.t === "rooms") {
       setRooms(sortRooms(e.list || []));
+      setGot(true);
       return;
     }
     if (e.t === "chat_err") {
@@ -263,10 +264,25 @@ export function useChat(relayRef: React.MutableRefObject<Relay | null>, myId: st
     }
   }, [add, myId, relayRef]);
 
-  const refresh = useCallback(() => relayRef.current?.roomsAsk(), [relayRef]);
+  const refresh = useCallback(() => {
+    setAsked(Date.now());
+    relayRef.current?.roomsAsk();
+  }, [relayRef]);
+
+  // 청한 지 4초가 지나도록 목록이 안 오면 그 사실을 화면에 적는다(계속 기다리지
+  // 않는다). 그 뒤에 오면 `got` 이 켜지면서 저절로 목록으로 바뀐다.
+  const [late, setLate] = useState(false);
+  useEffect(() => {
+    if (!asked || got) {
+      setLate(false);
+      return;
+    }
+    const id = window.setTimeout(() => setLate(true), 4000);
+    return () => window.clearTimeout(id);
+  }, [asked, got]);
 
   return {
-    supported, view, rooms, room, meta, msgs, notice, pwAsk, busy,
+    got, late, relay, view, rooms, room, meta, msgs, notice, pwAsk, busy,
     setNotice, setPwAsk, setView, handle, open, close, send, sendImage, refresh,
   };
 }
@@ -297,8 +313,7 @@ export function RoomListView(
         <button className="icon" onClick={onBack} title="낚시 제어로 돌아가기">←</button>
         <h1>채팅방 목록</h1>
         <span className="spacer" />
-        <button className="icon" onClick={chat.refresh} disabled={chat.supported !== true}
-                title="목록 새로 받기">⟳</button>
+        <button className="icon" onClick={chat.refresh} title="목록 새로 받기">⟳</button>
       </div>
 
       <div className="note">
@@ -309,14 +324,16 @@ export function RoomListView(
       {chat.notice && <div className="status warn">{chat.notice}</div>}
 
       <div className="rooms">
-        {chat.supported === false
+        {!chat.got && chat.late
           ? <div className="empty">
-              서버(domiserver)에 <b>웹 채팅 배선</b>이 아직 없습니다.<br />
-              방은 이미 서버에 다 있고, 그것을 브라우저로 넘겨주는 부분만 빠져
-              있습니다. 서버를 새 버전으로 올리면 여기에 목록이 그대로 뜹니다.
+              중계가 방 목록을 주지 않습니다.<br />
+              지금 붙어 있는 중계 버전은 <b>{chat.relay || "(모름)"}</b> 이고,
+              채팅은 <b>260914b</b> 이상에서 동작합니다. 돌고 있는
+              domiserver 가 그보다 옛 파일이면 그것부터 새로 올리세요.<br />
+              <button style={{ marginTop: 10 }} onClick={chat.refresh}>다시 청하기</button>
             </div>
-          : chat.supported === null
-          ? <div className="empty">(중계에 연결하는 중…)</div>
+          : !chat.got
+          ? <div className="empty">(방 목록을 받는 중…)</div>
           : chat.rooms.length === 0
           ? <div className="empty">(방 없음)</div>
           : chat.rooms.map((r) => (
@@ -334,7 +351,7 @@ export function RoomListView(
             ))}
       </div>
       <div className="note">
-        {chat.supported === true ? `채팅방 ${chat.rooms.length}개` : "\u00a0"}
+        {chat.got ? `채팅방 ${chat.rooms.length}개` : "\u00a0"}
       </div>
 
       {chat.pwAsk && (
