@@ -50,16 +50,25 @@ import urllib.request
 from collections import deque
 
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 # === [1. 상수 · 설정] ===
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "domiserver.json")
 DB_PATH = os.path.join(BASE_DIR, "domiserver.db")
-DOMIWEB_CONFIG_PATH = os.path.join(BASE_DIR, "domiweb.json")   # 옛 설정 승계용
+# 옛 설정 승계용. 따로 돌던 시절의 `domiweb.json` 은 **이 파일 옆에 있지 않다** —
+# domiweb.py 는 `C:\domiweb\` 에서 돌았고 설정도 그 옆에 있었다. 한 곳만 보면
+# 승계가 조용히 건너뛰어지고, 그러면 인증서 경로가 빈 채로 남아 평문 ws 로 열린다
+# (= https 페이지인 웹앱에서 **아무 오류 없이 접속만 안 된다**). 실제로 그랬다.
+DOMIWEB_CONFIG_CANDIDATES = [
+    os.path.join(BASE_DIR, "domiweb.json"),
+    r"C:\domiweb\domiweb.json",
+    os.path.join(os.path.expanduser("~"), "domiweb", "domiweb.json"),
+    os.path.join(os.getcwd(), "domiweb.json"),
+]
 
-APP_VERSION = "260914a"
+APP_VERSION = "260914c"
 # 프로토콜 버전 — welcome 으로 알려준다. 클라이언트는 이 값으로 기능 유무를 판단한다.
 #   1 = 텍스트 채팅  /  2 = 이미지 첨부('B' 프레임) 지원
 # 옛 서버는 'B' 프레임을 '지원하지 않는 프레임'으로 보고 **연결을 끊으므로**,
@@ -127,59 +136,160 @@ CONFIG = dict(DEFAULT_CONFIG)
 CONFIG_HAD_WEB_KEYS = False       # 설정 파일에 web_* 가 이미 있었는가(승계 판정용)
 
 
+def _coerce(key, v):
+    """JSON 값을 그 키의 자료형으로 맞춘다. 못 맞추면 None.
+
+    `isinstance(v, type(기본값))` 하나로 거르면 **사람이 손으로 쓴 설정이 조용히
+    버려진다**: `"web": 1`, `"web_port": "47822"` 처럼 흔한 표기가 전부 무시되고
+    기본값으로 돌아간다(그 결과가 '인증서 경로가 빈 서버'다). 받아 줄 수 있는
+    표기는 받아 주고, 정말 못 쓰는 값만 돌려보낸다."""
+    want = type(DEFAULT_CONFIG[key])
+    if want is bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return bool(v)
+        if isinstance(v, str) and v.strip().lower() in (
+                "1", "0", "true", "false", "yes", "no", "on", "off"):
+            return v.strip().lower() in ("1", "true", "yes", "on")
+        return None
+    if want is int:
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return v
+        if isinstance(v, float) and v.is_integer():
+            return int(v)
+        if isinstance(v, str):
+            try:
+                return int(v.strip())
+            except ValueError:
+                return None
+        return None
+    if want is str:
+        return v if isinstance(v, str) else None
+    if want is list:
+        # 목록은 문자열만 담는다(피제어 PC 이름·Origin). 문자열 하나가 와도 받는다.
+        if isinstance(v, str):
+            return [v] if v else []
+        if isinstance(v, list) and all(isinstance(x, str) for x in v):
+            return list(v)
+        return None
+    return v if isinstance(v, want) else None
+
+
+def _quarantine_config(why):
+    """읽을 수 없는 설정 파일을 옆으로 치운다.
+
+    **그냥 두면 다음 저장이 그 위에 기본값을 덮어써 사람이 쓴 값이 사라진다**
+    (브라우저가 PC를 하나 추가하기만 해도 save_config 가 불린다). 치워 두면
+    기본값으로 새로 시작하면서도 원본은 남아, 인증서 경로 같은 것을 되살릴 수 있다."""
+    bad = f"{CONFIG_PATH}.bad-{time.strftime('%Y%m%d-%H%M%S')}"
+    try:
+        os.replace(CONFIG_PATH, bad)
+        log(f"[설정] {os.path.basename(CONFIG_PATH)} 를 읽을 수 없습니다({why}).")
+        log(f"[설정] 원본을 {os.path.basename(bad)} 로 옮기고 기본값으로 시작합니다"
+            " — 웹 인증서 경로(web_certfile/web_keyfile)를 다시 넣어야 합니다.")
+    except OSError as e:
+        log(f"[설정] 읽지 못한 설정 파일을 옮기지도 못했습니다: {e}")
+
+
 def load_config():
-    """설정 파일 로드(없거나 깨졌으면 기본값). 모르는 키는 무시한다."""
+    """설정 파일 로드(없거나 깨졌으면 기본값). 모르는 키는 알려 주고 무시한다."""
     global CONFIG, CONFIG_HAD_WEB_KEYS
     CONFIG = dict(DEFAULT_CONFIG)
     CONFIG_HAD_WEB_KEYS = False
     try:
-        with open(CONFIG_PATH, encoding="utf-8") as fp:
+        # utf-8-sig: PowerShell 의 `Set-Content -Encoding UTF8` 은 **BOM 을 붙인다.**
+        # 그냥 utf-8 로 읽으면 json 이 BOM 에서 깨져 설정이 통째로 기본값으로
+        # 돌아가고, 그러면 인증서 경로가 비어 평문 ws 로 열려 "브라우저가 조용히
+        # 못 붙는다". domiweb.py 가 이미 값을 치른 함정이라 그대로 가져온다.
+        with open(CONFIG_PATH, encoding="utf-8-sig") as fp:
             data = json.load(fp)
-        CONFIG_HAD_WEB_KEYS = any(k.startswith("web") for k in data)
-        for k, v in data.items():
-            if k in DEFAULT_CONFIG and isinstance(v, type(DEFAULT_CONFIG[k])):
-                CONFIG[k] = v
     except FileNotFoundError:
-        save_config()
-    except Exception as e:
-        log(f"[경고] 설정 로드 실패, 기본값 사용: {e}")
+        return save_config()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        return _quarantine_config(e)
+
+    if not isinstance(data, dict):
+        return _quarantine_config("최상위가 객체(JSON object)가 아닙니다")
+
+    CONFIG_HAD_WEB_KEYS = any(k.startswith("web") for k in data)
+    for k, v in data.items():
+        if k not in DEFAULT_CONFIG:
+            log(f"[설정] 모르는 키 '{k}' 는 무시합니다.")
+            continue
+        got = _coerce(k, v)
+        if got is None:
+            # 조용히 넘기면 "설정은 고쳤는데 서버가 안 듣는다"가 된다 — 반드시 말한다.
+            log(f"[설정] '{k}' 값 {v!r} 을 쓸 수 없어 기본값 {DEFAULT_CONFIG[k]!r}"
+                " 을 씁니다.")
+            continue
+        CONFIG[k] = got
 
 
 def save_config():
+    """**원자적으로** 쓴다(임시 파일 → os.replace).
+
+    그냥 열어서 쓰면 도중에 죽거나 두 곳이 동시에 저장할 때 반쪽짜리 파일이 남는다.
+    저장은 브라우저의 PC 추가/삭제로도 일어나므로 드문 일이 아니고, 반쪽 파일은
+    다음 실행에서 '설정 전체가 기본값'이 되어 웹 접속이 끊기는 것으로 나타난다."""
+    tmp = CONFIG_PATH + ".tmp"
     try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as fp:
+        with open(tmp, "w", encoding="utf-8") as fp:
             json.dump(CONFIG, fp, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_PATH)
     except Exception as e:
         log(f"[경고] 설정 저장 실패: {e}")
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+
+
+def find_domiweb_config():
+    """옛 `domiweb.json` 을 알려진 자리에서 찾는다(첫 번째로 있는 것)."""
+    for path in DOMIWEB_CONFIG_CANDIDATES:
+        if os.path.isfile(path):
+            return path
+    return None
 
 
 def import_domiweb_config():
-    """옆에 옛 `domiweb.json` 이 있고 이 설정에 web_* 가 아직 없으면 한 번 옮겨 온다.
+    """옛 `domiweb.json` 이 있고 이 설정에 web_* 가 아직 없으면 한 번 옮겨 온다.
 
     **인증서 경로를 잃지 않으려는 것이 요점이다** — 공인 인증서·키 경로는 사람이
     손으로 적어 넣은 값이고, 비어 있으면 평문 ws 로 열려 **브라우저가 조용히 못
     붙는다**(오류도 안 난다). 피제어 PC 목록도 마찬가지로 손으로 쌓인 값이다.
-    한 번 옮기고 나면 domiserver.json 에 web_* 가 생겨 다시 보지 않는다."""
+    한 번 옮기고 나면 domiserver.json 에 web_* 가 생겨 다시 보지 않는다.
+
+    찾는 자리가 여럿인 이유는 DOMIWEB_CONFIG_CANDIDATES 의 설명과 같다 — 옛
+    프로세스는 이 파일 옆이 아니라 자기 폴더에서 돌았다."""
     if CONFIG_HAD_WEB_KEYS:
+        return
+    path = find_domiweb_config()
+    if path is None:
         return
     try:
         # utf-8-sig: PowerShell 의 `Set-Content -Encoding UTF8` 은 **BOM 을 붙인다.**
         # 그냥 utf-8 로 읽으면 json 이 BOM 에서 깨져 조용히 건너뛰게 된다.
-        with open(DOMIWEB_CONFIG_PATH, encoding="utf-8-sig") as fp:
+        with open(path, encoding="utf-8-sig") as fp:
             old = json.load(fp)
-    except FileNotFoundError:
-        return
     except Exception as e:
-        return log(f"[웹] 옛 domiweb.json 을 읽지 못했습니다: {e}")
+        return log(f"[웹] 옛 설정 '{path}' 을 읽지 못했습니다: {e}")
+    if not isinstance(old, dict):
+        return log(f"[웹] 옛 설정 '{path}' 이 객체(JSON object)가 아닙니다.")
     moved = []
     for src, dst in DOMIWEB_KEYMAP.items():
-        v = old.get(src)
-        if v is not None and isinstance(v, type(DEFAULT_CONFIG[dst])):
-            CONFIG[dst] = v
-            moved.append(dst)
+        if src not in old:
+            continue
+        got = _coerce(dst, old[src])
+        if got is None:
+            log(f"[웹] 옛 설정의 '{src}' 값 {old[src]!r} 은 옮기지 못했습니다.")
+            continue
+        CONFIG[dst] = got
+        moved.append(dst)
     if moved:
         save_config()
-        log(f"[웹] 옛 domiweb.json 설정을 옮겨 왔습니다: {', '.join(moved)}")
+        log(f"[웹] 옛 설정 '{path}' 에서 옮겨 왔습니다: {', '.join(moved)}")
 
 
 # === [2. 유틸 — 로그 · 검증 · 비밀번호] ===
@@ -188,9 +298,21 @@ _log_lock = threading.Lock()
 
 
 def log(msg):
-    """콘솔 출력. 채팅 본문은 절대 찍지 않는다(서버는 대화를 남기지 않는다)."""
+    """콘솔 출력. 채팅 본문은 절대 찍지 않는다(서버는 대화를 남기지 않는다).
+
+    **인코딩 오류로 죽어서는 안 된다(실측 함정):** 한국어 Windows 의 콘솔 기본
+    코드페이지는 cp949 라 로그에 섞인 '—'(em dash) 하나에 UnicodeEncodeError 가
+    나고, 그 예외가 `console_main` 첫 줄에서 터지면 **서버가 아예 못 뜬다**
+    (출력을 파일로 넘길 때 특히 잘 걸린다). 못 찍는 글자는 바꿔서라도 찍는다."""
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
     with _log_lock:
-        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+        try:
+            print(line, flush=True)
+        except UnicodeEncodeError:
+            enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(line.encode(enc, "replace").decode(enc, "replace"), flush=True)
+        except Exception:
+            pass                  # 출력이 막혔다고 서버가 멈출 이유는 없다
 
 
 def now():
@@ -1383,6 +1505,8 @@ WEB_HUB = None                  # 가동 중이면 WebHub
 WEB_SSL_CTX = None              # 브라우저용 SSLContext(공인 인증서). 없으면 평문 ws
 _web_cert_lock = threading.Lock()
 _web_cert_sig_seen = None       # (인증서 mtime, 키 mtime) — 갱신 감지용
+_web_tls_tried = False          # 한 번이라도 적재를 시도했는가(무한 재시도 방지)
+_web_tls_why = ""               # TLS 가 안 켜진 이유(사람에게 보여줄 한 줄)
 
 
 def fishing_room_of(uid):
@@ -2413,17 +2537,28 @@ def web_build_tls():
     붙지 않는다). **1.2로 고정한다** — 연결마다 수신 스레드와 송신 스레드가 한
     소켓을 나눠 쓰므로, 1.3의 핸드셰이크 후 메시지가 record layer를 깨는 문제를
     이미 겪었다(_pin_tls12 의 설명과 같은 이유, 같은 구조)."""
+    global _web_tls_why
     cert, key = CONFIG["web_certfile"], CONFIG["web_keyfile"]
     if not cert or not key:
+        missing = "web_certfile" if not cert else "web_keyfile"
+        _web_tls_why = f"{missing} 가 비어 있습니다"
         return None
+    for label, path in (("web_certfile", cert), ("web_keyfile", key)):
+        if not os.path.isfile(path):
+            # 경로 오타는 **가장 흔한 사고**이고, 그대로 두면 평문 ws 로 열려
+            # 브라우저가 조용히 못 붙는다. 어디가 틀렸는지 정확히 말한다.
+            _web_tls_why = f"{label} 경로에 파일이 없습니다: {path}"
+            return None
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(cert, key)
     except Exception as e:
-        log(f"[웹 TLS] 인증서를 읽지 못했습니다: {e}")
+        _web_tls_why = f"인증서를 읽지 못했습니다: {e}"
+        log(f"[웹 TLS] {_web_tls_why}")
         return None
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     _pin_tls12(ctx)
+    _web_tls_why = ""
     log(f"[웹 TLS] 인증서 적재: {cert}")
     return ctx
 
@@ -2442,15 +2577,25 @@ def web_tls_ctx():
     그때 사람이 서버를 재시작해야 하는 구조라면 어느 날 조용히 만료된다.
     적재에 실패하면 **직전 컨텍스트를 그대로 쓴다** — 갱신 도중의 반쪽 파일을
     읽었다고 서비스를 멈출 이유가 없다."""
-    global WEB_SSL_CTX, _web_cert_sig_seen
-    if not CONFIG["web_certfile"] or not CONFIG["web_keyfile"]:
+    global WEB_SSL_CTX, _web_cert_sig_seen, _web_tls_why
+    cert, key = CONFIG["web_certfile"], CONFIG["web_keyfile"]
+    if not cert or not key:
+        _web_tls_why = ("web_certfile / web_keyfile 이 비어 있습니다"
+                        if not cert and not key else
+                        f"{'web_certfile' if not cert else 'web_keyfile'} 가 비어 있습니다")
         return None
+    global _web_tls_tried
     with _web_cert_lock:
-        sig = _web_cert_sig_now()
-        if WEB_SSL_CTX is None or (sig is not None and sig != _web_cert_sig_seen):
-            ctx = web_build_tls()
-            if ctx is not None:
-                WEB_SSL_CTX, _web_cert_sig_seen = ctx, sig
+        sig = _web_cert_sig_now()          # 파일이 없으면 None
+        if sig == _web_cert_sig_seen and _web_tls_tried:
+            # 파일이 그대로다 — 실었으면 그대로 쓰고, 실패했으면 다시 하지 않는다.
+            # (경로가 틀린 채로 브라우저가 30초마다 재시도하면 같은 오류가 로그를
+            #  가득 채운다. 파일이 생기거나 갱신되면 sig 가 바뀌어 다시 시도된다.)
+            return WEB_SSL_CTX
+        ctx = web_build_tls()
+        _web_tls_tried, _web_cert_sig_seen = True, sig
+        if ctx is not None:
+            WEB_SSL_CTX = ctx              # 실패하면 직전 컨텍스트를 그대로 쓴다
         return WEB_SSL_CTX
 
 
@@ -2526,8 +2671,18 @@ def start_web_relay():
                      name="web-accept").start()
     scheme = "wss" if web_tls_ctx() is not None else "ws"
     if scheme == "ws":
-        log("[웹 TLS] 인증서가 없어 **평문 ws**로 엽니다 — 로컬 개발용이며 "
-            "https 페이지(GitHub Pages)에서는 접속되지 않습니다.")
+        # **이것이 '브라우저에서 연결이 안 된다'의 거의 모든 원인이다.** 평문 ws 는
+        # 서버 쪽에서는 아무 오류 없이 잘 떠 있고, https 로 받은 웹앱만 한쪽에서
+        # 조용히 차단당한다(mixed content). 그래서 무엇을 해야 하는지까지 적는다.
+        log(f"[웹 TLS] 인증서를 못 써서 **평문 ws**로 엽니다 — {_web_tls_why}")
+        log("[웹 TLS] 이 상태로는 https 페이지(GitHub Pages)의 웹앱이 붙지 못합니다"
+            " — 브라우저가 wss:// 를 요구하는데 서버는 ws:// 로 열려 있습니다.")
+        old = find_domiweb_config()
+        if old:
+            log(f"[웹 TLS] 옛 설정이 '{old}' 에 있습니다 — 인증서 경로를 그곳에서"
+                " 가져오려면 domiserver.json 의 web_* 키를 지우고 다시 실행하세요.")
+        log("[웹 TLS] 설정 예: set web_certfile <fullchain.cer 경로>"
+            " / set web_keyfile <cert.key 경로>  (관리 창이면 '설정')")
     log(f"[웹] {scheme}://<호스트>:{CONFIG['web_port']}/ws 로 브라우저를 받습니다"
         f" (중계 ID '{uid}').")
     log(f"[웹] 피제어 PC: {', '.join(CONFIG['web_pcs']) or '(없음)'}   (콘솔: web)")
@@ -2754,18 +2909,39 @@ def cmd_config(_):
 
 
 def cmd_set(args):
+    """설정 한 값 바꾸기.
+
+    **`type(기본값)(입력)` 으로 바꾸면 안 된다(함정):**
+      - `bool("0")` 은 **True** 다 — `set web 0` 이 오히려 켜 버린다.
+      - `list("seoul")` 은 `['s','e','o','u','l']` 이다 — `set web_pcs seoul` 한 번에
+        피제어 PC 목록이 글자 단위로 부서져 그대로 json 에 저장되고, 브라우저는
+        그 망가진 목록을 받는다.
+    그래서 설정 파일을 읽을 때와 **같은 변환기**(_coerce)를 쓴다. 목록은 애초에
+    이 길로 고치지 않는다 — 주인은 `web add` / `web del` 이다."""
     if len(args) < 2:
         return print("사용법: set <키> <값>   (config 로 키 목록 확인)")
-    k, v = args[0], args[1]
+    # 값에 공백이 있을 수 있다(인증서 경로의 'Program Files' 등) — 나머지를 다 붙인다.
+    k, v = args[0], " ".join(args[1:]).strip()
     if k not in DEFAULT_CONFIG:
         return print(f"모르는 키: {k}")
-    try:
-        CONFIG[k] = type(DEFAULT_CONFIG[k])(v)
-    except ValueError:
-        return print(f"'{v}' 는 {k} 에 넣을 수 없습니다.")
+    if isinstance(DEFAULT_CONFIG[k], list):
+        if k == "web_pcs":
+            return print("피제어 PC 목록은 'web add <ID>' / 'web del <ID>' 로 고칩니다.")
+        return print(f"{k} 는 목록이라 여기서 못 고칩니다 —"
+                     f" {os.path.basename(CONFIG_PATH)} 를 직접 편집하세요.")
+    got = _coerce(k, v)
+    if got is None:
+        return print(f"'{v}' 는 {k} 에 넣을 수 없습니다."
+                     + ("  (참/거짓: 1/0, true/false)"
+                        if isinstance(DEFAULT_CONFIG[k], bool) else ""))
+    CONFIG[k] = got
     save_config()
-    print(f"{k} = {CONFIG[k]}"
-          + ("  (포트는 재시작 후 적용)" if k == "port" else ""))
+    hint = ""
+    if k in ("port", "tls", "require_tls", "web", "web_host", "web_port", "web_id"):
+        hint = "  (재시작 후 적용)"
+    elif k in ("web_certfile", "web_keyfile"):
+        hint = "  (다음 브라우저 접속부터 적용)"
+    print(f"{k} = {CONFIG[k]}{hint}")
 
 
 def cmd_addr(_):
@@ -2894,6 +3070,9 @@ CONFIG_HINT = {
     "web_certfile": "브라우저가 신뢰하는 인증서(fullchain) · 비면 평문 ws",
     "web_keyfile": "그 개인키 · 비면 평문 ws",
 }
+
+# 파일 경로를 받는 키 — 넓은 칸 + '찾기' 로 다룬다(설정 창)
+PATH_KEYS = ("web_certfile", "web_keyfile")
 
 
 # === [10-2. 로그 다리 — domiserver.log 가로채기] ===
@@ -4003,6 +4182,21 @@ class ConfigWindow(tk.Toplevel):
                 var = tk.BooleanVar(value=bool(cur))
                 ttk.Checkbutton(box, variable=var).grid(row=i, column=1,
                                                         sticky="w", padx=8)
+            elif key in PATH_KEYS:
+                # 인증서 경로는 90자를 넘는다 — 12칸짜리 칸에 넣게 하면 붙여 넣은
+                # 값이 맞는지 눈으로 확인할 수가 없고, 오타 하나면 평문 ws 로 열려
+                # **브라우저가 조용히 못 붙는다.** 넓게 주고 찾아보기도 붙인다.
+                var = tk.StringVar(value=str(cur))
+                cell = ttk.Frame(box)
+                cell.grid(row=i, column=1, columnspan=2, sticky="we", padx=8)
+                ttk.Entry(cell, textvariable=var, width=64).pack(side="left")
+                ttk.Button(cell, text="찾기", width=6,
+                           command=lambda v=var, k=key: self.pick(v, k)
+                           ).pack(side="left", padx=4)
+                ttk.Label(cell, text=CONFIG_HINT.get(key, ""),
+                          foreground="#666").pack(side="left")
+                self.vars[key] = var
+                continue
             else:
                 var = tk.StringVar(value=str(cur))
                 ttk.Entry(box, textvariable=var, width=12).grid(row=i, column=1,
@@ -4020,6 +4214,20 @@ class ConfigWindow(tk.Toplevel):
         ttk.Button(bar, text="저장", width=10,
                    command=self.save).pack(side="right", padx=4)
 
+    def pick(self, var, key):
+        """인증서·키 파일 고르기. 경로를 손으로 옮겨 적다 틀리는 길을 없앤다."""
+        cur = var.get().strip()
+        start = os.path.dirname(cur) if cur else BASE_DIR
+        kinds = ([("인증서", "*.cer *.crt *.pem"), ("모든 파일", "*.*")]
+                 if key == "web_certfile" else
+                 [("개인키", "*.key *.pem"), ("모든 파일", "*.*")])
+        path = filedialog.askopenfilename(
+            parent=self, title=CONFIG_HINT.get(key, key),
+            initialdir=start if os.path.isdir(start) else BASE_DIR,
+            filetypes=kinds)
+        if path:
+            var.set(os.path.normpath(path))
+
     def save(self):
         changed = []
         for key, var in self.vars.items():
@@ -4027,12 +4235,20 @@ class ConfigWindow(tk.Toplevel):
             if isinstance(default, bool):
                 value = bool(var.get())
             else:
-                try:
-                    value = type(default)(var.get().strip())
-                except ValueError:
+                value = _coerce(key, var.get().strip())
+                if value is None:
                     messagebox.showerror(
                         "설정", f"'{var.get()}' 는 {key} 에 넣을 수 없습니다.",
                         parent=self)
+                    return
+            # 경로는 **저장 전에** 있는지 본다 — 없는 경로를 저장하면 서버는
+            # 조용히 평문 ws 로 열리고, 증상은 "브라우저만 안 붙는다"로 나타난다.
+            if key in PATH_KEYS and value and not os.path.isfile(value):
+                if not messagebox.askokcancel(
+                        "설정", f"{key} 경로에 파일이 없습니다:\n{value}\n\n"
+                        "이대로 저장하면 웹 중계가 평문 ws 로 열려 브라우저"
+                        "(https 페이지)가 접속하지 못합니다.\n\n그래도 저장할까요?",
+                        parent=self):
                     return
             if CONFIG[key] != value:
                 CONFIG[key] = value
