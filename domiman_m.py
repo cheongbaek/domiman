@@ -590,6 +590,16 @@ class DomimanSession:
         파싱해 응답하므로 최대 5초 안팎 걸릴 수 있다(15초 타임아웃 내)."""
         self.send_command("N", "N")
 
+    def cmd_blackout(self):
+        """'취침 모드'(B). 피제어 PC 화면을 암막으로 덮는다 — **낚시·회수는 그대로
+        계속된다**(화면만 가린다). 응답은 상태 없는 에코 ',Z,B'.
+
+        해제는 피제어 PC 앞에서 **사람이 직접 입력**해야 한다(주입 입력으로는
+        안 풀린다 — 그게 이 기능의 요점이다). 그래서 모바일에는 '해제' 짝이
+        없다. 다만 다른 원격 명령이 오면 피제어 측이 암막을 먼저 걷는다
+        (domiman.py `_handle_command`의 `stop_blackout(f"원격 명령 {cmd}")`)."""
+        return self.send_command("B", "B")
+
     def cmd_screenshot(self):
         """'스크린샷'(I). 이미 사진을 기다리는 중이면 보내지 않는다(중복 요청
         방지 — domiman.py on_screenshot과 동일한 정책)."""
@@ -904,14 +914,14 @@ def dispatch_result(session, kind, rest):
        "status": {...}|null,            # 상태 응답(S/V/T/C)일 때
        "tank": [cur,mx]|null,           # N(수량) 응답 또는 수량 방송일 때
        "tank_fail": bool,               # 위와 같되 파싱 실패(",Z,N,fail")
-       "echo": "G"|"P"|"W"|"Q"|"Y"|"I"|null, # 상태 없는 명령 에코일 때
+       "echo": "G"|"P"|"W"|"Q"|"Y"|"B"|"I"|null, # 상태 없는 명령 에코일 때
        "sched_minutes": str|null,       # echo=="Y"에 분 인자가 붙은 경우
        "shot_fail": bool,               # echo=="I"인데 ',Z,I,fail'(캡처 실패)일 때만 true
        "report_text": str|null,         # ev=="report"일 때 로그에 띄울 문장
        "report_status_key": str|null,   # 위와 같이 온 상태문구 키(STATUS_TEXT)
        "report_notify_key": str|null}   # 위와 같이 온 알림 설정 키(NOTIFY_KEYS)
 
-    ※ G/P/W/Q/Y 응답은 domiman.py가 상태 필드 없이 명령 글자만 되돌려주는
+    ※ G/P/W/Q/Y/B 응답은 domiman.py가 상태 필드 없이 명령 글자만 되돌려주는
     '에코'다(예: 시작 성공→',Z,G'). 상태 응답(S/V/T/C)은 첫 필드가 타이머
     숫자라 이 글자들과 겹치지 않으므로 rest[0]로 안전하게 구분된다. 과거엔
     이 분기가 없어 G/P 응답이 parse_status→None으로 버려져, 모바일에서
@@ -931,7 +941,7 @@ def dispatch_result(session, kind, rest):
                 out["shot_fail"] = True
             else:
                 session._begin_shot_wait()
-        elif first in ("G", "P", "W", "Q", "Y"):
+        elif first in ("G", "P", "W", "Q", "Y", "B"):
             out["echo"] = first
             if first == "Y" and len(rest) >= 2:
                 out["sched_minutes"] = rest[1]

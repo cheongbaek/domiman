@@ -41,7 +41,7 @@ data class DomimanEvent(
   val status: DomimanStatus? = null,
   val tank: List<Int>? = null,
   @SerialName("tank_fail") val tankFail: Boolean = false,
-  // 상태 필드 없는 명령 에코("G"/"P"/"W"/"Q"/"Y"/"I"). G/P로 시작/중지 상태를 갱신한다.
+  // 상태 필드 없는 명령 에코("G"/"P"/"W"/"Q"/"Y"/"B"/"I"). G/P로 시작/중지 상태를 갱신한다.
   val echo: String? = null,
   @SerialName("sched_minutes") val schedMinutes: String? = null,
   @SerialName("report_text") val reportText: String? = null,

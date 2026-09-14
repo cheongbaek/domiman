@@ -170,6 +170,8 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
             }
           }
           "Q" -> addLog("원격 프로그램이 종료되었습니다.")
+          // 취침 모드는 화면만 덮는다 — 낚시가 멈춘 것으로 오해하지 않게 함께 적는다.
+          "B" -> addLog("취침 모드로 전환했습니다. 화면만 덮이고 낚시는 계속됩니다.")
           "I" -> {
             if (event.shotFail) {
               shotTimeoutJob?.cancel()
@@ -315,6 +317,13 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
   fun onCollectNow() {
     markPending()
     viewModelScope.launch { repository.sendCollectNow() }
+  }
+
+  /** '취침 모드'(B) — 피제어 PC 화면을 암막으로 덮는다(낚시는 계속).
+   * PC판과 같이 '항상 가능' 그룹이라 응답 대기 중에만 잠긴다. */
+  fun onBlackout() {
+    markPending()
+    viewModelScope.launch { repository.sendBlackout() }
   }
 
   /** '실시간 수량확인'(N). */

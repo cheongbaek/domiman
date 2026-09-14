@@ -402,6 +402,11 @@ class DomimanRepository(context: Context) {
 
   suspend fun sendTankQuery() = cmd("cmd_tank_query")
 
+  /** '취침 모드'(B) — 피제어 PC 화면을 암막으로 덮는다. **낚시·회수는 계속된다.**
+   * 해제 짝은 없다: 그 PC 앞에서 사람이 직접 입력해야 풀린다(주입 입력으로는 안
+   * 풀리는 것이 이 기능의 요점). 다른 원격 명령을 보내면 피제어 측이 먼저 걷는다. */
+  suspend fun sendBlackout() = cmd("cmd_blackout")
+
   /** '스크린샷'(I) 요청. 이미 사진을 기다리는 중이면 파이썬이 보내지 않고
    * false를 돌려준다(cmd_screenshot의 중복 요청 방지 그대로). */
   suspend fun sendScreenshot(): Boolean =

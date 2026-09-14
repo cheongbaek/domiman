@@ -7,6 +7,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
@@ -184,6 +185,16 @@ fun MainScreen(
       OutlinedButton(onClick = onToggleDark, modifier = Modifier.weight(1f)) {
         Text(if (isDark) "화이트모드" else "다크모드")
       }
+    }
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+      // 취침 모드(B) — 피제어 PC 화면만 덮고 낚시는 계속된다. 해제는 그 PC 앞에서
+      // 사람이 직접 입력해야 하므로 앱에는 '해제' 짝을 두지 않는다.
+      OutlinedButton(
+        onClick = viewModel::onBlackout,
+        enabled = controlsEnabled,
+        modifier = Modifier.weight(1f),
+      ) { Text("취침 모드") }
+      Spacer(Modifier.weight(1f))
     }
 
     Row(verticalAlignment = Alignment.CenterVertically) {
