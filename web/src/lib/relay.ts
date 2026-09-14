@@ -34,17 +34,6 @@ export type PcState = {
   reason: string;
 };
 
-/** 방 목록 한 줄 — domiserver `rooms_snapshot()` 그대로. */
-export type RoomRow = {
-  name: string;
-  kind: "open" | "pw" | "allow" | "approve";
-  owner: string | null;
-  created: number;
-  allowed: boolean;      // 추가 절차 없이 바로 들어갈 수 있는지
-  blocked?: boolean;
-  waiting?: boolean;     // 사후 승인 방에 요청을 넣어 둔 상태
-};
-
 export type RelayEvent =
   | { t: "link"; state: "connecting" | "open" | "closed"; msg?: string }
   | { t: "ready"; my_id: string; pcs: string[]; connected: boolean; chat?: boolean;
@@ -56,21 +45,7 @@ export type RelayEvent =
   | ({ t: "pc"; pc: string } & PcState)
   | { t: "up"; connected: boolean; msg?: string }
   | { t: "shot"; pc: string; ok: boolean; name?: string; b64?: string; reason?: string }
-  | { t: "err"; msg: string }
-  // --- 채팅 (domiweb 260913a) ---
-  | { t: "rooms"; list: RoomRow[] }
-  | { t: "room"; room: string;
-      state: "joined" | "denied" | "closed" | "deleted" | "kicked" | "member"
-           | "approve_res";
-      kind?: string; owner?: string | null; reason?: string; msg?: string;
-      id?: string; in?: boolean; ok?: boolean }
-  | { t: "chat"; room: string; from: string; body: string; mid?: string; ts?: number;
-      cid?: string }
-  | { t: "chat_img"; room: string; from: string; fid: string; name: string;
-      ts: number; b64: string }
-  | { t: "chat_hist"; room: string; items: { room: string; from: string; body: string;
-      mid?: string; ts?: number }[] }
-  | { t: "chat_err"; room: string; msg: string };
+  | { t: "err"; msg: string };
 
 // domiweb 쪽과 같은 백오프(1·2·5·10·30초). 휴대폰이 절전에서 깨어날 때는
 // wake()가 즉시 재연결시키므로 이 표는 '서버가 죽었을 때'의 간격이다.
@@ -82,10 +57,6 @@ export class Relay {
   private idx = 0;
   private closed = false;
   private pc = "";
-  /** 열어 둔 채팅방 -> 입력했던 비밀번호(있으면). **메모리에만 둔다** —
-   *  domichat은 '구독한 방만 비번을 기억'하고 웹에는 구독이 없다. 끊겼다 붙을 때
-   *  같은 방에 말없이 다시 들어가기 위한 것이다. */
-  private rooms = new Map<string, string | undefined>();
 
   constructor(private url: string, private onEvent: (e: RelayEvent) => void) {}
 
@@ -109,9 +80,6 @@ export class Relay {
       this.idx = 0;
       this.onEvent({ t: "link", state: "open" });
       if (this.pc) this.send({ t: "select", pc: this.pc });
-      // 보던 방에 다시 들어간다. 중계가 그 방에 그대로 있었다면 곧바로 joined가
-      // 오고, 마지막 사람이 나가 방을 떠났었다면 비번으로 다시 입장한다.
-      for (const [room, pw] of this.rooms) this.send({ t: "room_open", room, pw });
     };
     ws.onmessage = (ev) => {
       if (typeof ev.data !== "string") return;
@@ -183,40 +151,6 @@ export class Relay {
 
   delPc(pc: string) {
     this.send({ t: "del_pc", pc });
-  }
-
-  // ---------- 채팅 ----------
-  roomsAsk() {
-    this.send({ t: "rooms" });
-  }
-
-  roomOpen(room: string, pw?: string) {
-    this.rooms.set(room, pw);
-    return this.send({ t: "room_open", room, pw });
-  }
-
-  roomClose(room: string) {
-    this.rooms.delete(room);
-    this.send({ t: "room_close", room });
-  }
-
-  /** 입장이 거절됐거나 방이 사라졌다 — 재접속 때 다시 들어가려 하지 않게 지운다. */
-  roomForget(room: string) {
-    this.rooms.delete(room);
-  }
-
-  chat(room: string, body: string, cid: string): boolean {
-    return this.send({ t: "chat", room, body, cid });
-  }
-
-  /** 이미지 청크는 크다 — 소켓 버퍼가 부푸는 동안 잠깐 쉰다(모바일 회선 보호). */
-  async drain(limit = 1024 * 1024): Promise<boolean> {
-    for (let i = 0; i < 600; i += 1) {
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
-      if (this.ws.bufferedAmount <= limit) return true;
-      await new Promise((r) => window.setTimeout(r, 50));
-    }
-    return false;
   }
 
   stop() {
