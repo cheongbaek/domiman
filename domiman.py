@@ -619,7 +619,6 @@ def send_report(code):
     chat_send(f",Z,F,{code}")
 
 
-
 # ============================================================
 # [2-1. 버전 확인 + 수동 업데이트 (GitHub raw 파일)]
 # ------------------------------------------------------------
@@ -633,7 +632,7 @@ def send_report(code):
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260911a"
+APP_VERSION = "260925a"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -682,30 +681,81 @@ def apply_update_and_restart(new_source):
 # ============================================================
 # [3. 좌표 및 설정 — 전부 FHD(1920x1080) 기준 (낚시.py와 동일)]
 # ============================================================
-COORD_FISHING_BTN = (1086, 988)   # 낚시 취소/시작 토글
-COORD_TANK_BTN = (1007, 1006)     # 살림망 확인
-COORD_MYROOM_BTN = (1138, 245)    # 마이룸 보내기
-COORD_CONFIRM_BTN = (958, 575)    # 확인(팝업)
-REGION_FISHING_BTN = (1040, 983, 88, 40)   # 위 버튼 글자('취소'/'시작' 부분매칭, 실측+여유)
+# **좌표는 지금도 전부 FHD 기준으로 적는다.** 게임이 다른 해상도로 렌더해도
+# `layout_point`/`layout_region`이 아래 '앵커 계열'에 따라 그 해상도의 좌표로
+# 옮겨 준다(260925a 실측). 계열은 둘뿐이다:
+#
+#   "popup" = 살림망·퀴즈·확인·미끼/낚싯대 리스트 등 **팝업 창**.
+#             크기가 고정이고 **화면 중앙**에 붙는다. UI 배율의 영향을 안 받는다.
+#   "hud"   = 하단 낚시 패널처럼 **화면 가장자리**에 붙는 것.
+#             화면 하단중앙 기준이며 위치·크기 모두 UI 배율 s배가 된다.
+#
+# 근거·실측표는 CLAUDE.md `## 🖥 다해상도 지원` 절 참고(권위 문서).
+# **새 좌표를 추가할 때 anchor를 빼먹지 말 것** — 기본값 "popup"이라
+# HUD 좌표를 그냥 적으면 1080이 아닌 높이에서 조용히 어긋난다.
 
-REGION_Q_LEFT = (742, 406, 78, 69)
-REGION_Q_RIGHT = (830, 407, 78, 69)
-REGION_ANSWERS = (972, 433, 226, 296)
-REGION_VERIFY_TEXT = (832, 503, 255, 38)
 
-REGION_TANK_QTY = (825, 989, 130, 36)   # 살림망 수량 'cur/max'
-REGION_MIN_TIME = (940, 916, 72, 34)    # 최소 획득 시간 'n초'
-REGION_MAX_TIME = (1035, 916, 80, 34)   # 최대 획득 시간 'n초' (만료 교차 확인용)
+class _Anchored(tuple):
+    """FHD 좌표/영역 + 앵커 계열. 값 자체는 평범한 튜플이라 인덱싱·언패킹 등
+    기존 코드는 손대지 않아도 그대로 동작한다."""
+
+    anchor = "popup"
+
+    def __new__(cls, *vals, **kw):
+        obj = tuple.__new__(cls, vals)
+        obj.anchor = kw.get("anchor", "popup")
+        return obj
+
+
+def Pt(x, y, anchor="popup"):
+    """클릭 좌표(FHD 기준) + 앵커."""
+    return _Anchored(x, y, anchor=anchor)
+
+
+def Rg(x, y, w, h, anchor="popup"):
+    """인식 영역(FHD 기준) + 앵커."""
+    return _Anchored(x, y, w, h, anchor=anchor)
+
+
+def anchor_of(t):
+    """튜플에 붙은 앵커. 안 붙어 있으면 "popup"(팝업이 압도적으로 많다)."""
+    return getattr(t, "anchor", "popup")
+
+
+COORD_FISHING_BTN = Pt(1086, 988, "hud")   # 낚시 취소/시작 토글
+COORD_TANK_BTN = Pt(1007, 1006, "hud")     # 살림망 확인
+COORD_MYROOM_BTN = Pt(1138, 245)           # 마이룸 보내기
+# 확인(팝업). **지금은 클릭하지 않는다** — 회수 성공 뒤에는 Enter 한 번으로
+# 대신한다(260925c). 좌표 자체는 되돌릴 때를 위해 남겨 둔다(5해상도 실측 완료).
+COORD_CONFIRM_BTN = Pt(958, 575)
+REGION_FISHING_BTN = Rg(1040, 983, 88, 40, "hud")   # 위 버튼 글자('취소'/'시작' 부분매칭, 실측+여유)
+
+REGION_Q_LEFT = Rg(742, 406, 78, 69)
+REGION_Q_RIGHT = Rg(830, 407, 78, 69)
+REGION_ANSWERS = Rg(972, 433, 226, 296)
+REGION_VERIFY_TEXT = Rg(832, 503, 255, 38)
+
+REGION_TANK_QTY = Rg(825, 989, 130, 36, "hud")   # 살림망 수량 'cur/max'
+REGION_MIN_TIME = Rg(940, 916, 72, 34, "hud")    # 최소 획득 시간 'n초'
+REGION_MAX_TIME = Rg(1035, 916, 80, 34, "hud")   # 최대 획득 시간 'n초' (만료 교차 확인용)
 TANK_COLLECT_MARGIN = 5                 # 회수 조건: cur >= max - 5 (가득차기 5칸 전)
 
 # --- 미끼 자동 교체 ---
-REGION_NO_BAIT = (890, 499, 142, 36)      # '미끼가 부족합니다' 팝업
-COORD_BAIT_LIST_BTN = (903, 913)          # 보유 미끼 리스트 열기(직접 진입, 실측)
-COORD_BAIT_NEXT_BTN = (1291, 565)         # 다음 페이지 화살표
-REGION_BAIT_NAMES = (640, 483, 640, 202)  # 카드 이름 바 8칸(2행x4열)
+REGION_NO_BAIT = Rg(890, 499, 142, 36)      # '미끼가 부족합니다' 팝업
+COORD_BAIT_LIST_BTN = Pt(903, 913, "hud")   # 보유 미끼 리스트 열기(직접 진입, 실측)
+# 다음/이전 페이지 화살표. **1291 -> 1296으로 옮겼다(260925b 실측):** 실제
+# 삼각형 중심은 화면중앙 기준 dx=+335.5(=FHD 1295.5)인데 옛 값은 +331이라
+# 22px짜리 버튼의 **왼쪽 꼭짓점 가장자리**에 걸쳤다(들어가긴 해서 동작은 했다).
+# 이전(◀)은 지금 쓰지 않지만 실측으로 확정된 값이라 같이 남긴다.
+COORD_BAIT_NEXT_BTN = Pt(1296, 565)
+COORD_BAIT_PREV_BTN = Pt(620, 565)
+REGION_BAIT_NAMES = Rg(640, 483, 640, 202)  # 카드 이름 바 8칸(2행x4열)
+# 실측 격자는 완전히 규칙적이다(열 간격 163, 행 간격 156.5 — 260925b, 5해상도).
+# 옛 값은 손으로 잰 것이라 최대 6px 흔들렸는데(1행 4열), 버튼이 60x23이라
+# 그래도 안쪽이었다. 규칙값으로 정리해 여유를 늘려 둔다.
 BAIT_USE_BTNS = [
-    [(708, 544), (874, 543), (1038, 540), (1209, 541)],
-    [(714, 702), (877, 699), (1042, 702), (1201, 701)],
+    [Pt(714, 542), Pt(877, 542), Pt(1040, 542), Pt(1203, 542)],
+    [Pt(714, 699), Pt(877, 699), Pt(1040, 699), Pt(1203, 699)],
 ]
 BAIT_COL_X = (715, 878, 1041, 1204)
 BAIT_NAME_ROW_Y = (503, 660)
@@ -737,7 +787,7 @@ BAIT_TARGET_PATTERN = (r"[금급].?지[렁렇령런랑]"
 BAIT_MAX_PAGE_MOVES = 4
 
 # --- 낚싯대 자동 교체 ---
-COORD_ROD_LIST_BTN = (814, 917)             # 보유 낚싯대 리스트 열기(직접 진입, 실측)
+COORD_ROD_LIST_BTN = Pt(814, 917, "hud")    # 보유 낚싯대 리스트 열기(직접 진입, 실측)
 # '매직 스타 낚싯대'/'푸른 장미검 낚싯대'를 찾는 패턴. 조각 중 하나라도 걸리면
 # 채택한다. 260909a에 보유 낚싯대 7종을 전처리 12가지로 읽어 오인식을 전수
 # 수집해 OR을 넓혔다(적중 12/12·12/12, 오검출 0/60):
@@ -757,12 +807,43 @@ ROD_TARGET_PATTERN = (r"스타"
                       r"|[푸무꾸][른튼름슨촌릎]")
 
 # --- 접속 끊김 감지 ---
-REGION_DISCONNECT = (769, 386, 258, 40)     # '서버와 접속이 끊어졌습니다.'
+# ⚠️ **다른 해상도에서 실제로 찍어 보지 못한 유일한 영역이다(260925c).**
+# 해상도마다 인터넷을 끊어 가며 띄울 수가 없어, 같은 엔진의 다른 시스템
+# 다이얼로그('확인' 팝업 — 5해상도 실측 완료)와 같은 팝업 계열로 간주하고
+# FHD 실측값을 그대로 둔다. 판정이 부분매칭('서버와')이라 조금 어긋나도
+# 읽히긴 하지만, **접속 끊김을 못 잡는 증상이 보이면 여기부터 의심할 것.**
+REGION_DISCONNECT = Rg(769, 386, 258, 40)   # '서버와 접속이 끊어졌습니다.'
 
 GAME_KEYWORD = "tales runner"
 WGC_WINDOW_NAME = "Tales Runner"
 GAME_HWND = None
-CURRENT_RESOLUTION = None    # "1080p" | "1440p" | None
+
+# --- 지원 해상도 ---
+# 게임 '화면 설정'에서 고르는 **렌더 해상도**가 좌표 레이아웃을 정한다.
+# key: 원격 프로토콜(V)·상태 문자열에 실려 나가는 값. 옛 "1080"/"1440"은
+#      그대로 둔다 — 안드로이드 앱이 이 두 값을 알고 있어서다(바꾸면 앱도
+#      같이 고쳐 다시 빌드해야 한다).
+# force_capture: None이면 캡처 방식은 모니터를 보고 자동으로 정한다.
+#      "1440"(늘린 FHD)만 WGC를 강제한다 — 옛 동작 그대로.
+RES_PRESETS = [
+    # key,          label,                    render_w, render_h, force_capture
+    ("1080",      "1920 x 1080",              1920, 1080, None),
+    ("1440",      "2560 x 1440 (늘린 FHD)",   1920, 1080, "wgc"),
+    ("1760x990",  "1760 x 990",               1760,  990, None),
+    ("1680x1050", "1680 x 1050",              1680, 1050, None),
+    ("1280x1024", "1280 x 1024",              1280, 1024, None),
+    ("1280x960",  "1280 x 960",               1280,  960, None),
+    ("1024x768",  "1024 x 768",               1024,  768, None),
+]
+RES_BY_KEY = {p[0]: p for p in RES_PRESETS}
+# 자동 감지가 후보로 삼는 **렌더** 해상도들(2560x1440은 게임의 렌더 해상도가
+# 아니라 '늘린 FHD'라 여기 넣지 않는다 — 넣으면 늘린 FHD를 네이티브 QHD로
+# 오인해 레이아웃이 통째로 어긋난다).
+RENDER_CANDIDATES = [(1920, 1080), (1760, 990), (1680, 1050),
+                     (1280, 1024), (1280, 960), (1024, 768)]
+
+CURRENT_RESOLUTION = None    # RES_PRESETS의 key. None이면 미설정
+CAPTURE_MODE = "wgc"         # "direct"(pyautogui 화면 캡처) | "wgc"(창 직접 캡처)
 
 reader = None                # easyocr Reader (백그라운드 로드)
 
@@ -819,7 +900,7 @@ def set_status(key):
 # [5. WGC 백그라운드 캡처 (낚시.py 이식)]
 # ============================================================
 class GameCapture:
-    """WGC로 게임 창을 연속 캡처, 최신 프레임 보관. get_frame_1080()이 축소본 반환."""
+    """WGC로 게임 창을 연속 캡처, 최신 프레임 보관. get_frame_render()가 축소본 반환."""
 
     def __init__(self, window_name):
         self.window_name = window_name
@@ -873,12 +954,20 @@ class GameCapture:
             abort_sleep(0.1)
         return False
 
-    def get_frame_1080(self):
+    def get_frame_render(self):
+        """게임 **렌더 해상도**로 맞춘 프레임(BGR). 없으면 None.
+
+        260925c 전에는 무조건 1920x1080으로 줄였다. 4:3·5:4·16:10 해상도에서는
+        그 축소가 화면을 찌그러뜨려(예: 1280x1024 -> 1920x1080) 좌표가 통째로
+        어긋난다. FHD·늘린 QHD에서는 결과가 예전과 같다(렌더가 1920x1080)."""
         with self._lock:
             raw = self._latest
         if raw is None:
             return None
-        return cv2.resize(raw, (1920, 1080), interpolation=cv2.INTER_AREA)
+        rw, rh = render_size()
+        if raw.shape[1] == rw and raw.shape[0] == rh:
+            return raw
+        return cv2.resize(raw, (rw, rh), interpolation=cv2.INTER_AREA)
 
     def get_frame_raw(self):
         """축소하지 않은 원본 프레임(BGR). **작은 글자를 OCR할 때 쓴다** —
@@ -921,19 +1010,63 @@ def _pick_game_hwnd(keyword=GAME_KEYWORD):
     return max(pool, key=lambda x: x[2] * x[3])[0]
 
 
-def _monitor_scale_is_100(hmon):
+def _monitor_dpi(hmon):
+    """모니터의 DPI(96=100%). 못 얻으면 96."""
     try:
         dpi_x = ctypes.c_uint()
         dpi_y = ctypes.c_uint()
         ctypes.windll.shcore.GetDpiForMonitor(
             int(hmon), 0, ctypes.byref(dpi_x), ctypes.byref(dpi_y))
-        return dpi_x.value == 96
+        return int(dpi_x.value) or 96
     except Exception:
-        return True
+        return 96
 
 
-def detect_resolution(keyword=GAME_KEYWORD):
-    """게임 창이 있는 모니터로 모드 판별. (mode, mw, mh, is_primary) 또는 None."""
+def _estimate_render_resolution(cw, ch, dpi_scale):
+    """클라이언트 크기 + 모니터 배율로 **게임 렌더 해상도**를 추정.
+    ((w, h), 근거문자열) 또는 (None, 사유).
+
+    **왜 배율로 나눠 보는가(중요):** 게임은 DPI-unaware라 고배율 모니터에서
+    창이 OS에 의해 통째로 확대된다. 우리 프로세스는 Per-Monitor v2라
+    `GetClientRect`가 **물리 픽셀**을 주므로, 1024x768로 렌더하는 게임이
+    150% 모니터에서는 1536x1152로 잡힌다. 그래서 배율로 나눈 값도 후보에
+    넣는다 — 이게 '작은 해상도 + 고배율' 조합을 살리는 핵심이다.
+    배율이 1이 아니면 **배율 해석을 먼저** 본다(위 가상화가 기본 동작이라).
+
+    크기로 못 맞추면 **화면비**로 고른다(전체화면에서 늘어난 경우).
+    늘린 QHD(2560x1440)가 여기로 떨어져 1920x1080으로 잡히는 것이 노림수다."""
+    if not cw or not ch:
+        return None, "창 크기를 읽지 못했습니다"
+    ks = ([(dpi_scale, 0), (1.0, 1)] if abs(dpi_scale - 1.0) > 0.01
+          else [(1.0, 0)])
+    best = None
+    for rw, rh in RENDER_CANDIDATES:
+        for k, rank in ks:
+            err = abs(cw - rw * k) + abs(ch - rh * k)
+            cand = (err, rank, -(rw * rh), rw, rh, k)
+            if best is None or cand < best:
+                best = cand
+    err, _rank, _a, rw, rh, k = best
+    if err <= max(6.0, 0.012 * (cw + ch)):
+        note = f"창 {cw}x{ch} = {rw}x{rh} x{k:.2f}"
+        return (rw, rh), note
+
+    ar = cw / float(ch)
+    group = [p for p in RENDER_CANDIDATES if abs(p[0] / float(p[1]) - ar) < 0.02]
+    if group:
+        rw, rh = min(group, key=lambda p: abs(p[0] - cw))
+        return (rw, rh), f"창 {cw}x{ch} 화면비 {ar:.3f} -> {rw}x{rh}(늘림 추정)"
+    return None, f"창 {cw}x{ch}(화면비 {ar:.3f})에 맞는 해상도가 없습니다"
+
+
+def _monitor_env(keyword=GAME_KEYWORD):
+    """게임 창이 놓인 모니터 정보 + 캡처 방식.
+    (hwnd, mw, mh, is_primary, dpi, native_fhd, capture) 또는 None.
+
+    **캡처 방식은 모니터로만 정한다** — 주 모니터 1920x1080 100%면 화면을
+    pyautogui로 바로 찍어도 되고(옛 '1080p'), 그 밖이면 WGC로 창을 직접 잡는다
+    (옛 '1440p'). 창 클라이언트 크기는 DPI 가상화 때문에 튀므로 여기 근거로
+    쓰지 않는다(본문 [해상도 자동 감지] 절)."""
     hwnd = _pick_game_hwnd(keyword)
     if hwnd is None:
         return None
@@ -943,11 +1076,59 @@ def detect_resolution(keyword=GAME_KEYWORD):
         ml, mt, mr, mb = mi['Monitor']
         mw, mh = mr - ml, mb - mt
         is_primary = bool(mi['Flags'] & win32con.MONITORINFOF_PRIMARY)
+        dpi = _monitor_dpi(hmon)
     except Exception:
         return None
-    if is_primary and mw == 1920 and mh == 1080 and _monitor_scale_is_100(hmon):
-        return "1080p", mw, mh, is_primary
-    return "1440p", mw, mh, is_primary
+    native_fhd = (is_primary and mw == 1920 and mh == 1080 and dpi == 96)
+    capture = "direct" if native_fhd else ("wgc" if _WGC_AVAILABLE else "direct")
+    return hwnd, mw, mh, is_primary, dpi, native_fhd, capture
+
+
+def detect_capture_mode(keyword=GAME_KEYWORD):
+    """캡처 방식만 감지("direct"|"wgc"). 창을 못 찾으면 None.
+    해상도를 **수동으로** 고를 때도 이것만은 자동으로 맞춰 주기 위함이다 —
+    사용자가 고르는 것은 게임 렌더 해상도이지 캡처 방식이 아니다."""
+    env = _monitor_env(keyword)
+    return env[6] if env else None
+
+
+def detect_resolution(keyword=GAME_KEYWORD):
+    """게임 창을 보고 (res_key, capture_mode, 설명) 추정. 실패하면 None.
+
+    **두 가지를 따로 정한다(260925c — 예전엔 하나로 뭉쳐 있었다):**
+      · `res_key`      = 게임 **렌더 해상도**. 좌표 레이아웃을 정한다.
+                         창 크기와 모니터 배율로 추정한다.
+      · `capture_mode` = 화면을 어떻게 읽을지. 예전 '1080p/1440p'가 실제로는
+                         이것이었다. **모니터**로만 정한다 — 주 모니터
+                         1920x1080 100%면 pyautogui로 화면을 바로 찍어도
+                         되고(=옛 1080p), 그 밖이면 WGC로 창을 직접 잡는다.
+
+    모니터 기반 판정을 유지하는 이유는 본문 [해상도 자동 감지] 절 그대로다 —
+    창 클라이언트 크기는 DPI 가상화 때문에 튀므로 캡처 방식의 근거로 못 쓴다.
+    (렌더 해상도 추정에는 쓰되, 배율 해석을 같이 넣어 그 흔들림을 흡수한다.)"""
+    env = _monitor_env(keyword)
+    if env is None:
+        return None
+    hwnd, mw, mh, is_primary, dpi, native_fhd, capture = env
+
+    geo = _client_geometry_of(hwnd)
+    cw, ch = (geo[2], geo[3]) if geo else (0, 0)
+    size, note = _estimate_render_resolution(cw, ch, dpi / 96.0)
+    if size is None:
+        # 창 크기를 못 믿을 상황(최소화 등) — 모니터만으로 옛 판정을 따른다.
+        key = "1080" if native_fhd else "1440"
+        note = f"{note}; 모니터 기준 폴백"
+    elif size == (1920, 1080):
+        # FHD 렌더는 '그대로'와 '늘린 QHD' 둘 다 가능하다. 캡처 방식으로 가른다
+        # (라벨·원격 프로토콜을 옛 두 값 그대로 유지하기 위함).
+        key = "1080" if capture == "direct" else "1440"
+    else:
+        key = f"{size[0]}x{size[1]}"
+        if key not in RES_BY_KEY:
+            key = "1080"
+    loc = "주 모니터" if is_primary else "보조 모니터"
+    desc = f"{loc} {mw}x{mh} @{dpi * 100 // 96}% / {note}"
+    return key, capture, desc
 
 
 def _client_geometry_of(hwnd):
@@ -1003,64 +1184,145 @@ def _note_client_geometry(geo):
     print(f"[좌표] 게임 창 클라이언트 ({ox},{oy}) {cw}x{ch} 기준으로 변환합니다.")
 
 
-def _fhd_region_to_client(region):
+def render_size():
+    """현재 설정된 게임 **렌더 해상도** (w, h). 미설정이면 FHD로 본다."""
+    p = RES_BY_KEY.get(CURRENT_RESOLUTION)
+    return (p[2], p[3]) if p else (1920, 1080)
+
+
+def ui_scale(rw=None, rh=None):
+    """게임 HUD의 UI 배율. 1280x960보다 작은 화면에서만 1 미만이 된다
+    (실측: 1024x768 = 0.8, 나머지 지원 해상도는 전부 1.0 — 260925a).
+    **800x600처럼 더 작은 해상도를 추가하면 반드시 다시 실측할 것** —
+    관측 6개로는 W/1280·H/960 중 무엇이 지배하는지 가릴 수 없었다."""
+    if rw is None or rh is None:
+        rw, rh = render_size()
+    return min(1.0, rw / 1280.0, rh / 960.0)
+
+
+def layout_point(fx, fy, anchor="popup"):
+    """FHD 기준 좌표 -> **렌더 해상도** 기준 좌표 (1단계).
+
+    FHD 렌더면 항등이라 260828a까지 검증된 좌표·동작이 글자 그대로 보존된다.
+    (늘린 QHD도 렌더는 FHD라 여기서는 아무 일도 하지 않는다.)"""
+    rw, rh = render_size()
+    if anchor == "hud":
+        s = ui_scale(rw, rh)
+        return (rw / 2.0 + (fx - 960.0) * s, rh - (1080.0 - fy) * s)
+    return (rw / 2.0 + (fx - 960.0), rh / 2.0 + (fy - 540.0))
+
+
+def layout_region(region, anchor=None):
+    """FHD 기준 (x,y,w,h) -> 렌더 해상도 기준 (x,y,w,h). 크기는 HUD만 배율이 붙는다
+    (팝업은 어느 해상도에서도 절대 픽셀 크기가 같다 — 260925a/b 실측)."""
+    if anchor is None:
+        anchor = anchor_of(region)
+    x, y, w, h = region[0], region[1], region[2], region[3]
+    rx, ry = layout_point(x, y, anchor)
+    if anchor == "hud":
+        s = ui_scale()
+        return (rx, ry, w * s, h * s)
+    return (rx, ry, float(w), float(h))
+
+
+def _region_to_client(region):
     """FHD 기준 (x,y,w,h)를 실제 화면 기준 (x,y,w,h)로. 창을 못 찾으면 None.
-    to_screen과 같은 변환이라 클릭 자리와 자르는 자리가 항상 함께 움직인다."""
+    to_screen과 같은 2단 변환이라 클릭 자리와 자르는 자리가 항상 함께 움직인다."""
     geo = _client_geometry()
     if geo is None:
         return None
     ox, oy, cw, ch = geo
-    x, y, w, h = region
-    sx, sy = cw / 1920.0, ch / 1080.0
-    return (int(ox + x * sx), int(oy + y * sy),
-            max(1, int(round(w * sx))), max(1, int(round(h * sy))))
+    rw, rh = render_size()
+    rx, ry, rgw, rgh = layout_region(region)
+    sx, sy = cw / float(rw), ch / float(rh)
+    return (int(ox + rx * sx), int(oy + ry * sy),
+            max(1, int(round(rgw * sx))), max(1, int(round(rgh * sy))))
+
+
+def _crop_frame(frame, region):
+    """캡처 원본 프레임에서 FHD 기준 region에 해당하는 조각을 잘라 낸다(BGR).
+    프레임 크기가 렌더 해상도와 달라도(늘린 QHD 등) 비율로 환산한다."""
+    if frame is None or not frame.size:
+        return None
+    rw, rh = render_size()
+    fh, fw = frame.shape[:2]
+    rx, ry, rgw, rgh = layout_region(region)
+    sx, sy = fw / float(rw), fh / float(rh)
+    x0, x1 = int(round(rx * sx)), int(round((rx + rgw) * sx))
+    y0, y1 = int(round(ry * sy)), int(round((ry + rgh) * sy))
+    crop = frame[max(0, y0):max(0, y1), max(0, x0):max(0, x1)]
+    return crop if crop.size else None
+
+
+def _grab_full_client_rgb():
+    """게임 창 클라이언트 전체를 화면에서 찍어 RGB로. 실패 시 None."""
+    geo = _client_geometry()
+    if geo is None:
+        return None
+    ox, oy, cw, ch = geo
+    try:
+        return np.array(pyautogui.screenshot(region=(ox, oy, cw, ch)))
+    except Exception:
+        return None
 
 
 def grab_region_rgb(region):
     """FHD 좌표 region의 화면 조각을 RGB numpy로. 실패 시 None.
 
-    1080p 모드는 화면을 직접 찍는데(pyautogui), **찍을 자리도 창을 따라가야
+    direct 모드는 화면을 직접 찍는데(pyautogui), **찍을 자리도 창을 따라가야
     한다(260828a)** — 예전엔 FHD 좌표를 화면 좌표로 그대로 써서 창이 움직이면
     엉뚱한 자리를 잘랐다(퀴즈 인식·성공 판정이 조용히 실패하는 원인). 클릭과
     같은 변환을 쓰므로 창이 (0,0)에 1920x1080으로 있으면 예전과 완전히 같은
     영역이 나온다. 창을 못 찾으면 예전 동작(화면 절대좌표)으로 폴백.
 
+    wgc 모드는 **원본 프레임에서 바로 자른다(260925c)** — 예전엔 1920x1080으로
+    줄인 뒤 잘랐는데, 4:3·5:4·16:10 해상도에서는 그 축소가 화면을 찌그러뜨려
+    좌표가 통째로 어긋난다. 감시 모드(`_watch_grab_region`)가 260815c부터
+    쓰던 방식과 같아졌고, 덤으로 QHD에서 글자가 더 선명해진다.
+
     잘라낸 크기는 환산된 그대로 둔다(FHD 크기로 되돌리지 않는다) —
-    `_watch_grab_region`도 원본 배율로 자르고, 호출부(윤곽선 매칭·OCR·잉크 폭)는
-    전부 크롭 실제 크기로 정규화하도록 되어 있다."""
-    x, y, w, h = region
-    if CURRENT_RESOLUTION == "1080p":
-        shot = pyautogui.screenshot(region=_fhd_region_to_client(region) or region)
-        return np.array(shot)
-    frame = game_capture.get_frame_1080() if game_capture else None
-    if frame is None:
-        return None
-    crop = frame[y:y + h, x:x + w]
-    if crop.size == 0:
+    호출부(윤곽선 매칭·OCR·잉크 폭)는 전부 크롭 실제 크기로 정규화한다."""
+    if CAPTURE_MODE == "direct":
+        box = _region_to_client(region)
+        if box is None:
+            rx, ry, rgw, rgh = layout_region(region)
+            box = (int(rx), int(ry), max(1, int(rgw)), max(1, int(rgh)))
+        try:
+            return np.array(pyautogui.screenshot(region=box))
+        except Exception:
+            return None
+    frame = game_capture.get_frame_raw() if game_capture else None
+    crop = _crop_frame(frame, region)
+    if crop is None:
         return None
     return cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
 
 
 def to_screen(coords):
-    """FHD(1920x1080) 기준 좌표 -> 실제 화면 좌표. **FHD/QHD 공통 경로**.
+    """FHD(1920x1080) 기준 좌표 -> 실제 화면 좌표. **모든 모드 공통 경로**.
 
-    260828a 전까지 1080p 모드는 이 변환을 건너뛰고 FHD 좌표를 그대로 화면
+    2단이다(260925c):
+      ① 레이아웃  FHD -> 게임 렌더 해상도 (`layout_point`, 앵커 계열별 공식)
+      ② 스트레치  렌더 해상도 -> 화면 (창 클라이언트 크기로 비례 환산)
+    렌더가 FHD면 ①이 항등이라 260828a의 공식과 결과가 완전히 같다.
+
+    260828a 전까지 1080p 모드는 ②마저 건너뛰고 FHD 좌표를 그대로 화면
     좌표로 썼다(= 창이 화면 (0,0)에 1920x1080으로 있다는 전제). 그래서 창이
     조금 움직이면 그만큼 전부 어긋난 자리를 눌러 루틴이 진행되지 않았다.
-    이제 두 모드가 같은 공식을 쓴다 — 창이 전제 위치에 있으면 결과는 예전과
-    똑같으므로(오프셋 0, 배율 1) 검증된 좌표는 그대로 유효하다.
 
     `GetWindowRect`가 아니라 `GetClientRect`+`ClientToScreen`을 쓰는 이유는
     3px 테두리 오차를 없애기 위함(검증 기록 참고). top이 음수(창이 화면 위로
     삐져나감)여도 공식은 그대로 성립한다."""
-    fx, fy = coords
+    fx, fy = coords[0], coords[1]
+    rx, ry = layout_point(fx, fy, anchor_of(coords))
     geo = _client_geometry()
     if geo is None:
         print("[경고] 게임 창을 찾지 못해 좌표 보정을 건너뜁니다.")
-        return int(fx), int(fy)
+        return int(rx), int(ry)
     _note_client_geometry(geo)
     ox, oy, cw, ch = geo
-    return int(ox + fx / 1920.0 * cw), int(oy + fy / 1080.0 * ch)
+    rw, rh = render_size()
+    return int(ox + rx / float(rw) * cw), int(oy + ry / float(rh) * ch)
 
 
 # --- 즉시 중지 (중지 요청이 오면 진행 중인 루틴을 그 자리에서 버린다) ---
@@ -1347,6 +1609,7 @@ def solve_quiz_step(region_q, answer_slots, side_label=""):
 
 def get_answer_slot_regions(grid_region, rows=4, cols=3):
     gx, gy, gw, gh = grid_region
+    anchor = anchor_of(grid_region)     # 보기 칸은 그리드와 같은 계열(팝업)
     cell_w, cell_h = gw / cols, gh / rows
     slots = []
     for r in range(rows):
@@ -1356,8 +1619,8 @@ def get_answer_slot_regions(grid_region, rows=4, cols=3):
                 break
             sx, sy = int(gx + c * cell_w), int(gy + r * cell_h)
             slots.append({
-                "region": (sx, sy, int(cell_w), int(cell_h)),
-                "center": (int(sx + cell_w / 2), int(sy + cell_h / 2)),
+                "region": Rg(sx, sy, int(cell_w), int(cell_h), anchor),
+                "center": Pt(int(sx + cell_w / 2), int(sy + cell_h / 2), anchor),
                 "index": index,
             })
     return slots
@@ -1417,17 +1680,14 @@ def _watch_grab_region(region):
     **원본 프레임에서 자른다(중요):** 예전에는 1080p로 축소한 프레임을 잘랐는데,
     QHD 화면이면 2560→1920으로 뭉갠 뒤 130x36짜리 숫자를 읽는 셈이라 정보를
     버리고 시작한다. 좌표만 원본 배율로 환산해 자르면 화면이 더 클수록 오히려
-    더 선명한 글자를 얻는다(FHD면 배율 1이라 예전과 같다)."""
-    x, y, w, h = region
+    더 선명한 글자를 얻는다(FHD면 배율 1이라 예전과 같다).
+
+    260925c부터 환산은 `_crop_frame`이 한다 — `grab_region_rgb`의 WGC 경로와
+    **같은 함수**라 두 길이 영원히 같은 자리를 자른다."""
     if game_capture is not None and game_capture.is_running:
-        frame = game_capture.get_frame_raw()
-        if frame is not None and frame.size:
-            fh, fw = frame.shape[:2]
-            sx, sy = fw / 1920.0, fh / 1080.0
-            crop = frame[int(round(y * sy)):int(round((y + h) * sy)),
-                         int(round(x * sx)):int(round((x + w) * sx))]
-            if crop.size:
-                return cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        crop = _crop_frame(game_capture.get_frame_raw(), region)
+        if crop is not None:
+            return cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
     return grab_region_rgb(region)
 
 
@@ -1435,27 +1695,30 @@ def capture_game_png():
     """게임 화면 전체를 1920x1080 PNG 바이트로. ((png, (w,h)), None) 또는 (None, 사유).
 
     감시 모드 읽기와 **같은 경로(WGC)** 를 쓴다 — 다른 창이 게임을 가려도, 포커스가
-    없어도 찍히기 때문이다. WGC가 없으면 1080p에서만 pyautogui로 폴백한다(게임이
-    화면 (0,0)에 있다는 전제가 필요).
+    없어도 찍히기 때문이다. WGC가 없으면 direct 모드에서만 pyautogui로 폴백한다
+    (창 클라이언트 영역을 그대로 찍으므로 창 위치는 상관없다).
 
-    **1920x1080으로 고정하는 이유:** 화면이 QHD여도 매크로가 실제로 보는 그림과
-    같아 좌표 어긋남을 눈으로 진단할 수 있고, 해상도에 따라 전송량이 들쭉날쭉해지지
-    않는다(원본 QHD를 그대로 보내면 PNG가 2배 가까이 커진다)."""
+    **렌더 해상도로 고정하는 이유:** 매크로가 실제로 보는 그림과 같아 좌표
+    어긋남을 눈으로 진단할 수 있고, 화면이 커도 전송량이 들쭉날쭉해지지 않는다
+    (원본 QHD를 그대로 보내면 PNG가 2배 가까이 커진다). 260925c 전에는
+    1920x1080 고정이었는데, 4:3·5:4 해상도에서는 그 그림이 찌그러져 있어
+    진단용으로 쓸 수가 없었다."""
+    rw, rh = render_size()
     frame = None
     if _ensure_watch_capture() and game_capture is not None:
-        frame = game_capture.get_frame_1080()
+        frame = game_capture.get_frame_render()
     if frame is None:
-        if CURRENT_RESOLUTION != "1080p":
+        if CAPTURE_MODE != "direct":
             return None, "게임 화면을 캡처하지 못했습니다(WGC 캡처 불가)."
         try:
-            # 폴백도 창 기준으로 자른다(grab_region_rgb가 변환을 안다) — 창이
-            # 움직인 채로 화면 (0,0)을 찍으면 진단용 사진이 밀려서 온다.
-            rgb = grab_region_rgb((0, 0, 1920, 1080))
+            # 폴백도 창 기준으로 찍는다 — 창이 움직인 채로 화면 (0,0)을 찍으면
+            # 진단용 사진이 밀려서 온다.
+            rgb = _grab_full_client_rgb()
             if rgb is None:
                 return None, "화면 캡처에 실패했습니다."
             frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-            if frame.shape[:2] != (1080, 1920):
-                frame = cv2.resize(frame, (1920, 1080), interpolation=cv2.INTER_AREA)
+            if frame.shape[:2] != (rh, rw):
+                frame = cv2.resize(frame, (rw, rh), interpolation=cv2.INTER_AREA)
         except Exception as e:
             return None, f"화면 캡처에 실패했습니다({e})."
     try:
@@ -2193,7 +2456,7 @@ def run_fishing_routine(skip_cancel=False):
     send_report("s")
 
     capture_started = False
-    if CURRENT_RESOLUTION == "1440p" and game_capture is not None:
+    if CAPTURE_MODE == "wgc" and game_capture is not None:
         try:
             if not game_capture.is_running:
                 game_capture.start()
@@ -2259,8 +2522,12 @@ def run_fishing_routine(skip_cancel=False):
             else:
                 print(" -> [경고] 최대 재시도(10회) 초과. 강제 진행합니다.")
 
-        print("4. 완료 확인")
-        click_real(COORD_CONFIRM_BTN)
+        # 260925c: '확인' 버튼 클릭 -> **Enter 한 번**으로 바꿨다.
+        # 좌표에 기대지 않으므로 해상도가 무엇이든 같은 동작이 되고, 팝업이
+        # 살짝 다른 자리에 떠도 영향을 받지 않는다. 경로(ctypes keybd_event)·
+        # 대기(0.5초)·자기입력 표시는 ESC와 완전히 같다.
+        print("4. 완료 확인 (Enter)")
+        press_key(VK_RETURN, label="Enter (확인)")
 
         print("5. 낚시 다시 시작")
         print(f" -> [시작 시각] {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -2517,10 +2784,10 @@ class BlackoutOverlay:
     2. **`WS_EX_LAYERED`는 tkinter의 `-alpha`가 붙이게 한다.** SetWindowLong으로
        직접 붙이면 레이어 표면이 비어 창이 보이지 않는다.
     3. **`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`를 반드시 건다.**
-       안 걸면 **화면 캡처에 이 검은 창이 잡혀 1080p 모드의 퀴즈 인식이
-       전멸한다**(1080p의 `grab_region_rgb`는 pyautogui = 화면 캡처).
+       안 걸면 **화면 캡처에 이 검은 창이 잡혀 direct 모드의 퀴즈 인식이
+       전멸한다**(direct 모드의 `grab_region_rgb`는 pyautogui = 화면 캡처).
        실측: 미적용이면 pyautogui가 검은픽셀 100%, 적용하면 0%(화면에는 그대로
-       검게 보인다). WGC(1440p·감시 모드)는 창을 직접 캡처하므로 무관하다.
+       검게 보인다). WGC(감시 모드 포함)는 창을 직접 캡처하므로 무관하다.
 
     해제 조건: **실제** 키보드/마우스/터치 입력, 매크로 중지·종료, 원격 제어 명령.
     매크로 자신의 입력으로는 풀리지 않는다 — 저수준 훅의 INJECTED 플래그와
@@ -3255,30 +3522,44 @@ class DomimanApp:
             print("[자동 감지 실패] Tales Runner 창을 찾지 못했습니다. "
                   "게임 실행 후 '자동 감지'를 누르세요.")
             return
-        mode, mw, mh, is_primary = detected
-        loc = "주 모니터" if is_primary else "보조 모니터"
-        print(f"[자동 감지] 게임 위치: {loc} {mw}x{mh} -> {mode}")
-        self._set_resolution(mode, auto=True)
+        key, capture, desc = detected
+        print(f"[자동 감지] {desc}")
+        self._set_resolution(key, auto=True, capture=capture)
         if self.ocr_ready:
             self.set_status("idle")
 
-    def _set_resolution(self, mode, auto):
-        global CURRENT_RESOLUTION, game_capture
-        if mode == "1080p":
-            CURRENT_RESOLUTION = "1080p"
-            label = "1920 x 1080"
-        else:
-            if not _WGC_AVAILABLE:
-                print("[오류] 1440p 모드에는 windows-capture 패키지가 필요합니다.")
-                self.lb_res.configure(text="감지 실패")
-                return
-            CURRENT_RESOLUTION = "1440p"
-            if game_capture is None:
-                game_capture = GameCapture(WGC_WINDOW_NAME)
-            label = "2560 x 1440"
+    def _set_resolution(self, key, auto, capture=None):
+        """렌더 해상도(key)를 적용한다. capture=None이면 캡처 방식은 지금 값을
+        유지하되, 프리셋이 강제하는 값('1440'=늘린 FHD -> WGC)이 있으면 그것을
+        따른다. **캡처 방식은 사용자가 고르는 값이 아니다** — 모니터를 보고
+        자동 감지가 정한다(창 클라이언트 크기는 DPI 가상화로 튀어서 못 쓴다)."""
+        global CURRENT_RESOLUTION, CAPTURE_MODE, game_capture
+        preset = RES_BY_KEY.get(key)
+        if preset is None:
+            print(f"[오류] 알 수 없는 해상도 '{key}'")
+            return
+        _k, label, rw, rh, force = preset
+        if capture is None and force is None:
+            # 수동 선택: 캡처 방식은 사용자에게 묻지 않고 모니터로 다시 정한다.
+            # (창을 못 찾으면 지금 값을 그대로 쓴다)
+            capture = detect_capture_mode()
+        want = force or capture or CAPTURE_MODE
+        if want == "wgc" and not _WGC_AVAILABLE:
+            # 예전에는 여기서 거부했다. 거부하면 사용자가 손쓸 방법이 없으므로
+            # 화면 직접 캡처로 물러선다 — 창이 가려지면 인식이 실패할 수 있다는
+            # 것만 알려 준다.
+            print("[경고] windows-capture 패키지가 없어 화면 직접 캡처로 동작합니다. "
+                  "(게임 창이 가려지면 인식이 실패할 수 있습니다)")
+            want = "direct"
+        CAPTURE_MODE = want
+        CURRENT_RESOLUTION = key
+        if CAPTURE_MODE == "wgc" and game_capture is None:
+            game_capture = GameCapture(WGC_WINDOW_NAME)
         self.res_auto = auto
         self.lb_res.configure(text=f"{label}{' (자동 감지됨)' if auto else ''}")
-        print(f" -> [설정] {'1080p (화면 직접 캡처)' if mode == '1080p' else '1440p (WGC 캡처)'}")
+        how = "화면 직접 캡처" if CAPTURE_MODE == "direct" else "WGC 캡처"
+        s = ui_scale(rw, rh)
+        print(f" -> [설정] 렌더 {rw}x{rh} (UI 배율 {s:g}) / {how}")
 
     def on_res_auto(self):
         if self.remote_target:
@@ -3300,29 +3581,31 @@ class DomimanApp:
         top.grab_set()
         t = THEME["dark" if self.dark else "light"]
         top.configure(bg=t["bg"])
-        lb = tk.Label(top, text="해상도를 선택하세요.", font=FONT, bg=t["bg"], fg=t["fg"])
+        lb = tk.Label(top, text="게임 '화면 설정'의 해상도를 고르세요.",
+                      font=FONT, bg=t["bg"], fg=t["fg"])
         lb.pack(padx=16, pady=(12, 6))
 
-        bt1080 = tk.Button(top, text="1920 x 1080", font=FONT, bg=BTN_GRAY, width=16)
-        bt1440 = tk.Button(top, text="2560 x 1440", font=FONT, bg=BTN_GRAY, width=16)
-        bt1080.pack(padx=16, pady=4)
-        bt1440.pack(padx=16, pady=(4, 12))
+        btns = []
 
-        def pick(mode):
+        def pick(key):
             if self.remote_target:
                 # 원격: 신호 발송 후 응답(또는 15초 무응답)까지 창을 열어두고 봉인
                 if self.pending is not None:
                     return
-                self._send_command(f"V,{'1080' if mode == '1080p' else '1440'}", "V")
-                bt1080.configure(state="disabled")
-                bt1440.configure(state="disabled")
+                self._send_command(f"V,{key}", "V")
+                for b in btns:
+                    b.configure(state="disabled")
                 self._res_top = top
             else:
-                self._set_resolution(mode, auto=False)
+                self._set_resolution(key, auto=False)
                 top.destroy()
 
-        bt1080.configure(command=lambda: pick("1080p"))
-        bt1440.configure(command=lambda: pick("1440p"))
+        for i, (key, label, _rw, _rh, _f) in enumerate(RES_PRESETS):
+            last = (i == len(RES_PRESETS) - 1)
+            b = tk.Button(top, text=label, font=FONT, bg=BTN_GRAY, width=20,
+                          command=lambda k=key: pick(k))
+            b.pack(padx=16, pady=(4, 12) if last else 4)
+            btns.append(b)
         top.protocol("WM_DELETE_WINDOW",
                      lambda: None if self.pending else top.destroy())
 
@@ -3951,7 +4234,7 @@ class DomimanApp:
         '실행중'을 항상 있는 필드(4번째 뒤)로 둔 이유: 감시모드에서만 붙는
         낚싯대/미끼처럼 있다 없다 하면 자리가 밀려 파싱이 꼬인다."""
         tval = self.var_timer.get().strip() or "0"
-        res = {"1080p": "1080", "1440p": "1440"}.get(CURRENT_RESOLUTION, "0")
+        res = CURRENT_RESOLUTION or "0"
         am = "a" if self.res_auto else "m"
         tf = lambda b: "t" if b else "f"   # noqa: E731
         s = f"{tval},{res},{am},{tf(self.var_logsave.get())},{tf(self._running())}"
@@ -4017,10 +4300,8 @@ class DomimanApp:
             if not self._running():
                 if args[1] == "a":
                     self._apply_detect_result(detect_resolution())
-                elif args[1] == "1080":
-                    self._set_resolution("1080p", auto=False)
-                elif args[1] == "1440":
-                    self._set_resolution("1440p", auto=False)
+                elif args[1] in RES_BY_KEY:
+                    self._set_resolution(args[1], auto=False)
                 else:
                     return
             reply(self._status_string())
@@ -4191,8 +4472,9 @@ class DomimanApp:
         try:
             self.var_timer.set(rest[0])
             res, am = rest[1], rest[2]
-            if res in ("1080", "1440"):
-                label = "1920 x 1080" if res == "1080" else "2560 x 1440"
+            preset = RES_BY_KEY.get(res)
+            if preset is not None:
+                label = preset[1]
                 if am == "a":
                     label += " (자동 감지됨)"
             else:
