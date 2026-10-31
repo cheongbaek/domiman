@@ -282,19 +282,15 @@ fun MainScreen(
       onDismissRequest = { showResolutionDialog = false },
       confirmButton = {},
       text = {
-        Column {
-          TextButton(
-            onClick = {
-              viewModel.onResolutionManual("1080")
-              showResolutionDialog = false
-            },
-          ) { Text("1920 x 1080") }
-          TextButton(
-            onClick = {
-              viewModel.onResolutionManual("1440")
-              showResolutionDialog = false
-            },
-          ) { Text("2560 x 1440") }
+        Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+          RES_PRESETS.forEach { (key, label) ->
+            TextButton(
+              onClick = {
+                viewModel.onResolutionManual(key)
+                showResolutionDialog = false
+              },
+            ) { Text(label) }
+          }
         }
       },
     )
@@ -392,7 +388,7 @@ private fun PcSelectDialog(
                 newName = ""
                 addError = null
               } else {
-                addError = "이미 있거나 쓸 수 없는 이름입니다."
+                addError = "이미 있거나 쓸 수 없는 이름입니다. (영문·숫자·_·- 20자까지)"
               }
             },
           ) { Text("추가") }

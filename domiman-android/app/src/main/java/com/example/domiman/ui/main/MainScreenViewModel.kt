@@ -24,6 +24,20 @@ private const val TIMER_DEBOUNCE_MS = 1_500L // PC의 타이머 3초 디바운�
 // (domiman_m.SHOT_START_TIMEOUT 15초 + SHOT_STALL_TIMEOUT 10초보다 넉넉한 전체 상한).
 private const val SHOT_TIMEOUT_MS = 45_000L
 
+// domiman.py RES_PRESETS와 key·라벨을 글자 그대로 맞춘다(key가 곧 'V,{key}' 명령값).
+// 옛 "1080"/"1440" 토큰은 구버전 앱 호환 대상이라 바꾸지 말 것.
+internal val RES_PRESETS =
+  listOf(
+    "1080" to "1920 x 1080",
+    "1440" to "2560 x 1440 (늘린 FHD)",
+    "1760x990" to "1760 x 990",
+    "1680x1050" to "1680 x 1050",
+    "1280x1024" to "1280 x 1024",
+    "1280x960" to "1280 x 960",
+    "1024x768" to "1024 x 768",
+  )
+private val RES_LABEL = RES_PRESETS.toMap()
+
 data class MainUiState(
   val resolutionLabel: String = "감지 중",
   val resAuto: Boolean = true,
@@ -233,13 +247,8 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
   }
 
   private fun resolutionLabelOf(resolution: String, auto: Boolean): String {
-    val base =
-      when (resolution) {
-        "1080" -> "1920 x 1080"
-        "1440" -> "2560 x 1440"
-        else -> "감지 실패"
-      }
-    return if (auto && resolution in setOf("1080", "1440")) "$base (자동 감지됨)" else base
+    val base = RES_LABEL[resolution] ?: return "감지 실패"
+    return if (auto) "$base (자동 감지됨)" else base
   }
 
   private fun addLog(line: String) {
@@ -280,7 +289,7 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
 
   fun onResolutionManual(mode: String) {
     markPending()
-    viewModelScope.launch { repository.sendSetResolution(mode) } // "1080" | "1440"
+    viewModelScope.launch { repository.sendSetResolution(mode) } // RES_PRESETS의 key
   }
 
   fun onResolutionAuto() {

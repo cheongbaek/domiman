@@ -570,7 +570,9 @@ class DomimanSession:
         self.send_command("Q", "Q")
 
     def cmd_set_resolution(self, mode):
-        """mode: 'a'(자동감지) | '1080' | '1440'."""
+        """mode: 'a'(자동감지) | domiman.py RES_PRESETS의 key
+        ('1080' | '1440' | '1760x990' | '1680x1050' | '1280x1024' |
+        '1280x960' | '1024x768')."""
         self.send_command(f"V,{mode}", "V")
 
     def cmd_set_timer(self, minutes):
