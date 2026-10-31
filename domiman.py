@@ -632,7 +632,7 @@ def send_report(code):
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "260925a"
+APP_VERSION = "261101a"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -4576,8 +4576,10 @@ class DomimanApp:
 
         def on_add():
             name = var_new.get().strip()
-            if not re.fullmatch(r"[A-Za-z0-9]+", name):
-                print("[안내] PC 이름은 영문+숫자만 가능합니다.")
+            # PC 이름 = 그 PC의 로그인 ID → 서버 ID_RE와 같은 규칙.
+            # ','는 명령 구분자라 불가, '.' 등은 서버가 ID로 받지 않는다.
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,20}", name):
+                print("[안내] PC 이름은 영문·숫자·_·- 로 20자까지 가능합니다.")
                 return
             if name == MY_ID or name in self.pc_list:
                 print("[안내] 이미 리스트에 있는 이름입니다.")
