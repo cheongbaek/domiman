@@ -27,6 +27,8 @@ data class DomimanStatus(
  *  - `target_joined` / `target_denied` / `target_gone` : 제어 PC 방 입장·거절·이탈
  *  - `reply` : 내 명령/질의에 대한 응답(status·tank·echo 중 하나)
  *  - `report` : 대상 PC의 상황 보고(,Z,F,*) — 알림 발송 판단에 report_notify_key
+ *  - `wol` : 'BGOD 켜기' 결과(서버 응답). ok=true면 신호를 보냈다는 뜻(켜짐 확인 아님),
+ *    ok=false면 code가 bad_frame(옛 서버)·timeout·rate_limited·wol_off·wol_fail, msg는 서버 문장
  */
 @Serializable
 data class DomimanEvent(
@@ -41,15 +43,14 @@ data class DomimanEvent(
   val status: DomimanStatus? = null,
   val tank: List<Int>? = null,
   @SerialName("tank_fail") val tankFail: Boolean = false,
-  // 상태 필드 없는 명령 에코("G"/"P"/"W"/"Q"/"Y"/"B"/"I"). G/P로 시작/중지 상태를 갱신한다.
+  // 상태 필드 없는 명령 에코("G"/"P"/"W"/"Q"/"B"/"I"). G/P로 시작/중지 상태를 갱신한다.
   val echo: String? = null,
-  @SerialName("sched_minutes") val schedMinutes: String? = null,
   @SerialName("report_text") val reportText: String? = null,
   @SerialName("report_status_key") val reportStatusKey: String? = null,
   @SerialName("report_notify_key") val reportNotifyKey: String? = null,
   // echo=="I"인데 캡처 자체가 실패("`,Z,I,fail`")했을 때만 true.
   @SerialName("shot_fail") val shotFail: Boolean = false,
-  // ev=="screenshot"(파일 전송 결과) 전용 필드.
+  // ev=="screenshot"(파일 전송 결과)·ev=="wol"(BGOD 켜기 결과) 공용.
   val ok: Boolean? = null,
   val name: String? = null,
   @SerialName("png_b64") val pngB64: String? = null,

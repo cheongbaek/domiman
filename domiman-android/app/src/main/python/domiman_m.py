@@ -39,7 +39,9 @@ win32 클릭, WGC 캡처, OCR, 낚시 자동화 루틴)를 전부 제외하고, 
   메인 제어     — 최상단에 '제어 PC 선택하기' 박스(기본 미선택). 고르면 그
                   PC의 방(domi_fishing_{PC})에 입장·구독하고 S 질의로 상태를
                   받아온다. 그 아래는 PC GUI와 동일(해상도/타이머/체크박스/
-                  시작-중지/상태문구/예약종료/즉시회수/실시간수량확인/로그).
+                  시작-중지/상태문구/BGOD켜기/즉시회수/실시간수량확인/로그).
+                  'BGOD 켜기'(261101b, 옛 '예약 종료' 자리)만은 제어 PC가 아니라
+                  **서버에** 보내는 요청이라 PC를 고르지 않아도 된다.
 
 ■ Kotlin(Chaquopy) 경계 규칙: PyObject dict 변환을 Kotlin에서 다루지 않도록
   **오가는 값은 전부 JSON 문자열**이다(`*_json` 함수들). 새 반환값이 생기면
@@ -83,6 +85,7 @@ LOGIN_TIMEOUT_SEC = 20.0     # 접속+로그인 왕복 대기 상한
 TARGET_TIMEOUT_SEC = 20.0    # 방 입장 + S 응답 대기 상한
 SHOT_START_TIMEOUT = 15.0    # ack 이후 사진(file_begin)이 시작될 때까지 대기 상한
 SHOT_STALL_TIMEOUT = 10.0    # 전송 시작 후 청크가 이 시간 넘게 끊기면 포기(domiman.py와 동일)
+WOL_REPLY_TIMEOUT = 15.0     # 'BGOD 켜기' 서버 응답 대기 상한(domiman.py와 동일)
 
 # domichat 계정 ID 규칙(domiserver.ID_RE와 동일). 제어할 PC 이름도 그 PC의
 # domichat 로그인 ID이므로 같은 규칙을 쓴다.
@@ -446,6 +449,7 @@ class DomimanSession:
         self.target = ""            # 제어 중인 PC 이름(= 그 PC의 domichat ID)
         self.pending = None         # {"kind": str, "sent": epoch}
         self.shot_wait = None       # 스크린샷 ack 후 사진 도착 대기 상태(domiman.py와 동일 개념)
+        self.wol_sent = None        # 'BGOD 켜기' 요청 시각(서버 응답 대기 중)|None
         self.server = ""            # "ip:port"(지문 저장 키)
         self.joined_target = ""     # 실제로 입장까지 끝난 대상
         self._stop = threading.Event()
@@ -475,6 +479,7 @@ class DomimanSession:
         self.target = ""
         self.joined_target = ""
         self.pending = None
+        self.wol_sent = None
         try:
             self.chat.logout()
         except Exception:
@@ -555,13 +560,28 @@ class DomimanSession:
     def cmd_stop(self):
         self.send_command("P", "P")
 
-    def cmd_sched_exit_ask(self):
-        """예약 종료 1단계: 생존 확인 겸 분 입력 다이얼로그 오픈 트리거."""
-        self.send_command("Y", "Y1")
+    def cmd_wake_bgod(self):
+        """'BGOD 켜기'(261101b, 옛 '예약 종료' 자리) — BGOD에 깨우기 신호(WoL)를
+        보내 달라고 **domiserver에** {"t":"wol"} 을 보낸다. 서버가 BGOD와 같은 LAN에
+        있어야 매직 패킷이 닿기 때문이다(휴대폰에서 쏘면 닿지 않는다).
 
-    def cmd_sched_exit_set(self, minutes):
-        """예약 종료 2단계 확정. minutes=0이면 예약 해제."""
-        self.send_command(f"Y,{minutes:g}", "Y2")
+        제어 PC 명령이 아니라 서버 요청이라 **대상 PC를 고르지 않아도 되고**
+        pending(원격 응답 대기)도 쓰지 않는다. 결과는 이벤트 하나로 온다:
+          {"ev":"wol","ok":true}                          신호를 보냈다(켜짐 확인 아님)
+          {"ev":"wol","ok":false,"code":...,"msg":...}    거절·옛 서버(bad_frame)·timeout
+        응답 대기 중이거나 로그인 전이면 보내지 않고 False(domiman.py와 같은 정책)."""
+        if self.wol_sent is not None or not self.chat.logged_in.is_set():
+            return False
+        self.wol_sent = time.time()
+        return self.chat.send({"t": "wol"})
+
+    def check_wol_timeout(self):
+        """서버가 WOL_REPLY_TIMEOUT 안에 답하지 않으면 실패 이벤트를 낸다 — 앱의
+        버튼이 영구히 잠기지 않게(check_shot_timeout과 같은 자리에서 돈다)."""
+        if self.wol_sent is None or time.time() - self.wol_sent <= WOL_REPLY_TIMEOUT:
+            return
+        self.wol_sent = None
+        self._emit({"ev": "wol", "ok": False, "code": "timeout"})
 
     def cmd_collect_now(self):
         self.send_command("W", "W")
@@ -696,12 +716,14 @@ class DomimanSession:
                 d = self.chat.q.get(timeout=0.2)
             except queue.Empty:
                 self.check_shot_timeout()   # 유휴 주기에도 타임아웃은 검사한다
+                self.check_wol_timeout()
                 continue
             try:
                 self._handle(d)
             except Exception as e:      # 한 프레임의 오류로 펌프가 죽지 않게
                 self._emit({"ev": "error", "msg": f"수신 처리 실패: {e}"})
             self.check_shot_timeout()
+            self.check_wol_timeout()
 
     def _handle(self, d):
         ev = d.get("_ev")
@@ -763,6 +785,11 @@ class DomimanSession:
                 self._finish_target(False, "room_deleted")
                 self._emit({"ev": "target_gone", "pc": self.target})
             return
+        if t == "ok":
+            if d.get("of") == "wol":
+                self.wol_sent = None
+                self._emit({"ev": "wol", "ok": True})
+            return
         if t == "error":
             return self._on_error(d)
 
@@ -778,6 +805,12 @@ class DomimanSession:
 
     def _on_error(self, d):
         code, msg = d.get("code"), d.get("msg", "")
+        # 'BGOD 켜기' 거절. 아직 기능이 없는 옛 서버는 ref 없이 '알 수 없는 요청: wol'
+        # (bad_frame)로 답하고 연결은 유지한다 — 앱은 code로 '서버 업데이트 필요'를 띄운다.
+        if d.get("ref") == "wol" or (self.wol_sent is not None and code == "bad_frame"
+                                     and msg.endswith(": wol")):
+            self.wol_sent = None
+            return self._emit({"ev": "wol", "ok": False, "code": code, "msg": msg})
         if code in ("bad_login", "already_online", "disabled", "bad_id", "bad_pw"):
             self._finish_login(False, msg or "로그인에 실패했습니다.", code)
             self.chat.logout()
@@ -916,18 +949,19 @@ def dispatch_result(session, kind, rest):
        "status": {...}|null,            # 상태 응답(S/V/T/C)일 때
        "tank": [cur,mx]|null,           # N(수량) 응답 또는 수량 방송일 때
        "tank_fail": bool,               # 위와 같되 파싱 실패(",Z,N,fail")
-       "echo": "G"|"P"|"W"|"Q"|"Y"|"B"|"I"|null, # 상태 없는 명령 에코일 때
-       "sched_minutes": str|null,       # echo=="Y"에 분 인자가 붙은 경우
+       "echo": "G"|"P"|"W"|"Q"|"B"|"I"|null, # 상태 없는 명령 에코일 때
        "shot_fail": bool,               # echo=="I"인데 ',Z,I,fail'(캡처 실패)일 때만 true
        "report_text": str|null,         # ev=="report"일 때 로그에 띄울 문장
        "report_status_key": str|null,   # 위와 같이 온 상태문구 키(STATUS_TEXT)
        "report_notify_key": str|null}   # 위와 같이 온 알림 설정 키(NOTIFY_KEYS)
 
-    ※ G/P/W/Q/Y/B 응답은 domiman.py가 상태 필드 없이 명령 글자만 되돌려주는
+    ※ G/P/W/Q/B 응답은 domiman.py가 상태 필드 없이 명령 글자만 되돌려주는
     '에코'다(예: 시작 성공→',Z,G'). 상태 응답(S/V/T/C)은 첫 필드가 타이머
     숫자라 이 글자들과 겹치지 않으므로 rest[0]로 안전하게 구분된다. 과거엔
     이 분기가 없어 G/P 응답이 parse_status→None으로 버려져, 모바일에서
-    '시작/중지'를 눌러도 running/pending이 갱신되지 않던 버그가 있었다."""
+    '시작/중지'를 눌러도 running/pending이 갱신되지 않던 버그가 있었다.
+    (Y = 예약 종료 에코는 261101b에 뺐다 — 앱이 더 이상 Y를 보내지 않는다.
+     응답은 요청자 ID로만 오므로 남이 보낸 Y의 에코가 여기 올 일도 없다.)"""
     out = {"ev": kind}
     if kind == "reply":
         first = rest[0] if rest else ""
@@ -943,10 +977,8 @@ def dispatch_result(session, kind, rest):
                 out["shot_fail"] = True
             else:
                 session._begin_shot_wait()
-        elif first in ("G", "P", "W", "Q", "Y", "B"):
+        elif first in ("G", "P", "W", "Q", "B"):
             out["echo"] = first
-            if first == "Y" and len(rest) >= 2:
-                out["sched_minutes"] = rest[1]
         else:
             out["status"] = DomimanSession.parse_status(rest)
     elif kind == "report":

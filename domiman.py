@@ -194,6 +194,19 @@ SHOT_PNG_LEVEL = 3          # cv2 PNG 압축 레벨. 실측(1920x1080 게임 화
                             # lv1 2.31MB/98ms · lv3 2.18MB/166ms · lv6 2.01MB/512ms
                             # · lv9 1.94MB/3756ms → 크기 이득이 꺾이기 전 지점.
 
+# --- BGOD 켜기(Wake-on-LAN, 261101b — 옛 '예약 종료' 버튼 자리) ---
+# 이 PC가 매직 패킷을 직접 쏘지 않는다. **domiserver에 {"t":"wol"} 한 줄을 보내면
+# 서버가 쏜다** — 서버는 BGOD와 같은 LAN의 다른 PC에서 돌고, 매직 패킷은
+# 브로드캐스트라 LAN 밖(이 PC·휴대폰)에서 쏘면 BGOD에 닿지 않기 때문이다.
+# 깨우는 대상은 **BGOD 한 대뿐**이라 요청에 대상을 싣지 않는다(MAC은 서버 설정이
+# 갖는다 — domiserver.py 의 [WoL] 머리말 참고). 응답 세 가지:
+#   ok{of:"wol"}                    = 서버가 신호를 보냈다(켜졌다는 뜻은 아니다)
+#   error{ref:"wol", code, msg}     = 서버가 거절(설정 없음·송신 실패·연타)
+#   error{code:"bad_frame", msg:"알 수 없는 요청: wol"} = 아직 이 기능이 없는 옛 서버.
+#   옛 서버는 모르는 요청에 오류만 돌려주고 **연결은 끊지 않으므로**, 'B' 프레임처럼
+#   서버 버전을 보고 미리 막을 필요가 없다(serve_conn 실측).
+WOL_REPLY_TIMEOUT = 15.0    # 서버 응답 대기 상한 — 다른 명령의 응답 대기와 같은 값
+
 chat_enabled = False                    # 'domichat 메시지' 체크박스와 연동
 MY_ID = ""                              # 로그인 ID(예전 PC 이름 자리)
 MY_ROOM = ""                            # domi_fishing_{MY_ID}
@@ -632,7 +645,7 @@ def send_report(code):
 # 이렇게 피한다). frozen 상태에서 재시작은 exe(launcher) 자신을 다시 띄우는
 # 것으로 충분 — 재시작된 launcher가 방금 교체된 새 domiman.py를 다시 읽는다.
 # ============================================================
-APP_VERSION = "261101a"
+APP_VERSION = "261101b"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -3187,8 +3200,8 @@ class DomimanApp:
         self.res_auto = None       # True=자동감지, False=직접설정, None=미설정
         self.ocr_ready = False
         self.current_status_key = "loading"
-        self.exit_after_id = None    # 예약 종료 after() 핸들 (로컬)
-        self.exit_deadline = None    # 예약 종료 시각(epoch), None=비활성 (로컬)
+        self.exit_after_id = None    # 예약 종료 after() 핸들 (원격 Y로만 걸린다)
+        self.exit_deadline = None    # 예약 종료 시각(epoch), None=비활성
         self._sched_ticking = False
         self.manual_collect = None   # 즉시 회수 스레드
 
@@ -3202,11 +3215,10 @@ class DomimanApp:
         self.remote_target = None        # None=로컬(이 PC), str=제어 중인 PC(ID)
         self.pending = None              # {"kind": str, "sent": epoch} 응답 대기
         self.remote_running_shown = None # 원격 시작/중지 버튼 표시 상태
-        self.remote_exit_deadline = None # 원격 예약 종료(표시 전용)
         self._local_snapshot = None      # 원격 진입 전 로컬 설정 백업
         self._applying_remote = False    # 원격 상태 반영 중(트레이스 발신 억제)
         self._timer_debounce_id = None   # 원격 타이머 3초 디바운스
-        self._sched_top = None           # 예약 종료 팝업(원격) 위젯들
+        self.wol_sent = None             # BGOD 켜기 요청 시각(서버 응답 대기 중)|None
         self._res_top = None             # 해상도 팝업 위젯들
         self._login_top = None           # 로그인 창
         self.my_room_ready = False       # 내 방(피제어용) 준비 완료 여부
@@ -3345,7 +3357,7 @@ class DomimanApp:
             font=FONT_SMALL)
         self.lb_swap_hint.grid(row=6, column=0, columnspan=2, sticky="w", **pad)
 
-        # -- 로그인/로그아웃 + 접속 정보 표시 + 예약 종료/즉시 회수 --
+        # -- 로그인/로그아웃 + 접속 정보 표시 + BGOD 켜기/즉시 회수 --
         # 예전의 '이름'·'채널' 입력란 자리를 그대로 쓴다: 라벨 자리에는 버튼,
         # 입력란 자리에는 **읽기 전용 표시**(위=IP, 아래=ID).
         self.bt_login = tk.Button(f, text="로그인", font=FONT, bg=BTN_GRAY,
@@ -3356,9 +3368,11 @@ class DomimanApp:
                                 width=18, anchor="w")
         self.en_name.grid(row=7, column=1, sticky="w", **pad)
 
-        self.bt_sched_exit = tk.Button(f, text="예약 종료", font=FONT, bg=BTN_GRAY,
-                                       command=self.on_sched_exit)
-        self.bt_sched_exit.grid(row=7, column=2, sticky="ew", **pad_r)
+        # 예전 '예약 종료' 자리 — 261101b에 'BGOD 켜기'(WoL 요청)로 대체됐다.
+        # 직접 제어·원격 제어 어느 모드에서도 같은 일을 한다(제어 대상과 무관).
+        self.bt_wake = tk.Button(f, text="BGOD 켜기", font=FONT, bg=BTN_GRAY,
+                                 command=self.on_wake_bgod)
+        self.bt_wake.grid(row=7, column=2, sticky="ew", **pad_r)
         self.bt_collect_now = tk.Button(f, text="즉시 회수", font=FONT, bg=BTN_GRAY,
                                         command=self.on_collect_now)
         self.bt_collect_now.grid(row=7, column=3, sticky="ew", **pad)
@@ -3453,7 +3467,7 @@ class DomimanApp:
         self.txt_log.configure(bg=t["log_bg"], fg=t["fg"], insertbackground=t["fg"])
         # 버튼은 회색 유지, 시작/중지 색 불변
         for bt in (self.bt_pc, self.bt_update, self.bt_res_manual, self.bt_res_auto,
-                   self.bt_tank_check, self.bt_shot, self.bt_sched_exit,
+                   self.bt_tank_check, self.bt_shot, self.bt_wake,
                    self.bt_collect_now,
                    self.bt_dark, self.bt_exit, self.bt_log_fold, self.bt_log_clear,
                    self.bt_sleep, self.bt_login, self.bt_logout):
@@ -3470,10 +3484,9 @@ class DomimanApp:
         self._refresh_status_display()
 
     def _refresh_status_display(self):
-        """예약 종료가 활성화되면 기존 상태문구 대신 남은 시간을 표시.
-        원격 모드에서는 상대(피제어 PC)의 예약을 표시한다."""
-        deadline = (self.remote_exit_deadline if self.remote_target
-                    else self.exit_deadline)
+        """예약 종료(원격 Y로 걸린 것)가 활성화되면 기존 상태문구 대신 남은 시간을
+        표시. 원격 제어 중에는 화면이 상대 PC의 상태를 보여주므로 숨긴다."""
+        deadline = None if self.remote_target else self.exit_deadline
         if deadline is not None:
             remain = max(0.0, deadline - time.time())
             n = max(1, int((remain + 59) // 60))   # 분 단위 올림
@@ -3746,6 +3759,7 @@ class DomimanApp:
         CHAT.logout()
         MY_ID, MY_ROOM = "", ""
         self.my_room_ready = False
+        self.wol_sent = None             # 끊긴 연결의 BGOD 켜기 응답은 오지 않는다
         self.saved_id = ""
         clear_secret_pw()
         save_config(self.server_ip, "", self.pc_list)
@@ -4066,6 +4080,7 @@ class DomimanApp:
             pass
         self._check_pending_timeout()
         self._check_shot_timeout()
+        self._check_wol_timeout()
         self.root.after(250, self._poll_chat_queue)
 
     def _on_chat_event(self, d):
@@ -4103,6 +4118,8 @@ class DomimanApp:
             of = d.get("of")
             if of == "room_create":
                 return self._after_my_room(d.get("room"))
+            if of == "wol":
+                return self._on_wol_result(True)
             return
         if t == "joined":
             room = d.get("room")
@@ -4139,6 +4156,10 @@ class DomimanApp:
             return
         if t == "error":
             code, msg = d.get("code"), d.get("msg", "")
+            # BGOD 켜기 거절. 옛 서버는 ref 없이 '알 수 없는 요청: wol'로 답한다.
+            if d.get("ref") == "wol" or (self.wol_sent is not None and code == "bad_frame"
+                                         and msg.endswith(": wol")):
+                return self._on_wol_result(False, code, msg)
             if code == "room_name_taken":
                 # 내 방이 이미 있다 — 만들 필요 없이 들어가면 된다
                 return CHAT.send({"t": "join", "room": MY_ROOM, "pw": ROOM_PW})
@@ -4271,6 +4292,8 @@ class DomimanApp:
             reply("P")
 
         elif cmd == "Y":
+            # 원격 예약 종료. 이 PC의 버튼은 261101b에 'BGOD 켜기'로 바뀌었지만
+            # 웹앱·옛 앱은 여전히 Y를 보내므로 **피제어 처리는 남긴다**(호환).
             if len(args) == 1:
                 reply("Y")             # 생존 확인용 1단계 ack
                 return
@@ -4377,11 +4400,6 @@ class DomimanApp:
             self._exit_remote()
         elif kind in ("G", "P"):
             self._set_start_button_remote()      # '대기' -> 이전 상태 복원
-        elif kind == "Y2":
-            target = self.remote_target
-            self._close_sched_dialog()
-            if target:
-                chat_send(f"{target},Y,0", room_of(target))
         elif kind == "V":
             self._close_res_dialog()
 
@@ -4409,20 +4427,6 @@ class DomimanApp:
             self.remote_running_shown = False
             self._set_start_button_remote()
             self.set_status("idle")
-        elif first == "Y" and len(rest) == 1:
-            if p and p["kind"] == "Y1":
-                self._open_sched_dialog_remote()
-        elif first == "Y":
-            try:
-                n = float(rest[1])
-            except (ValueError, IndexError):
-                n = None
-            if n is not None:
-                self.remote_exit_deadline = (time.time() + n * 60.0) if n > 0 else None
-                self._ensure_tick()
-                self._refresh_status_display()
-                print(f"[원격] 예약 종료 {'해제됨' if n == 0 else f'{n:g}분 설정됨'}")
-            self._close_sched_dialog()
         elif first == "W":
             print(f"[원격] {self.remote_target}가 즉시 회수 명령을 받았습니다.")
             self.set_status("collect3")
@@ -4640,7 +4644,6 @@ class DomimanApp:
 
         self.remote_target = target
         self.remote_running_shown = False
-        self.remote_exit_deadline = None
         self.bt_pc.configure(text=target)
         self.remote_tank = None          # 첫 방송을 '새 소식'으로 받기 위해 비운다
         self._update_remote_widgets()
@@ -4659,14 +4662,12 @@ class DomimanApp:
         self.remote_target = None
         self.pending = None
         self.remote_running_shown = None
-        self.remote_exit_deadline = None
         self.shot_wait = None          # 기다리던 사진은 포기한다(대상이 사라졌으므로)
         self.remote_tank = None
         self._update_remote_widgets()
         if self._timer_debounce_id is not None:
             self.root.after_cancel(self._timer_debounce_id)
             self._timer_debounce_id = None
-        self._close_sched_dialog()
         self._close_res_dialog()
 
         snap, self._local_snapshot = self._local_snapshot, None
@@ -4742,12 +4743,14 @@ class DomimanApp:
         for w in (self.en_timer, self.cb_rod, self.cb_bait, self.cb_logsave,
                   self.bt_res_manual, self.bt_res_auto):
             st(w, flags_ok)
-        # 예약 종료/즉시 회수/실시간 수량확인/취침 모드/프로그램 종료
+        # 즉시 회수/실시간 수량확인/취침 모드/프로그램 종료
         # — 로컬 상시, 원격은 대기 중 봉인
         always_ok = (not pending) if remote else True
-        for w in (self.bt_sched_exit, self.bt_collect_now, self.bt_tank_check,
-                  self.bt_sleep, self.bt_exit):
+        for w in (self.bt_collect_now, self.bt_tank_check, self.bt_sleep, self.bt_exit):
             st(w, always_ok)
+        # BGOD 켜기 — 제어 대상이 아니라 서버에 보내는 요청이라 모드·원격 응답 대기와
+        # 무관하게 상시. 자기 요청의 응답을 기다리는 동안만 잠근다(연타 방지).
+        st(self.bt_wake, self.wol_sent is None)
         # 시작/중지 — 원격 대기 중 봉인('대기' 표시는 G/P 전용 별도 처리)
         if remote:
             if pending and self.pending.get("kind") not in ("G", "P"):
@@ -4755,59 +4758,51 @@ class DomimanApp:
             elif not pending:
                 st(self.bt_start, True)
 
-    # ---------- 예약 종료 ----------
-    def on_sched_exit(self):
-        """몇 분 뒤 종료할지 입력받는 창. 0 입력/취소 = 예약 해제(또는 유지 안 함).
-        원격 모드에서는 먼저 Y를 보내 생존 확인 후(,Z,Y 수신 시) 창을 띄운다."""
-        if self.remote_target:
-            if self.pending is None:
-                self._send_command("Y", "Y1")
+    # ---------- BGOD 켜기 (Wake-on-LAN) ----------
+    def on_wake_bgod(self):
+        """BGOD에 깨우기 신호(Wake-on-LAN)를 보내 달라고 **domiserver에** 요청한다.
+
+        예전 '예약 종료' 버튼 자리다(261101b). 제어 대상 PC에 보내는 명령이 아니라
+        서버에 보내는 요청이라 **직접 제어·원격 제어 어느 모드에서도 같은 일**을
+        한다 — 원격 응답 대기(pending)를 쓰지 않는 것도 그래서다. 낚시 실행 여부·
+        'domichat 메시지' 체크와도 무관하다(사람이 직접 누른 단발 요청이다).
+
+        서버가 BGOD와 같은 LAN에 있어야 매직 패킷이 닿는다. 'ok'는 신호를 보냈다는
+        뜻일 뿐 BGOD가 켜졌다는 확인이 아니다(켜지기까지 1~2분 걸린다)."""
+        if self.wol_sent is not None:
+            return                          # 응답 대기 중(버튼도 잠겨 있다)
+        if not MY_ID or not CHAT.logged_in.is_set():
+            print("[BGOD 켜기] domichat 서버에 로그인되어 있어야 보낼 수 있습니다.")
             return
-        top = tk.Toplevel(self.root)
-        top.title("예약 종료")
-        top.resizable(False, False)
-        top.grab_set()
-        t = THEME["dark" if self.dark else "light"]
-        top.configure(bg=t["bg"])
+        CHAT.send({"t": "wol"})
+        self.wol_sent = time.time()
+        self._apply_ui_locks()
+        print("[BGOD 켜기] 서버에 BGOD 깨우기를 요청했습니다...")
 
-        tk.Label(top, text="몇 분 뒤에 종료할까요? (0 = 예약 해제)",
-                 font=FONT, bg=t["bg"], fg=t["fg"]).pack(padx=16, pady=(12, 6))
-        # 이미 예약돼 있으면 남은 분을 기본값으로
-        if self.exit_deadline is not None:
-            default = str(max(1, int((self.exit_deadline - time.time() + 59) // 60)))
+    def _on_wol_result(self, ok, code=None, msg=""):
+        """서버 응답(ok{of:"wol"} / error{ref:"wol"}). 시간 초과로 대기를 접은 뒤
+        늦게 온 응답이어도 결과는 찍는다(끊겼다 붙으며 큐에서 늦게 나간 요청일 수 있다)."""
+        self.wol_sent = None
+        self._apply_ui_locks()
+        if ok:
+            print("[BGOD 켜기] 서버가 BGOD에 깨우기 신호를 보냈습니다. "
+                  "켜지기까지 1~2분 걸립니다.")
+        elif code == "bad_frame":
+            print("[BGOD 켜기] 이 서버는 아직 BGOD 켜기를 지원하지 않습니다"
+                  "(domiserver 업데이트 필요).")
         else:
-            default = "0"
-        var = tk.StringVar(value=default)
-        en = tk.Entry(top, textvariable=var, font=FONT, width=10, justify="center",
-                      bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"])
-        en.pack(padx=16, pady=4)
-        en.select_range(0, "end")
-        en.focus_set()
-        warn = tk.Label(top, text="숫자를 입력하세요.", font=FONT_SMALL,
-                        fg="red", bg=t["bg"])
+            print(f"[BGOD 켜기] 서버가 요청을 거절했습니다: {msg} ({code})")
 
-        def on_ok(event=None):
-            try:
-                minutes = float(var.get().strip())
-                if minutes < 0:
-                    raise ValueError
-            except ValueError:
-                warn.pack(padx=16, pady=(0, 4))
-                return
-            top.destroy()
-            if minutes == 0:
-                self._cancel_sched_exit()
-            else:
-                self._schedule_exit(minutes)
+    def _check_wol_timeout(self):
+        if self.wol_sent is None or time.time() - self.wol_sent <= WOL_REPLY_TIMEOUT:
+            return
+        self.wol_sent = None
+        self._apply_ui_locks()
+        print("[BGOD 켜기] 서버가 응답하지 않습니다. 잠시 뒤 다시 눌러 보세요.")
 
-        row = tk.Frame(top, bg=t["bg"])
-        row.pack(padx=16, pady=(6, 12))
-        tk.Button(row, text="취소", font=FONT, bg=BTN_GRAY, width=8,
-                  command=top.destroy).pack(side="left", padx=(0, 6))
-        tk.Button(row, text="확인", font=FONT, bg=BTN_GRAY, width=8,
-                  command=on_ok).pack(side="left")
-        top.bind("<Return>", on_ok)
-
+    # ---------- 예약 종료 (원격 Y 전용) ----------
+    # 버튼은 261101b에 'BGOD 켜기'로 바뀌어 이 PC에서 예약을 거는 길은 원격 Y
+    # (웹앱·옛 앱)뿐이다. 그쪽이 남아 있는 한 타이머·남은 시간 표시·종료는 둔다.
     def _schedule_exit(self, minutes):
         if self.exit_after_id is not None:
             self.root.after_cancel(self.exit_after_id)
@@ -4829,14 +4824,9 @@ class DomimanApp:
         self.exit_deadline = None
         self._refresh_status_display()
 
-    def _ensure_tick(self):
-        if not self._sched_ticking:
-            self._sched_ticking = True
-            self.root.after(1000, self._tick_sched)
-
     def _tick_sched(self):
-        """예약 종료(로컬/원격 표시) 활성 중 남은 시간 표시를 주기 갱신."""
-        if self.exit_deadline is None and self.remote_exit_deadline is None:
+        """예약 종료 활성 중 남은 시간 표시를 주기 갱신."""
+        if self.exit_deadline is None:
             self._sched_ticking = False
             return
         self._refresh_status_display()
@@ -4846,70 +4836,6 @@ class DomimanApp:
         # 수거/교체 루틴이 진행 중이어도 지체 없이 종료(워커는 데몬 스레드).
         print("\n[예약 종료] 예약된 시각이 되어 프로그램을 종료합니다.")
         self.on_exit()
-
-    def _open_sched_dialog_remote(self):
-        """원격 예약 종료 창(,Z,Y 수신 후). 확인 -> Y,n 발송 후 응답까지
-        취소 외 봉인. 취소/15초 무응답 -> Y,0 발송 후 그냥 닫힘."""
-        top = tk.Toplevel(self.root)
-        top.title("예약 종료")
-        top.resizable(False, False)
-        top.grab_set()
-        t = THEME["dark" if self.dark else "light"]
-        top.configure(bg=t["bg"])
-
-        tk.Label(top, text=f"몇 분 뒤에 {self.remote_target}를 종료할까요? (0 = 예약 해제)",
-                 font=FONT, bg=t["bg"], fg=t["fg"]).pack(padx=16, pady=(12, 6))
-        var = tk.StringVar(value="0")
-        en = tk.Entry(top, textvariable=var, font=FONT, width=10, justify="center",
-                      bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"])
-        en.pack(padx=16, pady=4)
-        en.select_range(0, "end")
-        en.focus_set()
-        warn = tk.Label(top, text="숫자를 입력하세요.", font=FONT_SMALL,
-                        fg="red", bg=t["bg"])
-
-        row = tk.Frame(top, bg=t["bg"])
-        row.pack(padx=16, pady=(6, 12))
-        bt_cancel = tk.Button(row, text="취소", font=FONT, bg=BTN_GRAY, width=8)
-        bt_ok = tk.Button(row, text="확인", font=FONT, bg=BTN_GRAY, width=8)
-        bt_cancel.pack(side="left", padx=(0, 6))
-        bt_ok.pack(side="left")
-
-        def on_ok(event=None):
-            if self.pending is not None:
-                return
-            try:
-                minutes = float(var.get().strip())
-                if minutes < 0:
-                    raise ValueError
-            except ValueError:
-                warn.pack(padx=16, pady=(0, 4))
-                return
-            self._send_command(f"Y,{minutes:g}", "Y2")
-            en.configure(state="disabled")   # 응답 전까지 취소만 가능
-            bt_ok.configure(state="disabled")
-
-        def on_cancel():
-            target = self.remote_target
-            if self.pending is not None and self.pending.get("kind") == "Y2":
-                self._resolve_pending()      # 응답 대기 포기
-            self._close_sched_dialog()
-            if target:
-                chat_send(f"{target},Y,0", room_of(target))
-
-        bt_ok.configure(command=on_ok)
-        bt_cancel.configure(command=on_cancel)
-        top.bind("<Return>", on_ok)
-        top.protocol("WM_DELETE_WINDOW", on_cancel)
-        self._sched_top = top
-
-    def _close_sched_dialog(self):
-        if self._sched_top is not None:
-            try:
-                self._sched_top.destroy()
-            except Exception:
-                pass
-            self._sched_top = None
 
     # ---------- 즉시 회수 ----------
     def _can_operate(self):

@@ -61,7 +61,6 @@ fun MainScreen(
   var backPressCount by remember { mutableStateOf(0) }
   var showResolutionDialog by remember { mutableStateOf(false) }
   var showLogoutHint by remember { mutableStateOf(false) }
-  var showSchedDialog by remember { mutableStateOf(false) }
   var showPcDialog by remember { mutableStateOf(false) }
 
   // 제어할 PC를 고르기 전에는 아무 명령도 보낼 곳이 없다 → 컨트롤을 잠근다.
@@ -165,11 +164,13 @@ fun MainScreen(
     Text(state.statusMessage, style = MaterialTheme.typography.bodyMedium)
 
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+      // BGOD 켜기(261101b, 옛 '예약 종료' 자리) — 제어 PC가 아니라 서버에 보내는 요청이라
+      // PC를 고르지 않아도 되고 원격 응답 대기(isPending)와도 무관하다. 서버 연결만 본다.
       OutlinedButton(
-        onClick = { showSchedDialog = true },
-        enabled = controlsEnabled,
+        onClick = viewModel::onWakeBgod,
+        enabled = connected && !state.wolWaiting,
         modifier = Modifier.weight(1f),
-      ) { Text("예약 종료") }
+      ) { Text("BGOD 켜기") }
       OutlinedButton(
         onClick = viewModel::onCollectNow,
         enabled = controlsEnabled,
@@ -293,34 +294,6 @@ fun MainScreen(
           }
         }
       },
-    )
-  }
-
-  if (showSchedDialog) {
-    var minutesField by remember { mutableStateOf("") }
-    AlertDialog(
-      onDismissRequest = { showSchedDialog = false },
-      title = { Text("예약 종료") },
-      text = {
-        Column {
-          Text("몇 분 뒤에 종료할까요? (0 = 예약 해제)")
-          OutlinedTextField(
-            value = minutesField,
-            onValueChange = { new -> if (new.matches(Regex("""\d*"""))) minutesField = new },
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            singleLine = true,
-          )
-        }
-      },
-      confirmButton = {
-        TextButton(
-          onClick = {
-            minutesField.toDoubleOrNull()?.let(viewModel::onSchedExitSet)
-            showSchedDialog = false
-          },
-        ) { Text("확인") }
-      },
-      dismissButton = { TextButton(onClick = { showSchedDialog = false }) { Text("취소") } },
     )
   }
 }

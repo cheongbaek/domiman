@@ -51,6 +51,8 @@ data class MainUiState(
   val isPending: Boolean = false,
   /** 제어 PC 방에 입장해 상태를 받아오는 중(선택 직후). */
   val isConnectingTarget: Boolean = false,
+  /** 'BGOD 켜기' 서버 응답을 기다리는 중(isPending과 별개 — 제어 PC 응답이 아니다). */
+  val wolWaiting: Boolean = false,
 )
 
 /** 도착한 스크린샷 — 원본 PNG 바이트는 저장·클립보드 복사에 그대로 쓰인다
@@ -177,12 +179,6 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
           "G" -> _uiState.value = _uiState.value.copy(running = true)
           "P" -> _uiState.value = _uiState.value.copy(running = false)
           "W" -> addLog("즉시 회수 명령이 접수되었습니다.")
-          "Y" -> {
-            val m = event.schedMinutes
-            if (m != null) {
-              addLog(if (m == "0") "예약 종료가 해제되었습니다." else "${m}분 뒤 종료가 예약되었습니다.")
-            }
-          }
           "Q" -> addLog("원격 프로그램이 종료되었습니다.")
           // 취침 모드는 화면만 덮는다 — 낚시가 멈춘 것으로 오해하지 않게 함께 적는다.
           "B" -> addLog("취침 모드로 전환했습니다. 화면만 덮이고 낚시는 계속됩니다.")
@@ -216,6 +212,10 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
         }
       }
       "report" -> event.reportText?.let(::addLog)
+      "wol" -> {
+        _uiState.value = _uiState.value.copy(wolWaiting = false)
+        addLog(wolResultText(event))
+      }
       "target_joined" -> addLog("'${event.pc}' 채팅방에 입장했습니다.")
       "target_denied" -> {
         addLog(targetFailText(event.pc ?: "", event.reason))
@@ -316,12 +316,27 @@ class MainScreenViewModel(private val repository: DomimanRepository) : ViewModel
     viewModelScope.launch { repository.sendSetFlags(logSave, rod, bait) }
   }
 
-  /** 예약 종료 — minutes분 뒤 종료(0=해제). PC의 2단계(Y ack→창→Y,n) 대신
-   * 모바일은 앱 안에서 분을 입력받아 바로 Y,n을 보낸다(응답은 Y 에코로 확인). */
-  fun onSchedExitSet(minutes: Double) {
-    markPending()
-    viewModelScope.launch { repository.sendSchedExitSet(minutes) }
+  /** 'BGOD 켜기'(261101b, 옛 '예약 종료' 자리) — 제어 PC 명령이 아니라 서버 요청이라
+   * markPending()(제어 PC 응답 대기)을 쓰지 않는다. 버튼은 "wol" 이벤트(서버 답 또는
+   * 파이썬의 15초 시간 초과)가 올 때까지만 잠근다(연타 방지). */
+  fun onWakeBgod() {
+    _uiState.value = _uiState.value.copy(wolWaiting = true)
+    addLog("서버에 BGOD 깨우기를 요청합니다...")
+    viewModelScope.launch {
+      if (!repository.sendWakeBgod()) {
+        _uiState.value = _uiState.value.copy(wolWaiting = false)
+        addLog("보내지 못했습니다. 서버 연결을 확인하고 잠시 뒤 다시 누르세요.")
+      }
+    }
   }
+
+  private fun wolResultText(event: DomimanEvent): String =
+    when {
+      event.ok == true -> "BGOD에 깨우기 신호를 보냈습니다. 켜지기까지 1~2분 걸립니다."
+      event.code == "bad_frame" -> "서버가 아직 BGOD 켜기를 지원하지 않습니다(서버 업데이트 필요)."
+      event.code == "timeout" -> "서버가 응답하지 않습니다. 잠시 뒤 다시 눌러 보세요."
+      else -> "서버가 BGOD 켜기를 거절했습니다: ${event.msg ?: event.code}"
+    }
 
   fun onCollectNow() {
     markPending()

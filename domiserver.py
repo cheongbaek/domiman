@@ -24,6 +24,11 @@
 콘솔(repl)로 뜬다(창을 못 쓰는 환경·원격 세션용).
 
 콘솔·창 모두 계정·채팅방·웹 중계 관리용이며, 채팅 내용은 출력하지 않는다.
+
+**(261101 예정) BGOD와 같은 LAN의 다른 PC에서 돌린다.** domiman·모바일 앱의
+'BGOD 켜기' 버튼이 이 서버에 {"t":"wol"} 을 보내면 서버가 BGOD에 매직 패킷을
+쏘는 구조다. 클라이언트는 이미 완성돼 있고 **서버 쪽은 아직 구현하지 않았다** —
+할 일은 HANDLERS 바로 위의 [WoL] 머리말에 전부 적어 두었다.
 """
 
 import base64
@@ -113,6 +118,9 @@ DEFAULT_CONFIG = {
     "web_origins": [],          # 빈 배열이면 Origin 검사 없음(오픈 방침)
     "web_pw": "",               # 그 계정의 비밀번호 — 중계가 127.0.0.1 로 로그인한다
     "web_chat": True,           # 브라우저에서 채팅방에 들어가는 기능(끄면 전부 거절)
+
+    # --- BGOD 켜기(WoL) — TODO: 아직 없다. 넣을 키 3개(wol_mac·wol_broadcast·
+    #     wol_port)와 값은 HANDLERS 바로 위의 [WoL] 머리말 참고 ---
 }
 
 # domiweb.json -> domiserver.json 키 이름 대응(따로 돌던 시절의 설정 승계용).
@@ -1292,6 +1300,115 @@ def relay_file_chunk(conn, body):
 def handle_pong(conn, d):
     pass                                 # last_rx는 프레임 수신 자체로 갱신된다
 
+
+# ------------------------------------------------------------
+# [WoL] BGOD 켜기 요청 — **TODO: 아직 구현하지 않았다(다른 PC에서 구현 예정)**
+# ------------------------------------------------------------
+# domiman(PC 261101b~)과 모바일 앱의 'BGOD 켜기' 버튼이, 로그인된 연결로 아래 한
+# 프레임을 보낸다. **클라이언트 쪽은 이미 완성돼 배포됐다.**
+#     {"t": "wol"}
+# 깨우는 대상은 **BGOD 한 대뿐**이라 요청에 대상(MAC·이름)을 싣지 않는다. MAC은
+# 이 서버의 설정이 갖는다 — 클라이언트마다 MAC을 들고 다닐 필요가 없고, 공개된
+# 서버가 '아무 MAC이나 깨워 주는 중계'가 되지 않는다.
+#
+# 지금 이 서버는 'wol'을 모르므로 serve_conn 의 마지막 분기가
+#     error{code:"bad_frame", msg:"알 수 없는 요청: wol"}
+# 를 돌려주고 **연결은 유지한다.** 클라이언트는 이 응답을 '서버 업데이트 필요'로
+# 읽도록 만들어 두었다. 그래서 PROTO_VER 를 올리거나 welcome 에 기능 표시를 넣을
+# 필요가 **없다**('B' 프레임과 다르다 — 그건 옛 서버가 연결을 끊어 버렸기 때문에
+# 버전으로 미리 막아야 했다).
+#
+# ■ 클라이언트가 기다리는 응답(바꾸면 domiman.py·domiman_m.py·앱이 같이 바뀌어야 한다)
+#   성공: {"t":"ok", "of":"wol"}
+#         = 매직 패킷을 **보냈다**는 뜻. BGOD가 켜졌다는 확인이 아니다(클라이언트도
+#           '켜지기까지 1~2분 걸린다'고만 안내한다).
+#   실패: {"t":"error", "code":..., "msg":..., "ref":"wol"}
+#         **ref="wol" 을 반드시 붙일 것** — 클라이언트는 ref 로 다른 오류와 가른다.
+#         msg 는 사용자 화면에 그대로 나온다. code 제안:
+#           wol_off      서버에 wol_mac 이 비어 있음(기능 꺼짐)
+#           wol_fail     소켓 송신 실패(어댑터 없음 등)
+#           rate_limited 방금 보냈음(연타)
+#   클라이언트 응답 대기는 15초다. 송신은 즉시 끝나므로 넉넉하다.
+#
+# ■ 할 일
+# 1) DEFAULT_CONFIG 에 키 3개(관리 창의 설정 표·콘솔 `set` 이 자동으로 다룬다 —
+#    _coerce 가 기본값의 자료형을 보고 맞추므로 따로 손볼 곳은 없다):
+#        "wol_mac": "",                      # BGOD MAC. 비우면 기능 꺼짐(wol_off)
+#        "wol_broadcast": "192.168.137.255", # 매직 패킷을 보낼 브로드캐스트 주소
+#        "wol_port": 9,                      # 관례상 9(discard). 7을 쓰는 NIC도 있다
+#    실제 MAC은 domiserver.json 에만 적는다(아래 '네트워크'에 실측값이 있다).
+#
+# 2) 핸들러. 로그인한 연결만 받으므로 PUBLIC_HANDLERS 가 아니라 HANDLERS 에
+#    `"wol": handle_wol` 을 넣는다. 그대로 옮겨 써도 되는 초안:
+#
+#        WOL_MIN_GAP = 5.0       # 서버 전체 기준 최소 간격 — 누가 눌러도 한 번이면 된다
+#        _wol_last = 0.0
+#
+#        def wol_packet(mac):
+#            raw = bytes.fromhex(re.sub(r"[^0-9A-Fa-f]", "", mac))
+#            if len(raw) != 6:
+#                raise ValueError("MAC 주소 형식이 아닙니다")
+#            return b"\xff" * 6 + raw * 16    # 매직 패킷 = FF x6 + MAC x16 (102바이트)
+#
+#        def send_wol():
+#            """매직 패킷 송신. 실패하면 OSError/ValueError 를 그대로 올린다."""
+#            pkt = wol_packet(str(CONFIG.get("wol_mac") or ""))
+#            dst = (CONFIG["wol_broadcast"], int(CONFIG["wol_port"]))
+#            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+#                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+#                for _ in range(3):           # UDP라 유실 대비로 몇 번(중복은 무해)
+#                    s.sendto(pkt, dst)
+#
+#        def handle_wol(conn, d):
+#            global _wol_last
+#            if not str(CONFIG.get("wol_mac") or "").strip():
+#                return conn.err("wol_off", "서버에 BGOD 켜기가 설정되어 있지 않습니다.",
+#                                ref="wol")
+#            if now() - _wol_last < WOL_MIN_GAP:
+#                return conn.err("rate_limited", "방금 보냈습니다. 잠시 뒤 다시 누르세요.",
+#                                ref="wol")
+#            try:
+#                send_wol()
+#            except (OSError, ValueError) as e:
+#                log(f"[WoL] {conn.uid} 요청 — 송신 실패: {e}")
+#                return conn.err("wol_fail", f"신호를 보내지 못했습니다({e}).", ref="wol")
+#            _wol_last = now()
+#            conn.send({"t": "ok", "of": "wol"})
+#            log(f"[WoL] {conn.uid} 요청 — BGOD 깨우기 신호를 보냈습니다.")
+#
+#    handle_* 는 연결 스레드에서 돈다. sendto 는 즉시 끝나 블로킹 걱정이 없고, 두
+#    사람이 동시에 눌러 패킷이 두 번 나가도 무해해서 _wol_last 에 잠금은 필요 없다.
+#    계정은 사후 승인제라 승인된 계정이면 누구나 누를 수 있게 둔다(깨우기만 할 뿐
+#    끄거나 들어갈 수는 없다). 막고 싶으면 "wol_allow": [ID…] 를 두어 거르면 된다.
+#
+# 3) (선택) 콘솔 `wol` 명령과 관리 창 버튼 — 클라이언트 없이 서버에서 바로 시험
+#    하는 수단(COMMANDS 표에 TODO 를 남겨 두었다). 위 send_wol() 을 그대로 부르면
+#    된다. 로그는 다른 관리 사건([가입요청]/[로그인])처럼 [WoL] 로 남긴다.
+#
+# ■ 네트워크 — 이 서버는 BGOD와 같은 LAN에 있어야 한다(브로드캐스트는 라우터를
+#   넘지 못한다). 2026-11-01 BGOD에서 잰 값:
+#     BGOD 이더넷  Realtek PCIe GbE · MAC 08-BF-B8-B9-D7-00 · IP 192.168.137.156/24
+#     게이트웨이   192.168.137.1
+#   192.168.137.x 는 **Windows 인터넷 연결 공유(ICS)의 기본 대역**이다 — 서버 PC가
+#   BGOD에 인터넷을 나눠 주는 그 PC라면 서버 PC의 ICS 쪽 어댑터가 192.168.137.1 이다.
+#   **255.255.255.255(제한 브로드캐스트)를 쓰지 말 것.** 서버 PC에는 인터넷 쪽과 ICS
+#   쪽 어댑터가 둘 다 있고, Windows는 제한 브로드캐스트를 메트릭이 이기는 **한쪽으로만**
+#   내보낸다(대개 인터넷 쪽) → BGOD에 닿지 않는다. 192.168.137.255(그 서브넷의
+#   브로드캐스트)는 라우팅 표대로 ICS 어댑터로 나간다. 대역이 바뀌면 이 값만 고친다.
+#   IP 유니캐스트로 보내지 말 것 — 꺼진 BGOD는 ARP에 답하지 않아 패킷이 나가지 못한다.
+#   방화벽: 나가는 UDP라 서버 PC에 따로 규칙이 필요 없다.
+#
+#   BGOD 쪽 준비 상태(드라이버 설정, 실측): Wake on Magic Packet = Enabled,
+#   Shutdown Wake-On-Lan = Enabled, 'AllowComputerToTurnOffDevice' = Disabled.
+#   **확인하지 못한 것:** BIOS/UEFI의 WoL 항목(Power On by PCI-E / Wake on LAN 등) —
+#   완전 종료(S5) 상태에서 안 켜지면 여기부터 볼 것. Windows '빠른 시작'이 켜져
+#   있다(HiberbootEnabled=1). Realtek 은 대개 괜찮지만, 절전에서는 켜지는데 종료
+#   상태에서만 안 켜지면 빠른 시작을 끄고 다시 시험해 볼 것.
+#
+# ■ 웹앱(cheongbaek.github.io/domiman)에는 아직 이 버튼이 없다. 붙이려면 [8. 웹
+#   중계]의 브라우저 프레임에 요청 하나를 늘리고, 중계가 상류 연결로 {"t":"wol"} 을
+#   대신 보내 결과를 그 브라우저에 돌려주면 된다(그 경우 웹 쪽 연타 제한도 둘 것).
+# ------------------------------------------------------------
 
 # 로그인 없이 받아주는 프레임
 PUBLIC_HANDLERS = {"register": handle_register, "login": handle_login,
@@ -3223,6 +3340,8 @@ COMMANDS = {
     "rooms": cmd_rooms, "room": cmd_room, "delroom": cmd_delroom,
     "delrooms": cmd_delrooms, "web": cmd_web,
     "config": cmd_config, "set": cmd_set,
+    # TODO(WoL): "wol": cmd_wol — 클라이언트 없이 콘솔에서 BGOD 깨우기를 시험하는
+    # 명령. [WoL] 머리말 3)항 참고(HELP 문자열에도 한 줄 추가할 것).
 }
 
 

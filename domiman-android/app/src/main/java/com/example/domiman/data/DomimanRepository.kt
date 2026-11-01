@@ -389,7 +389,14 @@ class DomimanRepository(context: Context) {
 
   suspend fun sendStop() = cmd("cmd_stop")
 
-  suspend fun sendSchedExitSet(minutes: Double) = cmd("cmd_sched_exit_set", minutes)
+  /** 'BGOD 켜기'(261101b, 옛 '예약 종료' 자리) — BGOD에 깨우기 신호(WoL)를 보내 달라고
+   * **서버에** 요청한다. 제어 PC 명령이 아니라서 PC를 고르지 않아도 된다. 결과는 "wol"
+   * 이벤트로 온다(15초 안에 답이 없으면 파이썬이 timeout 이벤트를 낸다). 로그인 전이거나
+   * 이미 응답을 기다리는 중이면 보내지 않고 false. */
+  suspend fun sendWakeBgod(): Boolean =
+    withContext(Dispatchers.IO) {
+      runCatching { session?.callAttr("cmd_wake_bgod")?.toBoolean() ?: false }.getOrElse { false }
+    }
 
   suspend fun sendCollectNow() = cmd("cmd_collect_now")
 
