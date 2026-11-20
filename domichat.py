@@ -78,6 +78,16 @@ IMG_VIEW_W = 320                          # 말풍선 안 표시 폭
 IMG_EXTS = [("이미지", "*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff"),
             ("모든 파일", "*.*")]
 
+# --- AI 부르기 (261120a, 서버 프로토콜 3) ---
+# 채팅방 창 ⚙ 메뉴에서 서버의 봇 계정(welcome 의 "bots", 지금은 xeon_ai = domiai)을 **이 방으로 불러 들인다.**
+# 클라이언트는 {"t":"bot","cmd":"call","arg":번호} / {"t":"bot","cmd":"dismiss"} 를 보내기만 한다 —
+# 모델·세션·거절(다른 사람이 쓰는 중 등)은 봇이 정하고, 방에 쓰거나 bot_reply(나에게만 오는 안내)로 알려 준다.
+# 번호는 봇(domiai.py 의 MODELS)과 맞춘 것이다.
+AI_MODELS = (("1", "코딩 — Qwen2.5 Coder 7B"),
+             ("2", "한국어 문서 · 이미지 읽기 — Gemma 3 4B"),
+             ("3", "대화 · 범용 — Qwen3 4B, 생각 모드 끔 (빠름)"),
+             ("4", "대화 · 범용 — Qwen3 4B, 생각 모드 켬 (느리지만 정확)"))
+
 
 def new_fid():
     """전송 식별자(32자리 hex). uuid 모듈을 쓰지 않는다 — 위 import 주석 참고."""
@@ -133,7 +143,7 @@ if os.name == "nt":       # 흐릿한 글자 방지. root 생성 전에 해둬�
 #
 # 리포는 domiman과 공유하고 **파일 이름으로 구분**한다(domichat_version.txt /
 # domichat.py) — 리포를 새로 만들지 않아도 되고 domiman 업데이트와 섞이지 않는다.
-APP_VERSION = "260815e"
+APP_VERSION = "261120a"
 UPDATE_REPO = "cheongbaek/domiman"
 UPDATE_BRANCH = "main"
 UPDATE_RAW_BASE = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}"
@@ -1004,6 +1014,7 @@ class App:
         self.room_pw_mem = {}
         self.incoming = {}       # 받는 중인 이미지: fid -> {room,name,size,buf,...}
         self.server_ver = 1      # welcome 으로 갱신(2 이상이어야 이미지 전송 가능)
+        self.bots = []           # 방으로 불러 들일 수 있는 봇 계정(서버 3 이상, welcome 의 "bots")
         self.busy = False
         self.updating = False
         self.logged_once = False
@@ -1507,6 +1518,16 @@ class App:
             return
         if t == "error":
             return self._on_error(d)
+        if t == "bot_reply":
+            # 봇(AI)이 나에게만 보낸 안내 — 다른 사람이 쓰는 중, AI 중계가 꺼져 있음 등
+            room, msg = d.get("room"), d.get("msg") or ""
+            w = self.windows.get(room)
+            if w:
+                w.set_status(msg)
+            messagebox.showinfo(f"domichat — {d.get('from') or 'AI'}",
+                                (f"[{room}] " if room else "") + msg,
+                                parent=w.win if w else self.root)
+            return
 
     def _on_internal(self, ev, d):
         if ev == "register_result":
@@ -1564,6 +1585,8 @@ class App:
         # 서버 프로토콜 버전(1=텍스트만, 2=이미지 지원). 옛 서버에 이미지를 보내면
         # 그쪽이 연결을 끊어 재접속 고리에 빠지므로 **보내기 전에 막는다.**
         self.server_ver = int(d.get("ver") or 1)
+        self.bots = [b for b in (d.get("bots") or []) if isinstance(b, str) and b] \
+            if self.server_ver >= 3 else []
         self.rooms = {r["name"]: r for r in d.get("rooms", [])}
         cfg = self.store.cfg
         ip, port, uid, pw = self._fields()
@@ -1889,9 +1912,28 @@ class RoomWindow:
                 m.add_command(label="채팅방 삭제", command=self.delete_room)
         m.add_command(label="이미지 업로드", command=self.pick_image,
                       state="normal" if (HAS_PIL and filedialog) else "disabled")
+        if self.app.bots:                    # 서버가 봇 부르기를 알 때만(프로토콜 3 이상)
+            m.add_separator()
+            for num, title in AI_MODELS:
+                m.add_command(label=f"AI 부르기: {title}",
+                              command=lambda n=num, t=title: self.call_ai(n, t))
+            m.add_command(label="AI 내보내기", command=self.dismiss_ai)
         x = self.bt_gear.winfo_rootx()
         y = self.bt_gear.winfo_rooty() + self.bt_gear.winfo_height()
         m.post(x, y)
+
+    # ---------- AI 부르기 · 내보내기 ----------
+    def call_ai(self, num, title):
+        """AI(봇)를 이 방으로 부른다. 같은 방에서 내가 이미 쓰는 중이면 모델만 바뀐다.
+        다른 사람이 쓰는 중이면 봇이 bot_reply 로 알려 준다(한 번에 한 사람만)."""
+        bot = self.app.bots[0]
+        self.app.client.send({"t": "bot", "room": self.room, "id": bot, "cmd": "call", "arg": num})
+        self.set_status(f"AI({bot})를 부르는 중… — {title}")
+
+    def dismiss_ai(self):
+        bot = self.app.bots[0]
+        self.app.client.send({"t": "bot", "room": self.room, "id": bot, "cmd": "dismiss"})
+        self.set_status(f"AI({bot})를 내보내는 중…")
 
     def clear_chat(self):
         if not messagebox.askokcancel(
